@@ -1,0 +1,17 @@
+[package]
+name = "membrie-daemon"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[[bin]]
+name = "membried"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+membrie-core = { path = "../membrie-core" }
+serde_json.workspace = true

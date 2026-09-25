@@ -1,0 +1,18 @@
+[package]
+name = "membrie-capture"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[[bin]]
+name = "membrie-capture"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+gio = { version = "0.20.12", features = ["v2_80"] }
+glib = { version = "0.20.12", features = ["v2_80"] }
+membrie-core = { path = "../membrie-core" }

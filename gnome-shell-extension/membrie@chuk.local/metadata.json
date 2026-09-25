@@ -1,0 +1,6 @@
+{
+  "uuid": "membrie@chuk.local",
+  "name": "Membrie Clipboard Bridge",
+  "description": "Local-only GNOME Shell clipboard bridge for Membrie. It observes text copied in the desktop session and makes it available only to the local Membrie capture process over the user session bus. No clipboard data is sent over a network.",
+  "shell-version": ["50"]
+}

@@ -1,0 +1,17 @@
+[package]
+name = "membrie-app"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[[bin]]
+name = "membrie"
+path = "src/main.rs"
+
+[dependencies]
+gtk = { package = "gtk4", version = "0.9.7" }
+adw = { package = "libadwaita", version = "0.7.2", features = ["v1_5"] }
+membrie-core = { path = "../membrie-core" }
