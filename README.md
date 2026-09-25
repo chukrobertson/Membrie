@@ -22,6 +22,7 @@ The project is intentionally local-only:
 - Persistent pause state
 - Safe, explicitly enabled clipboard capture through a local GNOME Shell bridge
 - Optional focused-application and window-title activity sessions with idle boundaries
+- Consent-gated Semantic Context compatibility preview using GNOME's accessibility interface
 - Opt-in active-window Screen Memory with local visual-change filtering
 - A five-second “Remember this screen” control for deliberate one-off capture
 - Temporary PNGs removed from disk before their pixels are analyzed in memory by a selected loopback Ollama vision model
@@ -40,8 +41,9 @@ The project is intentionally local-only:
 - Brie answers powered by local `gemma4:12b`, with exact Remembrie citations
 - Local model selection and visible indexing health
 
-Dedicated OCR, optional retained evidence controls, richer citation navigation, and the
-interactive constellation are the next implementation milestones.
+Persistent Semantic Context capture, dedicated OCR, optional retained evidence controls,
+richer citation navigation, and the interactive constellation are the next implementation
+milestones.
 
 ## Install on Ubuntu
 
@@ -137,6 +139,7 @@ MEMBRIE_DATA_DIR=/tmp/membrie-dev ./scripts/dev.sh
 crates/membrie-core    Canonical model, SQLite repository, paths, and IPC client
 crates/membrie-daemon  Database owner, policy engine, and Unix-socket service
 crates/membrie-capture Local D-Bus client for the GNOME desktop bridge
+crates/membrie-a11y    Bounded, read-only AT-SPI compatibility probe
 crates/membrie-app     Native GTK 4/libadwaita application
 gnome-shell-extension  Local clipboard and desktop-context bridge for GNOME Wayland
 docs/                  Product and architecture decisions

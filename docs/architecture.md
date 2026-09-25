@@ -87,6 +87,16 @@ begins. If its activity session closes while Ollama is still working, session en
 held until that observation completes or fails. Successful late context is appended to the
 canonical Remembrie and its replaceable search artifacts are rebuilt.
 
+Semantic Context begins as a compatibility preview rather than an automatic capture source.
+After explicit consent, the desktop app can enable GNOME's accessibility interface and gives
+the user five seconds to focus a chosen window. The probe considers only the window AT-SPI
+marks active or focused, visits at most 500 nodes to a maximum depth of 14, collects only
+visible and showing nodes, and skips password-text nodes. It reads Accessible names, descriptions, roles, states,
+and supported-interface metadata; it never constructs or invokes Action or EditableText
+interfaces. Preview results remain in memory, are shown only in the app, and are not sent to
+the daemon or written to SQLite. This isolates real-world application testing from the later
+design of persistent semantic observations and their capture policy.
+
 ## Storage
 
 SQLite owns identity, timestamps, metadata, captured text, processing state, and

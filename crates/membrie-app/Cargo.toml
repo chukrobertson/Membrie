@@ -14,4 +14,5 @@ path = "src/main.rs"
 [dependencies]
 gtk = { package = "gtk4", version = "0.9.7" }
 adw = { package = "libadwaita", version = "0.7.2", features = ["v1_5"] }
+membrie-a11y = { path = "../membrie-a11y" }
 membrie-core = { path = "../membrie-core" }

@@ -3,6 +3,7 @@ members = [
     "crates/membrie-core",
     "crates/membrie-daemon",
     "crates/membrie-capture",
+    "crates/membrie-a11y",
     "crates/membrie-app",
 ]
 resolver = "2"

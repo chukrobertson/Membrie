@@ -32,6 +32,12 @@ short-lived active-window PNGs. It removes each image before local Ollama analys
 only labeled text context is stored in the database. Screen Memory is off by default and
 requires a local vision model such as `gemma4:e2b`.
 
+The optional Semantic Context compatibility preview may ask to enable GNOME accessibility
+the first time it is tested. The confirmation explains that this makes application-provided
+UI structure available to Membrie and other local accessibility tools. The preview is
+read-only, skips password fields, and does not write its result to the Membrie database.
+Some already-open applications may need to be restarted after accessibility is enabled.
+
 ## Backups
 
 Membrie creates a verified SQLite snapshot when the daemon starts if the latest backup

@@ -1,5 +1,6 @@
 use adw::prelude::*;
 use gtk::{Align, Orientation};
+use membrie_a11y::ProbeSummary;
 use membrie_core::{
     ActivitySnapshot, BrieAnswer, BrieCitation, CaptureRule, CaptureStatus, DaemonClient,
     IntelligenceSettings, IntelligenceStatus, LocalModel, NewRemembrie, PauseMode, Remembrie,
@@ -8,7 +9,7 @@ use membrie_core::{
 use std::cell::{Cell, RefCell};
 use std::fs;
 use std::rc::Rc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const APP_ID: &str = "com.chuk.Membrie";
 const CLIPBOARD_DBUS_NAME: &str = "com.chuk.Membrie.Clipboard";
@@ -38,6 +39,9 @@ struct UiState {
     activity_finish_button: gtk::Button,
     activity_idle_combo: gtk::ComboBoxText,
     activity_settings_updating: Cell<bool>,
+    semantic_status: gtk::Label,
+    semantic_button: gtk::Button,
+    semantic_probe_busy: Cell<bool>,
     screen_status: gtk::Label,
     screen_button: gtk::Button,
     screen_capture_now_button: gtk::Button,
@@ -98,6 +102,11 @@ fn build_ui(application: &adw::Application) {
         activity_idle_combo.append(Some(id), label);
     }
     activity_idle_combo.set_active_id(Some("900000"));
+    let semantic_status = gtk::Label::new(Some("Semantic Context · Checking…"));
+    semantic_status.set_xalign(0.0);
+    semantic_status.set_wrap(true);
+    let semantic_button = gtk::Button::with_label("Enable and test semantic context");
+    semantic_button.set_halign(Align::Start);
     let screen_status = gtk::Label::new(Some("Screen memory · Checking…"));
     screen_status.set_xalign(0.0);
     screen_status.set_wrap(true);
@@ -164,6 +173,9 @@ fn build_ui(application: &adw::Application) {
         activity_finish_button,
         activity_idle_combo,
         activity_settings_updating: Cell::new(false),
+        semantic_status,
+        semantic_button,
+        semantic_probe_busy: Cell::new(false),
         screen_status,
         screen_button,
         screen_capture_now_button,
@@ -220,6 +232,7 @@ fn build_ui(application: &adw::Application) {
         .build();
 
     refresh_clipboard_bridge(&state);
+    refresh_semantic_status(&state);
     refresh_status(&state);
     refresh_backups(&state);
     refresh_timeline(&state);
@@ -234,6 +247,7 @@ fn build_ui(application: &adw::Application) {
     let state_for_timer = Rc::clone(&state);
     gtk::glib::timeout_add_seconds_local(30, move || {
         refresh_clipboard_bridge(&state_for_timer);
+        refresh_semantic_status(&state_for_timer);
         refresh_status(&state_for_timer);
         refresh_backups(&state_for_timer);
         gtk::glib::ControlFlow::Continue
@@ -833,6 +847,35 @@ fn build_privacy_page(state: &Rc<UiState>) -> gtk::Widget {
     });
     page.append(&activity_card);
 
+    let semantic_card = gtk::Box::new(Orientation::Vertical, 8);
+    semantic_card.add_css_class("card");
+    semantic_card.add_css_class("capture-card");
+    let semantic_heading = gtk::Label::new(Some("Semantic Context · Compatibility preview"));
+    semantic_heading.add_css_class("heading");
+    semantic_heading.set_xalign(0.0);
+    let semantic_detail = gtk::Label::new(Some(
+        "This read-only preview asks the active application for the names, labels, and text structure it already provides to GNOME accessibility tools. It performs no actions, skips password fields, and stores nothing. Automatic Semantic Context is not enabled by this test.",
+    ));
+    semantic_detail.add_css_class("dim-label");
+    semantic_detail.set_xalign(0.0);
+    semantic_detail.set_wrap(true);
+    let semantic_hint = gtk::Label::new(Some(
+        "After a five-second countdown, Membrie inspects only the window you switch to. Some applications may need to be restarted after GNOME accessibility is enabled.",
+    ));
+    semantic_hint.add_css_class("dim-label");
+    semantic_hint.set_xalign(0.0);
+    semantic_hint.set_wrap(true);
+    semantic_card.append(&semantic_heading);
+    semantic_card.append(&state.semantic_status);
+    semantic_card.append(&semantic_detail);
+    semantic_card.append(&semantic_hint);
+    semantic_card.append(&state.semantic_button);
+    let state_for_semantic = Rc::clone(state);
+    state.semantic_button.connect_clicked(move |button| {
+        request_semantic_probe(button, &state_for_semantic);
+    });
+    page.append(&semantic_card);
+
     let screen_card = gtk::Box::new(Orientation::Vertical, 8);
     screen_card.add_css_class("card");
     screen_card.add_css_class("capture-card");
@@ -1381,6 +1424,212 @@ fn remember_visible_window(client: &DaemonClient) -> Result<ScreenCaptureResult,
         .map_err(|error| error.to_string());
     let _ = fs::remove_file(path);
     result
+}
+
+fn refresh_semantic_status(state: &Rc<UiState>) {
+    if state.semantic_probe_busy.get() {
+        return;
+    }
+    let settings = gtk::gio::Settings::new("org.gnome.desktop.interface");
+    if settings.boolean("toolkit-accessibility") {
+        state.semantic_status.set_text(
+            "GNOME accessibility is available for testing · automatic Semantic Context remains off",
+        );
+        state
+            .semantic_button
+            .set_label("Test a window in 5 seconds");
+    } else {
+        state
+            .semantic_status
+            .set_text("Off · GNOME is not currently exposing accessibility context to Membrie");
+        state
+            .semantic_button
+            .set_label("Enable and test semantic context");
+    }
+    state.semantic_button.set_sensitive(true);
+}
+
+fn request_semantic_probe(parent: &gtk::Button, state: &Rc<UiState>) {
+    if state.semantic_probe_busy.get() {
+        return;
+    }
+    let settings = gtk::gio::Settings::new("org.gnome.desktop.interface");
+    if settings.boolean("toolkit-accessibility") {
+        start_semantic_probe_countdown(parent, state);
+        return;
+    }
+
+    let dialog = adw::AlertDialog::builder()
+        .heading("Enable GNOME accessibility?")
+        .body(
+            "This allows Membrie—and other local accessibility tools—to receive UI structure that applications provide to GNOME. Membrie’s compatibility preview is read-only, performs no actions, skips password fields, and stores nothing. Some open applications may need to be restarted before they provide useful context.",
+        )
+        .build();
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("enable", "Enable and test");
+    dialog.set_close_response("cancel");
+    dialog.set_default_response(Some("enable"));
+    dialog.set_response_appearance("enable", adw::ResponseAppearance::Suggested);
+    let parent_for_response = parent.clone();
+    let state_for_response = Rc::clone(state);
+    dialog.connect_response(Some("enable"), move |_, _| {
+        if settings.set_boolean("toolkit-accessibility", true).is_err() {
+            toast(
+                &state_for_response,
+                "GNOME accessibility could not be enabled",
+            );
+            refresh_semantic_status(&state_for_response);
+            return;
+        }
+        refresh_semantic_status(&state_for_response);
+        start_semantic_probe_countdown(&parent_for_response, &state_for_response);
+    });
+    dialog.present(Some(parent));
+}
+
+fn start_semantic_probe_countdown(parent: &gtk::Button, state: &Rc<UiState>) {
+    if state.semantic_probe_busy.replace(true) {
+        return;
+    }
+    state.semantic_button.set_sensitive(false);
+    state
+        .semantic_button
+        .set_label("Switch to the window to test · 5");
+    state
+        .semantic_status
+        .set_text("Waiting for you to switch windows · nothing is being read during the countdown");
+
+    let remaining = Rc::new(Cell::new(5_u8));
+    let remaining_for_timer = Rc::clone(&remaining);
+    let parent_for_timer = parent.clone();
+    let state_for_timer = Rc::clone(state);
+    gtk::glib::timeout_add_seconds_local(1, move || {
+        let next = remaining_for_timer.get().saturating_sub(1);
+        remaining_for_timer.set(next);
+        if next > 0 {
+            state_for_timer
+                .semantic_button
+                .set_label(&format!("Switch to the window to test · {next}"));
+            return gtk::glib::ControlFlow::Continue;
+        }
+        state_for_timer
+            .semantic_button
+            .set_label("Reading the active window…");
+        state_for_timer
+            .semantic_status
+            .set_text("Read-only compatibility test in progress · nothing will be stored");
+        run_semantic_probe(&parent_for_timer, &state_for_timer);
+        gtk::glib::ControlFlow::Break
+    });
+}
+
+fn run_semantic_probe(parent: &gtk::Button, state: &Rc<UiState>) {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = sender.send(membrie_a11y::inspect_active_window(true));
+    });
+    let started_at = Instant::now();
+    let parent_for_result = parent.clone();
+    let state_for_result = Rc::clone(state);
+    gtk::glib::timeout_add_local(Duration::from_millis(100), move || {
+        match receiver.try_recv() {
+            Ok(Ok(summary)) => {
+                finish_semantic_probe(&state_for_result);
+                show_semantic_probe_result(&parent_for_result, &summary);
+                gtk::glib::ControlFlow::Break
+            }
+            Ok(Err(error)) => {
+                finish_semantic_probe(&state_for_result);
+                let dialog = adw::AlertDialog::builder()
+                    .heading("This window did not provide semantic context")
+                    .body(format!(
+                        "Membrie stored nothing and made no changes. The application may need to be restarted after accessibility was enabled, or it may not expose an accessible active window.\n\nDetails: {}",
+                        truncate_display_text(&error.to_string(), 800)
+                    ))
+                    .build();
+                dialog.add_response("close", "Close");
+                dialog.set_default_response(Some("close"));
+                dialog.present(Some(&parent_for_result));
+                gtk::glib::ControlFlow::Break
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty)
+                if started_at.elapsed() < Duration::from_secs(20) =>
+            {
+                gtk::glib::ControlFlow::Continue
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                finish_semantic_probe(&state_for_result);
+                let dialog = adw::AlertDialog::builder()
+                    .heading("The compatibility test took too long")
+                    .body("Membrie stopped waiting after 20 seconds and stored nothing. Try a simpler window, or restart the application you want to test after GNOME accessibility has been enabled.")
+                    .build();
+                dialog.add_response("close", "Close");
+                dialog.set_default_response(Some("close"));
+                dialog.present(Some(&parent_for_result));
+                gtk::glib::ControlFlow::Break
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                finish_semantic_probe(&state_for_result);
+                toast(
+                    &state_for_result,
+                    "The semantic compatibility test stopped unexpectedly",
+                );
+                gtk::glib::ControlFlow::Break
+            }
+        }
+    });
+}
+
+fn finish_semantic_probe(state: &Rc<UiState>) {
+    state.semantic_probe_busy.set(false);
+    refresh_semantic_status(state);
+}
+
+fn show_semantic_probe_result(parent: &gtk::Button, summary: &ProbeSummary) {
+    let application = display_or_unknown(&summary.application);
+    let window = display_or_unknown(&summary.window);
+    let quality = match summary.quality() {
+        "rich" => "Rich semantic context",
+        "partial" => "Partial semantic context",
+        _ => "Little semantic context",
+    };
+    let body = format!(
+        "{quality}\n\nApplication: {application}\nWindow: {window}\nCoverage: {} visible items · {} text-capable · {} document-capable\n\nNothing from this preview was stored. Automatic Semantic Context remains off.",
+        summary.visible_nodes, summary.text_nodes, summary.document_nodes
+    );
+    let preview = if summary.preview.is_empty() {
+        "No visible semantic labels were provided by this window.".to_owned()
+    } else {
+        summary.preview.join("\n")
+    };
+    let preview_label = gtk::Label::new(Some(&truncate_display_text(&preview, 6000)));
+    preview_label.set_xalign(0.0);
+    preview_label.set_yalign(0.0);
+    preview_label.set_wrap(true);
+    preview_label.set_selectable(true);
+    preview_label.add_css_class("monospace");
+    let preview_scroll = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .min_content_height(180)
+        .max_content_height(360)
+        .child(&preview_label)
+        .build();
+    let dialog = adw::AlertDialog::builder()
+        .heading("Semantic Context compatibility result")
+        .body(body)
+        .extra_child(&preview_scroll)
+        .build();
+    dialog.add_response("close", "Close");
+    dialog.set_default_response(Some("close"));
+    dialog.present(Some(parent));
+}
+
+fn display_or_unknown(value: &str) -> &str {
+    if value.trim().is_empty() {
+        "Unknown"
+    } else {
+        value
+    }
 }
 
 fn refresh_status(state: &Rc<UiState>) {

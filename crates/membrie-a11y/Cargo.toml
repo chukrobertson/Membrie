@@ -1,0 +1,17 @@
+[package]
+name = "membrie-a11y"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[[bin]]
+name = "membrie-a11y-probe"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+async-io = "2.6.0"
+atspi = { version = "0.30.0", default-features = false, features = ["connection", "proxies", "zbus"] }
