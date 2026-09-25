@@ -36,6 +36,11 @@ struct UiState {
     activity_finish_button: gtk::Button,
     activity_idle_combo: gtk::ComboBoxText,
     activity_settings_updating: Cell<bool>,
+    screen_status: gtk::Label,
+    screen_button: gtk::Button,
+    screen_interval_combo: gtk::ComboBoxText,
+    screen_model_combo: gtk::ComboBoxText,
+    screen_settings_updating: Cell<bool>,
     backup_status: gtk::Label,
     backup_button: gtk::Button,
     backup_in_progress: Cell<bool>,
@@ -89,6 +94,24 @@ fn build_ui(application: &adw::Application) {
         activity_idle_combo.append(Some(id), label);
     }
     activity_idle_combo.set_active_id(Some("900000"));
+    let screen_status = gtk::Label::new(Some("Screen memory · Checking…"));
+    screen_status.set_xalign(0.0);
+    screen_status.set_wrap(true);
+    let screen_button = gtk::Button::with_label("Enable screen memory");
+    screen_button.set_halign(Align::Start);
+    let screen_interval_combo = gtk::ComboBoxText::new();
+    for (id, label) in [
+        ("30000", "30 seconds"),
+        ("60000", "1 minute"),
+        ("120000", "2 minutes"),
+        ("300000", "5 minutes"),
+    ] {
+        screen_interval_combo.append(Some(id), label);
+    }
+    screen_interval_combo.set_active_id(Some("120000"));
+    let screen_model_combo = gtk::ComboBoxText::new();
+    screen_model_combo.append(Some("gemma4:e2b"), "gemma4:e2b");
+    screen_model_combo.set_active_id(Some("gemma4:e2b"));
     let backup_status = gtk::Label::new(Some("Checking local backups…"));
     backup_status.set_xalign(0.0);
     backup_status.set_wrap(true);
@@ -134,6 +157,11 @@ fn build_ui(application: &adw::Application) {
         activity_finish_button,
         activity_idle_combo,
         activity_settings_updating: Cell::new(false),
+        screen_status,
+        screen_button,
+        screen_interval_combo,
+        screen_model_combo,
+        screen_settings_updating: Cell::new(false),
         backup_status,
         backup_button,
         backup_in_progress: Cell::new(false),
@@ -704,7 +732,7 @@ fn build_privacy_page(state: &Rc<UiState>) -> gtk::Widget {
     activity_heading.add_css_class("heading");
     activity_heading.set_xalign(0.0);
     let activity_detail = gtk::Label::new(Some(
-        "Off by default. When enabled, Membrie records focused application and window-title changes, then closes a session after inactivity. This phase does not take screenshots or record keyboard input.",
+        "Off by default. When enabled, Membrie records focused application and window-title changes, then closes a session after inactivity. It never records keyboard or pointer input.",
     ));
     activity_detail.add_css_class("dim-label");
     activity_detail.set_xalign(0.0);
@@ -716,7 +744,7 @@ fn build_privacy_page(state: &Rc<UiState>) -> gtk::Widget {
     idle_row.append(&idle_label);
     idle_row.append(&state.activity_idle_combo);
     let screen_note = gtk::Label::new(Some(
-        "Screen content · Not captured yet. Keyframes, OCR, retention, and visual-model controls come after this activity foundation is proven.",
+        "Screen content remains off unless you separately enable Screen Memory below.",
     ));
     screen_note.add_css_class("dim-label");
     screen_note.set_xalign(0.0);
@@ -795,6 +823,124 @@ fn build_privacy_page(state: &Rc<UiState>) -> gtk::Widget {
         }
     });
     page.append(&activity_card);
+
+    let screen_card = gtk::Box::new(Orientation::Vertical, 8);
+    screen_card.add_css_class("card");
+    screen_card.add_css_class("capture-card");
+    let screen_heading = gtk::Label::new(Some("Screen Memory · Early access"));
+    screen_heading.add_css_class("heading");
+    screen_heading.set_xalign(0.0);
+    let screen_detail = gtk::Label::new(Some(
+        "Off by default. When enabled, Membrie privately samples only the active window and ignores unchanged frames. Each temporary PNG is removed from disk before its pixels are passed in memory to the selected local Ollama vision model; only clearly labeled machine-described text is kept. No video is recorded.",
+    ));
+    screen_detail.add_css_class("dim-label");
+    screen_detail.set_xalign(0.0);
+    screen_detail.set_wrap(true);
+    let screen_caution = gtk::Label::new(Some(
+        "Machine descriptions can be incomplete or wrong. Brie treats them as supporting context—not proof that an action was completed.",
+    ));
+    screen_caution.add_css_class("dim-label");
+    screen_caution.set_xalign(0.0);
+    screen_caution.set_wrap(true);
+    let screen_interval_row = gtk::Box::new(Orientation::Horizontal, 10);
+    let screen_interval_label = gtk::Label::new(Some("Check a changed screen at most every"));
+    screen_interval_label.set_xalign(0.0);
+    screen_interval_label.set_hexpand(true);
+    screen_interval_row.append(&screen_interval_label);
+    screen_interval_row.append(&state.screen_interval_combo);
+    let screen_model_row = gtk::Box::new(Orientation::Horizontal, 10);
+    let screen_model_label = gtk::Label::new(Some("Local screen model"));
+    screen_model_label.set_xalign(0.0);
+    screen_model_label.set_hexpand(true);
+    screen_model_row.append(&screen_model_label);
+    screen_model_row.append(&state.screen_model_combo);
+    screen_card.append(&screen_heading);
+    screen_card.append(&state.screen_status);
+    screen_card.append(&screen_detail);
+    screen_card.append(&screen_caution);
+    screen_card.append(&screen_interval_row);
+    screen_card.append(&screen_model_row);
+    screen_card.append(&state.screen_button);
+
+    let state_for_screen = Rc::clone(state);
+    state.screen_button.connect_clicked(move |_| {
+        let enabled = state_for_screen
+            .client
+            .status()
+            .map(|status| !status.screen_enabled)
+            .unwrap_or(false);
+        match state_for_screen.client.set_screen_enabled(enabled) {
+            Ok(status) => {
+                apply_status_ui(&state_for_screen, &status);
+                toast(
+                    &state_for_screen,
+                    if enabled {
+                        "Screen Memory enabled—temporary images stay local and are never retained"
+                    } else {
+                        "Screen Memory disabled"
+                    },
+                );
+            }
+            Err(error) => toast(
+                &state_for_screen,
+                &format!("Could not update Screen Memory: {error}"),
+            ),
+        }
+    });
+    let state_for_screen_interval = Rc::clone(state);
+    state.screen_interval_combo.connect_changed(move |combo| {
+        if state_for_screen_interval.screen_settings_updating.get() {
+            return;
+        }
+        let Some(value) = combo
+            .active_id()
+            .and_then(|value| value.parse::<u64>().ok())
+        else {
+            return;
+        };
+        match state_for_screen_interval
+            .client
+            .set_screen_sample_interval(value)
+        {
+            Ok(status) => {
+                apply_status_ui(&state_for_screen_interval, &status);
+                toast(&state_for_screen_interval, "Screen Memory timing updated");
+            }
+            Err(error) => {
+                toast(
+                    &state_for_screen_interval,
+                    &format!("Could not update screen timing: {error}"),
+                );
+                refresh_status(&state_for_screen_interval);
+            }
+        }
+    });
+    let state_for_screen_model = Rc::clone(state);
+    state.screen_model_combo.connect_changed(move |combo| {
+        if state_for_screen_model.screen_settings_updating.get() {
+            return;
+        }
+        let Some(model) = combo.active_id() else {
+            return;
+        };
+        match state_for_screen_model
+            .client
+            .set_screen_model(model.as_str())
+        {
+            Ok(status) => {
+                apply_status_ui(&state_for_screen_model, &status);
+                toast(&state_for_screen_model, "Local screen model updated");
+            }
+            Err(error) => {
+                toast(
+                    &state_for_screen_model,
+                    &format!("Could not update the local screen model: {error}"),
+                );
+                refresh_status(&state_for_screen_model);
+            }
+        }
+    });
+    page.append(&screen_card);
 
     let backup_card = gtk::Box::new(Orientation::Vertical, 8);
     backup_card.add_css_class("card");
@@ -1082,6 +1228,9 @@ fn refresh_status(state: &Rc<UiState>) {
             state.activity_button.set_sensitive(false);
             state.activity_finish_button.set_sensitive(false);
             state.activity_idle_combo.set_sensitive(false);
+            state.screen_button.set_sensitive(false);
+            state.screen_interval_combo.set_sensitive(false);
+            state.screen_model_combo.set_sensitive(false);
             state
                 .clipboard_agent_label
                 .set_text("Desktop capture service · Daemon offline");
@@ -1093,6 +1242,9 @@ fn refresh_status(state: &Rc<UiState>) {
             state
                 .activity_status
                 .set_text("Activity context · Daemon offline");
+            state
+                .screen_status
+                .set_text("Screen Memory · Daemon offline");
         }
     }
 }
@@ -1294,6 +1446,42 @@ fn apply_intelligence_status(state: &UiState, status: &IntelligenceStatus) {
         .brie_send_button
         .set_sensitive(status.total_remembries > 0 && !state.brie_busy.get());
     state.brie_models_button.set_sensitive(true);
+    let current_screen_model = state
+        .client
+        .status()
+        .map(|capture| capture.screen_model)
+        .unwrap_or_else(|_| "gemma4:e2b".to_owned());
+    state.screen_settings_updating.set(true);
+    state.screen_model_combo.remove_all();
+    for model in status
+        .available_models
+        .iter()
+        .filter(|model| is_likely_vision_model(&model.name))
+    {
+        state
+            .screen_model_combo
+            .append(Some(&model.name), &model.name);
+    }
+    if !state
+        .screen_model_combo
+        .set_active_id(Some(&current_screen_model))
+    {
+        state
+            .screen_model_combo
+            .append(Some(&current_screen_model), &current_screen_model);
+        state
+            .screen_model_combo
+            .set_active_id(Some(&current_screen_model));
+    }
+    state.screen_settings_updating.set(false);
+}
+
+fn is_likely_vision_model(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    name.contains("minicpm-v")
+        || name.contains("llava")
+        || name.contains("vision")
+        || name.starts_with("gemma4")
 }
 
 fn finish_brie_request(state: &UiState) {
@@ -1414,6 +1602,16 @@ fn apply_status_ui(state: &UiState, status: &CaptureStatus) {
     state
         .activity_finish_button
         .set_sensitive(status.activity_active_since_ms.is_some());
+    state.screen_button.set_sensitive(
+        (state.clipboard_bridge_available.get() || status.screen_enabled)
+            && status.activity_enabled,
+    );
+    state
+        .screen_interval_combo
+        .set_sensitive(status.screen_enabled);
+    state
+        .screen_model_combo
+        .set_sensitive(!status.screen_enabled);
     state.pause_button.set_icon_name(if status.paused {
         "media-playback-start-symbolic"
     } else {
@@ -1449,11 +1647,32 @@ fn apply_status_ui(state: &UiState, status: &CaptureStatus) {
     } else {
         "Enable activity context"
     });
+    state.screen_button.set_label(if status.screen_enabled {
+        "Disable screen memory"
+    } else {
+        "Enable screen memory"
+    });
     state.activity_settings_updating.set(true);
     state
         .activity_idle_combo
         .set_active_id(Some(&status.activity_idle_threshold_ms.to_string()));
     state.activity_settings_updating.set(false);
+    state.screen_settings_updating.set(true);
+    state
+        .screen_interval_combo
+        .set_active_id(Some(&status.screen_sample_interval_ms.to_string()));
+    if !state
+        .screen_model_combo
+        .set_active_id(Some(&status.screen_model))
+    {
+        state
+            .screen_model_combo
+            .append(Some(&status.screen_model), &status.screen_model);
+        state
+            .screen_model_combo
+            .set_active_id(Some(&status.screen_model));
+    }
+    state.screen_settings_updating.set(false);
     let capture_agent_running = status
         .clipboard_agent_last_seen_ms
         .is_some_and(|last_seen| current_time_ms().saturating_sub(last_seen) <= 30_000);
@@ -1497,6 +1716,38 @@ fn apply_status_ui(state: &UiState, status: &CaptureStatus) {
         )
     };
     state.activity_status.set_text(&activity_text);
+    let screen_text = if !status.screen_enabled {
+        format!(
+            "Off · {} local screen observations stored · no screenshots retained",
+            status.screen_observation_count
+        )
+    } else if !capture_agent_running {
+        "Enabled, but the desktop capture service is not responding".to_owned()
+    } else if !status.activity_enabled {
+        "Waiting for Activity Context to be enabled".to_owned()
+    } else {
+        let seconds = status.screen_sample_interval_ms / 1000;
+        let interval = if seconds == 60 {
+            "1 minute".to_owned()
+        } else if seconds.is_multiple_of(60) {
+            format!("{} minutes", seconds / 60)
+        } else {
+            format!("{seconds} seconds")
+        };
+        let failures = if status.screen_failed_count > 0 {
+            format!(
+                " · {} local analyses need attention",
+                status.screen_failed_count
+            )
+        } else {
+            String::new()
+        };
+        format!(
+            "On · active window only · up to once per {interval}\nModel: {} · {} observations stored · screenshots retained: 0{failures}",
+            status.screen_model, status.screen_observation_count
+        )
+    };
+    state.screen_status.set_text(&screen_text);
     state.privacy_stats.set_text(&format!(
         "{} Remembries stored · {} automatic events safely skipped\n{} probable secrets blocked · {} duplicates ignored",
         status.remembrie_count,

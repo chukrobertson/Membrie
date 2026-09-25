@@ -18,6 +18,8 @@ pub struct OllamaClient {
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<String>,
 }
 
 impl ChatMessage {
@@ -25,6 +27,7 @@ impl ChatMessage {
         Self {
             role: "system".to_owned(),
             content: content.into(),
+            images: Vec::new(),
         }
     }
 
@@ -32,6 +35,15 @@ impl ChatMessage {
         Self {
             role: "user".to_owned(),
             content: content.into(),
+            images: Vec::new(),
+        }
+    }
+
+    pub fn user_with_image(content: impl Into<String>, image: &[u8]) -> Self {
+        Self {
+            role: "user".to_owned(),
+            content: content.into(),
+            images: vec![encode_base64(image)],
         }
     }
 }
@@ -304,6 +316,29 @@ fn decode_chunked(mut input: &[u8]) -> Result<Vec<u8>> {
     Ok(decoded)
 }
 
+fn encode_base64(input: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut output = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let first = chunk[0];
+        let second = chunk.get(1).copied().unwrap_or(0);
+        let third = chunk.get(2).copied().unwrap_or(0);
+        output.push(ALPHABET[(first >> 2) as usize] as char);
+        output.push(ALPHABET[(((first & 0x03) << 4) | (second >> 4)) as usize] as char);
+        if chunk.len() > 1 {
+            output.push(ALPHABET[(((second & 0x0f) << 2) | (third >> 6)) as usize] as char);
+        } else {
+            output.push('=');
+        }
+        if chunk.len() > 2 {
+            output.push(ALPHABET[(third & 0x3f) as usize] as char);
+        } else {
+            output.push('=');
+        }
+    }
+    output
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -324,5 +359,13 @@ mod tests {
     fn rejects_cloud_model_names() {
         assert!(require_local_model("gemma4:12b").is_ok());
         assert!(require_local_model("gemma4:cloud").is_err());
+    }
+
+    #[test]
+    fn encodes_images_for_local_vision_requests() {
+        assert_eq!(encode_base64(b""), "");
+        assert_eq!(encode_base64(b"f"), "Zg==");
+        assert_eq!(encode_base64(b"fo"), "Zm8=");
+        assert_eq!(encode_base64(b"foo"), "Zm9v");
     }
 }

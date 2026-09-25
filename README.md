@@ -22,7 +22,10 @@ The project is intentionally local-only:
 - Persistent pause state
 - Safe, explicitly enabled clipboard capture through a local GNOME Shell bridge
 - Optional focused-application and window-title activity sessions with idle boundaries
-- Activity sessions become searchable, cited Remembries without capturing screenshots or input
+- Opt-in active-window Screen Memory with local visual-change filtering
+- Temporary PNGs removed from disk before their pixels are analyzed in memory by a selected loopback Ollama vision model
+- Machine-described screen context is explicitly labeled as fallible evidence for Brie
+- Activity sessions become searchable, cited Remembries without recording keyboard or pointer input
 - Pre-storage secret detection and duplicate suppression
 - Built-in password-manager and private-window exclusions
 - User-managed application exclusion rules
@@ -35,7 +38,7 @@ The project is intentionally local-only:
 - Brie answers powered by local `gemma4:12b`, with exact Remembrie citations
 - Local model selection and visible indexing health
 
-Change-triggered screen keyframes, local OCR, richer citation navigation, and the
+Dedicated OCR, optional retained evidence controls, richer citation navigation, and the
 interactive constellation are the next implementation milestones.
 
 ## Install on Ubuntu
@@ -63,7 +66,12 @@ defaults are:
 ```bash
 ollama pull gemma4:12b
 ollama pull embeddinggemma
+ollama pull gemma4:e2b
 ```
+
+The first two models power Brie and hybrid recall. The optional third model powers
+Screen Memory and is not used unless that source is explicitly enabled. Other installed
+vision-capable Ollama models can be selected in Privacy & Capture.
 
 Membrie connects only to Ollama's fixed loopback address (`127.0.0.1`). Cloud-backed
 Ollama model names are deliberately rejected.
@@ -89,8 +97,10 @@ Membrie is in the background:
 ```
 
 The extension exports only a local session-bus interface and has no network code.
-Activity context stays off until enabled in Membrie's Privacy & Capture screen, and this
-phase does not take screenshots or record keyboard input. GNOME may require one log out and back in before it
+Activity context and Screen Memory stay off until enabled in Membrie's Privacy & Capture
+screen. Screen Memory takes one-shot samples of the active window, filters unchanged
+frames locally, removes each PNG from disk before local Ollama analysis, and never
+records keyboard or pointer input. GNOME may require one log out and back in before it
 can load a newly installed local extension; the installer queues it to enable on that
 next login. After the bridge is enabled, start Membrie:
 

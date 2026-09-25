@@ -27,6 +27,11 @@ The installer places files in:
 
 No service runs as root. The database and local socket are readable only by the user.
 
+Screen Memory additionally uses a private directory beneath `$XDG_RUNTIME_DIR` for
+short-lived active-window PNGs. It removes each image before local Ollama analysis begins;
+only labeled text context is stored in the database. Screen Memory is off by default and
+requires a local vision model such as `gemma4:e2b`.
+
 ## Backups
 
 Membrie creates a verified SQLite snapshot when the daemon starts if the latest backup

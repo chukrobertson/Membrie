@@ -1,6 +1,6 @@
 {
   "uuid": "membrie@chuk.local",
   "name": "Membrie Desktop Bridge",
-  "description": "Local-only GNOME Shell bridge for Membrie. It provides clipboard text and, only when enabled in Membrie, focused application, window-title, lock, and idle context to the local capture service. It does not capture screenshots or send data over a network.",
+  "description": "Local-only GNOME Shell bridge for Membrie. It provides clipboard text and focused desktop context, and can provide one-shot active-window samples to Membrie's local capture service. It has no network code.",
   "shell-version": ["50"]
 }

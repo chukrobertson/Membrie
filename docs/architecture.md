@@ -62,7 +62,24 @@ An idle, lock, pause, exclusion, bridge loss, restart, manual finish, or disable
 closes the session. The daemon then atomically materializes one time-bounded Activity
 Remembrie and its enrichment job, keeping the Timeline and Brie's citations at the
 meaningful-session level rather than exposing low-level input events. No key presses,
-pointer events, or screenshots are captured in this phase.
+or pointer events are captured.
+
+Screen Memory is a separate opt-in layered on activity context. The capture helper asks
+the GNOME bridge for a one-shot PNG of only the focused window, never a continuous video.
+It reduces the image to a small luminance fingerprint and discards frames that are not
+materially different from the last useful sample. A changed PNG is accepted only while
+the activity session remains open and the same pause, exclusion, private-window,
+password-manager, title, and secret policies permit it. The daemon reads images only
+from Membrie's private runtime spool, validates their type and size, and deletes each PNG
+before asking the selected local vision model for a description. Ollama remains fixed to
+`127.0.0.1`; the bridge itself has no network code.
+
+Only the locally generated description, useful visible text, confidence, model provenance,
+and active-window metadata enter SQLite. Model output is scanned again for recognizable
+secrets. Activity Remembries label this material as machine-described, fallible supporting
+context, and Brie is instructed not to treat a compose window or open form as proof that an
+action was completed. Screen Memory is off by default and automatically turns off when
+activity context is disabled. No screenshot pixels are retained in this first mode.
 
 ## Storage
 

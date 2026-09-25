@@ -132,11 +132,29 @@ pub struct CaptureStatus {
     pub activity_current_app: Option<String>,
     #[serde(default)]
     pub activity_current_window: Option<String>,
+    #[serde(default)]
+    pub screen_enabled: bool,
+    #[serde(default = "default_screen_sample_interval_ms")]
+    pub screen_sample_interval_ms: u64,
+    #[serde(default = "default_screen_model")]
+    pub screen_model: String,
+    #[serde(default)]
+    pub screen_observation_count: u64,
+    #[serde(default)]
+    pub screen_failed_count: u64,
     pub database_path: String,
 }
 
 pub const fn default_activity_idle_threshold_ms() -> u64 {
     15 * 60 * 1000
+}
+
+pub const fn default_screen_sample_interval_ms() -> u64 {
+    2 * 60 * 1000
+}
+
+pub fn default_screen_model() -> String {
+    "gemma4:e2b".to_owned()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -154,6 +172,35 @@ pub struct ActivityRecordResult {
     pub outcome: String,
     pub reason: Option<String>,
     pub session_id: Option<String>,
+    #[serde(default)]
+    pub screen_capture_allowed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ScreenCaptureCandidate {
+    pub session_id: String,
+    pub screenshot_path: String,
+    pub app_id: String,
+    pub app_name: String,
+    pub window_title: String,
+    pub observed_at_ms: Option<i64>,
+    pub width: u32,
+    pub height: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ScreenAnalysis {
+    pub description: String,
+    pub visible_text: String,
+    pub confidence: String,
+    pub model: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ScreenCaptureResult {
+    pub outcome: String,
+    pub reason: Option<String>,
+    pub observation_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

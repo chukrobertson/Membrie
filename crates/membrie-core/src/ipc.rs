@@ -1,7 +1,7 @@
 use crate::model::{
     ActivityRecordResult, ActivitySnapshot, BackupInfo, BrieAnswer, CaptureCandidate,
     CaptureDecision, CaptureRule, CaptureStatus, IntelligenceSettings, IntelligenceStatus,
-    NewRemembrie, PauseMode, Remembrie, SearchHit,
+    NewRemembrie, PauseMode, Remembrie, ScreenCaptureCandidate, ScreenCaptureResult, SearchHit,
 };
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -41,8 +41,20 @@ pub enum Request {
     SetActivityIdleThreshold {
         idle_threshold_ms: u64,
     },
+    SetScreenEnabled {
+        enabled: bool,
+    },
+    SetScreenSampleInterval {
+        sample_interval_ms: u64,
+    },
+    SetScreenModel {
+        model: String,
+    },
     RecordActivity {
         snapshot: ActivitySnapshot,
+    },
+    AnalyzeScreen {
+        candidate: ScreenCaptureCandidate,
     },
     EndActivitySession {
         reason: String,
@@ -83,6 +95,7 @@ pub enum Response {
     PauseUpdated { status: CaptureStatus },
     CaptureSourceUpdated { status: CaptureStatus },
     ActivityRecorded { result: ActivityRecordResult },
+    ScreenAnalyzed { result: ScreenCaptureResult },
     ActivitySessionEnded,
     CaptureRules { rules: Vec<CaptureRule> },
     CaptureRuleAdded { rule: CaptureRule },
@@ -261,12 +274,59 @@ impl DaemonClient {
         }
     }
 
+    pub fn set_screen_enabled(&self, enabled: bool) -> Result<CaptureStatus, ClientError> {
+        match self.request(&Request::SetScreenEnabled { enabled })? {
+            Response::CaptureSourceUpdated { status } => Ok(status),
+            other => Err(ClientError::Rejected(format!(
+                "unexpected response: {other:?}"
+            ))),
+        }
+    }
+
+    pub fn set_screen_sample_interval(
+        &self,
+        sample_interval_ms: u64,
+    ) -> Result<CaptureStatus, ClientError> {
+        match self.request(&Request::SetScreenSampleInterval { sample_interval_ms })? {
+            Response::CaptureSourceUpdated { status } => Ok(status),
+            other => Err(ClientError::Rejected(format!(
+                "unexpected response: {other:?}"
+            ))),
+        }
+    }
+
+    pub fn set_screen_model(&self, model: impl Into<String>) -> Result<CaptureStatus, ClientError> {
+        match self.request(&Request::SetScreenModel {
+            model: model.into(),
+        })? {
+            Response::CaptureSourceUpdated { status } => Ok(status),
+            other => Err(ClientError::Rejected(format!(
+                "unexpected response: {other:?}"
+            ))),
+        }
+    }
+
     pub fn record_activity(
         &self,
         snapshot: ActivitySnapshot,
     ) -> Result<ActivityRecordResult, ClientError> {
         match self.request(&Request::RecordActivity { snapshot })? {
             Response::ActivityRecorded { result } => Ok(result),
+            other => Err(ClientError::Rejected(format!(
+                "unexpected response: {other:?}"
+            ))),
+        }
+    }
+
+    pub fn analyze_screen(
+        &self,
+        candidate: ScreenCaptureCandidate,
+    ) -> Result<ScreenCaptureResult, ClientError> {
+        match self.request_with_timeout(
+            &Request::AnalyzeScreen { candidate },
+            Duration::from_secs(15 * 60),
+        )? {
+            Response::ScreenAnalyzed { result } => Ok(result),
             other => Err(ClientError::Rejected(format!(
                 "unexpected response: {other:?}"
             ))),

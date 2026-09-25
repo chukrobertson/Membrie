@@ -1,7 +1,8 @@
 use crate::model::{
     ActivityRecordResult, ActivitySnapshot, CaptureCandidate, CaptureDecision, CaptureRule,
     CaptureStatus, EmbeddedChunk, IntelligenceSettings, IntelligenceStatus, LocalModel,
-    NewRemembrie, PauseMode, ProcessingJob, Remembrie, SearchHit,
+    NewRemembrie, PauseMode, ProcessingJob, Remembrie, ScreenAnalysis, ScreenCaptureCandidate,
+    ScreenCaptureResult, SearchHit,
 };
 use crate::policy::{MAX_AUTOMATIC_CONTENT_BYTES, exclusion_reason, sensitive_reason};
 use rusqlite::{Connection, DatabaseName, OptionalExtension, Row, params};
@@ -12,7 +13,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use uuid::Uuid;
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 const DUPLICATE_WINDOW_MS: i64 = 24 * 60 * 60 * 1000;
 const MIN_SEMANTIC_SIMILARITY: f64 = 0.25;
 const SEMANTIC_SCORE_WINDOW: f64 = 0.20;
@@ -251,6 +252,40 @@ INSERT OR IGNORE INTO capture_rules(
 );
 "#;
 
+const MIGRATION_5: &str = r#"
+ALTER TABLE capture_state ADD COLUMN screen_enabled INTEGER NOT NULL DEFAULT 0
+    CHECK(screen_enabled IN (0, 1));
+ALTER TABLE capture_state ADD COLUMN screen_sample_interval_ms INTEGER NOT NULL DEFAULT 120000
+    CHECK(screen_sample_interval_ms BETWEEN 30000 AND 300000);
+ALTER TABLE capture_state ADD COLUMN screen_model TEXT NOT NULL DEFAULT 'gemma4:e2b';
+
+CREATE TABLE IF NOT EXISTS screen_observations (
+    id                  TEXT PRIMARY KEY NOT NULL,
+    session_id          TEXT NOT NULL REFERENCES activity_sessions(id) ON DELETE CASCADE,
+    observed_at_ms      INTEGER NOT NULL,
+    app_id              TEXT NOT NULL,
+    app_name            TEXT NOT NULL,
+    window_title        TEXT NOT NULL,
+    width               INTEGER NOT NULL CHECK(width BETWEEN 1 AND 16384),
+    height              INTEGER NOT NULL CHECK(height BETWEEN 1 AND 16384),
+    state               TEXT NOT NULL DEFAULT 'processing'
+                        CHECK(state IN ('processing', 'complete', 'failed')),
+    description         TEXT,
+    visible_text        TEXT,
+    confidence          TEXT CHECK(confidence IS NULL OR confidence IN ('low', 'medium', 'high')),
+    model               TEXT NOT NULL,
+    last_error          TEXT,
+    image_retained      INTEGER NOT NULL DEFAULT 0 CHECK(image_retained = 0),
+    created_at_ms       INTEGER NOT NULL,
+    updated_at_ms       INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_screen_observations_session
+    ON screen_observations(session_id, observed_at_ms);
+CREATE INDEX IF NOT EXISTS idx_screen_observations_state
+    ON screen_observations(state, observed_at_ms DESC);
+"#;
+
 #[derive(Debug, Error)]
 pub enum RepositoryError {
     #[error("database error: {0}")]
@@ -321,6 +356,13 @@ impl Repository {
         if version < 4 {
             let transaction = connection.unchecked_transaction()?;
             transaction.execute_batch(MIGRATION_4)?;
+            transaction.pragma_update(None, "user_version", 4)?;
+            transaction.commit()?;
+            version = 4;
+        }
+        if version < 5 {
+            let transaction = connection.unchecked_transaction()?;
+            transaction.execute_batch(MIGRATION_5)?;
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             transaction.commit()?;
         }
@@ -988,13 +1030,29 @@ impl Repository {
 
     pub fn status(&self) -> Result<CaptureStatus, RepositoryError> {
         let (paused, paused_until_ms) = self.effective_pause(now_ms()?)?;
-        let (clipboard_enabled, activity_enabled, activity_idle_threshold_ms) =
-            self.connection.query_row(
-                "SELECT clipboard_enabled, activity_enabled, activity_idle_threshold_ms
+        let (
+            clipboard_enabled,
+            activity_enabled,
+            activity_idle_threshold_ms,
+            screen_enabled,
+            screen_sample_interval_ms,
+            screen_model,
+        ) = self.connection.query_row(
+            "SELECT clipboard_enabled, activity_enabled, activity_idle_threshold_ms,
+                        screen_enabled, screen_sample_interval_ms, screen_model
                  FROM capture_state WHERE singleton = 1",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )?;
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )?;
         let count = self.connection.query_row(
             "SELECT COUNT(*) FROM remembries WHERE deleted_at_ms IS NULL",
             [],
@@ -1042,6 +1100,14 @@ impl Repository {
                 },
             )
             .optional()?;
+        let (screen_observation_count, screen_failed_count) = self.connection.query_row(
+            "SELECT
+                COALESCE(SUM(state = 'complete'), 0),
+                COALESCE(SUM(state = 'failed'), 0)
+             FROM screen_observations",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
         Ok(CaptureStatus {
             paused,
             paused_until_ms,
@@ -1059,6 +1125,11 @@ impl Repository {
                 .as_ref()
                 .and_then(|activity| activity.1.clone()),
             activity_current_window: current_activity.and_then(|activity| activity.2),
+            screen_enabled,
+            screen_sample_interval_ms,
+            screen_model,
+            screen_observation_count,
+            screen_failed_count,
             database_path: self.path.display().to_string(),
         })
     }
@@ -1109,13 +1180,67 @@ impl Repository {
         let now = now_ms()?;
         self.connection.execute(
             "UPDATE capture_state
-             SET activity_enabled = ?1, updated_at_ms = ?2
+             SET activity_enabled = ?1,
+                 screen_enabled = CASE WHEN ?1 THEN screen_enabled ELSE 0 END,
+                 updated_at_ms = ?2
              WHERE singleton = 1",
             params![activity_enabled, now],
         )?;
         if !activity_enabled {
             self.finish_active_activity_session(now, "activity_disabled")?;
         }
+        self.status()
+    }
+
+    pub fn set_screen_enabled(
+        &self,
+        screen_enabled: bool,
+    ) -> Result<CaptureStatus, RepositoryError> {
+        let activity_enabled = self.connection.query_row(
+            "SELECT activity_enabled FROM capture_state WHERE singleton = 1",
+            [],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if screen_enabled && !activity_enabled {
+            return Err(RepositoryError::Validation(
+                "enable activity context before enabling screen memory".to_owned(),
+            ));
+        }
+        self.connection.execute(
+            "UPDATE capture_state
+             SET screen_enabled = ?1, updated_at_ms = ?2
+             WHERE singleton = 1",
+            params![screen_enabled, now_ms()?],
+        )?;
+        self.status()
+    }
+
+    pub fn set_screen_sample_interval(
+        &self,
+        sample_interval_ms: u64,
+    ) -> Result<CaptureStatus, RepositoryError> {
+        if !(30_000..=300_000).contains(&sample_interval_ms) {
+            return Err(RepositoryError::Validation(
+                "the screen-memory interval must be between 30 seconds and 5 minutes".to_owned(),
+            ));
+        }
+        self.connection.execute(
+            "UPDATE capture_state
+             SET screen_sample_interval_ms = ?1, updated_at_ms = ?2
+             WHERE singleton = 1",
+            params![sample_interval_ms, now_ms()?],
+        )?;
+        self.status()
+    }
+
+    pub fn set_screen_model(&self, model: &str) -> Result<CaptureStatus, RepositoryError> {
+        validate_model_name(model)?;
+        self.connection.execute(
+            "UPDATE capture_state
+             SET screen_model = ?1, updated_at_ms = ?2
+             WHERE singleton = 1",
+            params![model.trim(), now_ms()?],
+        )?;
         self.status()
     }
 
@@ -1152,11 +1277,17 @@ impl Repository {
         }
 
         let (paused, _) = self.effective_pause(now)?;
-        let (activity_enabled, idle_threshold_ms) = self.connection.query_row(
-            "SELECT activity_enabled, activity_idle_threshold_ms
+        let (activity_enabled, idle_threshold_ms, screen_enabled) = self.connection.query_row(
+            "SELECT activity_enabled, activity_idle_threshold_ms, screen_enabled
              FROM capture_state WHERE singleton = 1",
             [],
-            |row| Ok((row.get::<_, bool>(0)?, row.get::<_, u64>(1)?)),
+            |row| {
+                Ok((
+                    row.get::<_, bool>(0)?,
+                    row.get::<_, u64>(1)?,
+                    row.get::<_, bool>(2)?,
+                ))
+            },
         )?;
         if !activity_enabled {
             return Ok(activity_result(
@@ -1309,7 +1440,9 @@ impl Repository {
             }
         }
 
-        Ok(activity_result("recorded", None, Some(&session_id)))
+        let mut result = activity_result("recorded", None, Some(&session_id));
+        result.screen_capture_allowed = screen_enabled;
+        Ok(result)
     }
 
     pub fn end_activity_session(&mut self, reason: &str) -> Result<(), RepositoryError> {
@@ -1327,6 +1460,183 @@ impl Repository {
 
     pub fn reset_interrupted_activity(&mut self) -> Result<(), RepositoryError> {
         self.finish_active_activity_session(now_ms()?, "daemon_restart")?;
+        Ok(())
+    }
+
+    pub fn screen_model_for_candidate(
+        &self,
+        candidate: &ScreenCaptureCandidate,
+    ) -> Result<String, RepositoryError> {
+        validate_screen_candidate(candidate)?;
+        let wall_now = now_ms()?;
+        let observed_at_ms = candidate.observed_at_ms.unwrap_or(wall_now);
+        let (paused, _) = self.effective_pause(observed_at_ms)?;
+        let (activity_enabled, screen_enabled, screen_model) = self.connection.query_row(
+            "SELECT activity_enabled, screen_enabled, screen_model
+                 FROM capture_state WHERE singleton = 1",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, bool>(0)?,
+                    row.get::<_, bool>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )?;
+        if paused || !activity_enabled || !screen_enabled {
+            return Err(RepositoryError::Validation(
+                "screen memory is paused or disabled".to_owned(),
+            ));
+        }
+        let session_exists = self.connection.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM activity_sessions
+                WHERE id = ?1 AND ended_at_ms IS NULL
+             )",
+            [&candidate.session_id],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !session_exists {
+            return Err(RepositoryError::Validation(
+                "the activity session ended before screen analysis began".to_owned(),
+            ));
+        }
+
+        let snapshot = CaptureCandidate {
+            kind: "screen".to_owned(),
+            title: "Screen memory".to_owned(),
+            body: candidate.window_title.clone(),
+            source_app: Some(activity_source_app(&candidate.app_id, &candidate.app_name)),
+            window_title: (!candidate.window_title.trim().is_empty())
+                .then(|| candidate.window_title.clone()),
+            source_uri: None,
+            occurred_at_ms: candidate.observed_at_ms,
+        };
+        let rules = self.list_capture_rules()?;
+        if let Some(rule) = exclusion_reason(&snapshot, &rules) {
+            let label = rule.label.as_deref().unwrap_or("a privacy rule");
+            return Err(RepositoryError::Validation(format!(
+                "screen context is excluded by {label}"
+            )));
+        }
+        if sensitive_reason(&candidate.window_title).is_some() {
+            return Err(RepositoryError::Validation(
+                "the active window title looked sensitive".to_owned(),
+            ));
+        }
+        let session_started_at_ms = self.connection.query_row(
+            "SELECT started_at_ms FROM activity_sessions WHERE id = ?1",
+            [&candidate.session_id],
+            |row| row.get::<_, i64>(0),
+        )?;
+        if observed_at_ms < session_started_at_ms || observed_at_ms > wall_now + 60_000 {
+            return Err(RepositoryError::Validation(
+                "screen timestamp is outside the active session".to_owned(),
+            ));
+        }
+        validate_model_name(&screen_model)?;
+        Ok(screen_model)
+    }
+
+    pub fn record_screen_analysis(
+        &self,
+        candidate: &ScreenCaptureCandidate,
+        analysis: &ScreenAnalysis,
+    ) -> Result<ScreenCaptureResult, RepositoryError> {
+        let model = self.screen_model_for_candidate(candidate)?;
+        if analysis.model != model {
+            return Ok(screen_capture_result(
+                "skipped",
+                Some("the screen model changed while analysis was running"),
+                None,
+            ));
+        }
+        validate_screen_analysis(analysis)?;
+        let combined = format!("{}\n{}", analysis.description, analysis.visible_text);
+        if sensitive_reason(&combined).is_some() {
+            return Ok(screen_capture_result(
+                "skipped",
+                Some("local analysis found content that looked sensitive"),
+                None,
+            ));
+        }
+        if analysis.description.trim().is_empty() && analysis.visible_text.trim().is_empty() {
+            return Ok(screen_capture_result(
+                "skipped",
+                Some("the local screen model found no useful visible context"),
+                None,
+            ));
+        }
+
+        let observation_id = Uuid::now_v7().to_string();
+        let now = now_ms()?;
+        let observed_at_ms = candidate.observed_at_ms.unwrap_or(now);
+        self.connection.execute(
+            "INSERT INTO screen_observations(
+                id, session_id, observed_at_ms, app_id, app_name, window_title,
+                width, height, state, description, visible_text, confidence,
+                model, last_error, image_retained, created_at_ms, updated_at_ms
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'complete', ?9, ?10,
+                      ?11, ?12, NULL, 0, ?13, ?13)",
+            params![
+                observation_id,
+                candidate.session_id,
+                observed_at_ms,
+                candidate.app_id.trim(),
+                candidate.app_name.trim(),
+                candidate.window_title.trim(),
+                candidate.width,
+                candidate.height,
+                analysis.description.trim(),
+                analysis.visible_text.trim(),
+                analysis.confidence,
+                analysis.model,
+                now,
+            ],
+        )?;
+        self.record_capture_event("screen", "stored", None, None, observed_at_ms)?;
+        Ok(screen_capture_result("stored", None, Some(&observation_id)))
+    }
+
+    pub fn record_screen_failure(
+        &self,
+        candidate: &ScreenCaptureCandidate,
+        model: &str,
+        error: &str,
+    ) -> Result<(), RepositoryError> {
+        validate_screen_candidate(candidate)?;
+        validate_model_name(model)?;
+        let session_exists = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM activity_sessions WHERE id = ?1)",
+            [&candidate.session_id],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !session_exists {
+            return Ok(());
+        }
+        let now = now_ms()?;
+        let safe_error: String = error.chars().take(500).collect();
+        self.connection.execute(
+            "INSERT INTO screen_observations(
+                id, session_id, observed_at_ms, app_id, app_name, window_title,
+                width, height, state, description, visible_text, confidence,
+                model, last_error, image_retained, created_at_ms, updated_at_ms
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'failed', NULL, NULL,
+                      NULL, ?9, ?10, 0, ?11, ?11)",
+            params![
+                Uuid::now_v7().to_string(),
+                candidate.session_id,
+                candidate.observed_at_ms.unwrap_or(now),
+                candidate.app_id.trim(),
+                candidate.app_name.trim(),
+                candidate.window_title.trim(),
+                candidate.width,
+                candidate.height,
+                model,
+                safe_error,
+                now,
+            ],
+        )?;
         Ok(())
     }
 
@@ -1552,6 +1862,75 @@ impl Repository {
             ));
         }
 
+        let screen_observations = {
+            let mut statement = self.connection.prepare(
+                "SELECT observed_at_ms, app_name, window_title, description,
+                        visible_text, confidence, model
+                 FROM screen_observations
+                 WHERE session_id = ?1 AND state = 'complete'
+                 ORDER BY observed_at_ms, created_at_ms",
+            )?;
+            let rows = statement.query_map([&session_id], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                ))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        if !screen_observations.is_empty() {
+            body.push_str(
+                "\nMachine-described screen context:\n\
+                 These notes were generated locally from temporary active-window screenshots. \
+                 The screenshots were immediately deleted. Descriptions can be incomplete or wrong, \
+                 so they are supporting context—not confirmation that an action occurred.\n",
+            );
+            let mut included_screen = 0_usize;
+            for (
+                observed_at_ms,
+                app_name,
+                window_title,
+                description,
+                visible_text,
+                confidence,
+                model,
+            ) in &screen_observations
+            {
+                let offset_minutes = (observed_at_ms - started_at_ms).max(0) / 60_000;
+                let window = if window_title.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!(" — {}", window_title.trim())
+                };
+                let visible = if visible_text.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!(" Visible text: {}", normalize_screen_text(visible_text))
+                };
+                let line = format!(
+                    "- +{offset_minutes}m: {}{window} [{confidence} confidence; model {model}] {}{visible}\n",
+                    app_name.trim(),
+                    normalize_screen_text(description),
+                );
+                if body.chars().count() + line.chars().count() > 20_000 {
+                    break;
+                }
+                body.push_str(&line);
+                included_screen += 1;
+            }
+            if included_screen < screen_observations.len() {
+                body.push_str(&format!(
+                    "- {} additional machine-described screen observations remain in the local ledger.\n",
+                    screen_observations.len() - included_screen
+                ));
+            }
+        }
+
         let now = now_ms()?;
         let remembrie_id = Uuid::now_v7().to_string();
         let content_id = Uuid::now_v7().to_string();
@@ -1731,6 +2110,62 @@ fn validate_activity_text(
     Ok(())
 }
 
+fn validate_screen_candidate(candidate: &ScreenCaptureCandidate) -> Result<(), RepositoryError> {
+    validate_activity_text("activity session identifier", &candidate.session_id, 128)?;
+    validate_activity_text("screenshot path", &candidate.screenshot_path, 4096)?;
+    validate_activity_text("application identifier", &candidate.app_id, 512)?;
+    validate_activity_text("application name", &candidate.app_name, 512)?;
+    validate_activity_text("window title", &candidate.window_title, 4096)?;
+    if candidate.session_id.trim().is_empty() || candidate.screenshot_path.trim().is_empty() {
+        return Err(RepositoryError::Validation(
+            "screen capture needs a session and temporary image".to_owned(),
+        ));
+    }
+    if !(1..=16_384).contains(&candidate.width) || !(1..=16_384).contains(&candidate.height) {
+        return Err(RepositoryError::Validation(
+            "screen dimensions are outside the supported range".to_owned(),
+        ));
+    }
+    if candidate
+        .observed_at_ms
+        .is_some_and(|timestamp| timestamp < 0)
+    {
+        return Err(RepositoryError::Validation(
+            "screen timestamps cannot be negative".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_screen_analysis(analysis: &ScreenAnalysis) -> Result<(), RepositoryError> {
+    validate_activity_text("screen description", &analysis.description, 2_000)?;
+    validate_activity_text("visible screen text", &analysis.visible_text, 8_000)?;
+    validate_model_name(&analysis.model)?;
+    if !matches!(analysis.confidence.as_str(), "low" | "medium" | "high") {
+        return Err(RepositoryError::Validation(
+            "screen-analysis confidence must be low, medium, or high".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn activity_source_app(app_id: &str, app_name: &str) -> String {
+    let app_id = app_id.trim();
+    let app_name = app_name.trim();
+    match (app_name.is_empty(), app_id.is_empty()) {
+        (false, false) if !app_name.eq_ignore_ascii_case(app_id) => {
+            format!("{app_name} ({app_id})")
+        }
+        (false, _) => app_name.to_owned(),
+        (_, false) => app_id.to_owned(),
+        _ => "Desktop".to_owned(),
+    }
+}
+
+fn normalize_screen_text(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 fn activity_result(
     outcome: &str,
     reason: Option<&str>,
@@ -1740,6 +2175,19 @@ fn activity_result(
         outcome: outcome.to_owned(),
         reason: reason.map(str::to_owned),
         session_id: session_id.map(str::to_owned),
+        screen_capture_allowed: false,
+    }
+}
+
+fn screen_capture_result(
+    outcome: &str,
+    reason: Option<&str>,
+    observation_id: Option<&str>,
+) -> ScreenCaptureResult {
+    ScreenCaptureResult {
+        outcome: outcome.to_owned(),
+        reason: reason.map(str::to_owned),
+        observation_id: observation_id.map(str::to_owned),
     }
 }
 
@@ -1826,6 +2274,11 @@ fn validate_model_name(name: &str) -> Result<(), RepositoryError> {
     }) {
         return Err(RepositoryError::Validation(
             "model names contain an unsupported character".to_owned(),
+        ));
+    }
+    if name.to_ascii_lowercase().contains("cloud") {
+        return Err(RepositoryError::Validation(
+            "cloud-backed model names are not allowed in Membrie".to_owned(),
         ));
     }
     Ok(())
@@ -1973,6 +2426,9 @@ mod tests {
         let status = repository.status().unwrap();
         assert!(!status.activity_enabled);
         assert_eq!(status.activity_idle_threshold_ms, 15 * 60 * 1000);
+        assert!(!status.screen_enabled);
+        assert_eq!(status.screen_sample_interval_ms, 2 * 60 * 1000);
+        assert_eq!(status.screen_model, "gemma4:e2b");
         assert!(
             repository
                 .list_capture_rules()
@@ -2094,6 +2550,110 @@ mod tests {
         let remembries = repository.list_recent(10).unwrap();
         assert_eq!(remembries.len(), 1);
         assert_eq!(remembries[0].ended_at_ms, Some(start + 60_000));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn screen_memory_is_opt_in_and_materializes_labeled_context() {
+        let path = temporary_database("screen-memory");
+        let mut repository = Repository::open(&path).unwrap();
+        assert!(repository.set_screen_enabled(true).is_err());
+        repository.set_activity_enabled(true).unwrap();
+        repository.set_screen_enabled(true).unwrap();
+        let start = now_ms().unwrap() - 60_000;
+        let activity = repository
+            .record_activity_snapshot(activity_snapshot(
+                start,
+                "google-chrome.desktop",
+                "Google Chrome",
+                "Compose email to Duke Jones",
+                0,
+            ))
+            .unwrap();
+        assert!(activity.screen_capture_allowed);
+        let candidate = ScreenCaptureCandidate {
+            session_id: activity.session_id.unwrap(),
+            screenshot_path: "/run/user/1000/membrie-screen/example.png".to_owned(),
+            app_id: "google-chrome.desktop".to_owned(),
+            app_name: "Google Chrome".to_owned(),
+            window_title: "Compose email to Duke Jones".to_owned(),
+            observed_at_ms: Some(start + 1_000),
+            width: 1200,
+            height: 800,
+        };
+        assert_eq!(
+            repository.screen_model_for_candidate(&candidate).unwrap(),
+            "gemma4:e2b"
+        );
+        let stored = repository
+            .record_screen_analysis(
+                &candidate,
+                &ScreenAnalysis {
+                    description: "An email compose window is open.".to_owned(),
+                    visible_text: "To: Duke Jones; Subject: Meeting notes".to_owned(),
+                    confidence: "high".to_owned(),
+                    model: "gemma4:e2b".to_owned(),
+                },
+            )
+            .unwrap();
+        assert_eq!(stored.outcome, "stored");
+        repository.end_activity_session("manual").unwrap();
+
+        let remembries = repository.list_recent(10).unwrap();
+        assert_eq!(remembries.len(), 1);
+        assert!(
+            remembries[0]
+                .body
+                .contains("Machine-described screen context")
+        );
+        assert!(
+            remembries[0]
+                .body
+                .contains("supporting context—not confirmation")
+        );
+        assert!(remembries[0].body.contains("Duke Jones"));
+        assert_eq!(repository.status().unwrap().screen_observation_count, 1);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn sensitive_screen_analysis_is_not_stored() {
+        let path = temporary_database("screen-sensitive");
+        let mut repository = Repository::open(&path).unwrap();
+        repository.set_activity_enabled(true).unwrap();
+        repository.set_screen_enabled(true).unwrap();
+        let start = now_ms().unwrap() - 1_000;
+        let activity = repository
+            .record_activity_snapshot(activity_snapshot(
+                start,
+                "org.gnome.TextEditor",
+                "Text Editor",
+                "Ordinary notes",
+                0,
+            ))
+            .unwrap();
+        let result = repository
+            .record_screen_analysis(
+                &ScreenCaptureCandidate {
+                    session_id: activity.session_id.unwrap(),
+                    screenshot_path: "/run/user/1000/membrie-screen/example.png".to_owned(),
+                    app_id: "org.gnome.TextEditor".to_owned(),
+                    app_name: "Text Editor".to_owned(),
+                    window_title: "Ordinary notes".to_owned(),
+                    observed_at_ms: Some(start),
+                    width: 800,
+                    height: 600,
+                },
+                &ScreenAnalysis {
+                    description: "A note contains an AWS access key.".to_owned(),
+                    visible_text: "AKIAIOSFODNN7EXAMPLE".to_owned(),
+                    confidence: "high".to_owned(),
+                    model: "gemma4:e2b".to_owned(),
+                },
+            )
+            .unwrap();
+        assert_eq!(result.outcome, "skipped");
+        assert_eq!(repository.status().unwrap().screen_observation_count, 0);
         let _ = fs::remove_file(path);
     }
 

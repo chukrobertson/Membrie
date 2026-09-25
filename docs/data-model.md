@@ -13,13 +13,15 @@ not an individual key press or low-level operating-system event.
 - `capture_events`: content-free decisions for stored or skipped automatic events
 - `activity_sessions`: bounded active-use periods and their closing reason
 - `activity_observations`: deduplicated focused application and window-title changes
+- `screen_observations`: explicitly labeled local vision descriptions tied to activity sessions;
+  temporary source images are not retained
 
 ## Derived records
 
 - `remembrie_fts`: replaceable full-text projection
 - `remembrie_chunks`: citation-addressable excerpts for retrieval
 - `embeddings`: vectors with model and dimensionality provenance
-- `derived_artifacts`: summaries, OCR, entities, and other model output
+- `derived_artifacts`: summaries, future dedicated OCR, entities, and other model output
 - `processing_jobs`: durable background work and retry state
 - `intelligence_settings`: selected local Ollama models and bounded working context
 

@@ -24,6 +24,14 @@ pub fn backup_dir() -> PathBuf {
     data_dir().join("backups")
 }
 
+pub fn screen_spool_dir() -> PathBuf {
+    if let Some(path) = env::var_os("XDG_RUNTIME_DIR") {
+        return PathBuf::from(path).join("membrie-screen");
+    }
+
+    data_dir().join("screen-spool")
+}
+
 pub fn socket_path() -> PathBuf {
     if let Some(path) = env::var_os("MEMBRIE_SOCKET") {
         return PathBuf::from(path);

@@ -28,6 +28,14 @@ const DBUS_XML = `
       <arg direction="out" type="u" name="idle_ms"/>
       <arg direction="out" type="b" name="locked"/>
     </method>
+    <method name="CaptureWindow">
+      <arg direction="out" type="s" name="path"/>
+      <arg direction="out" type="s" name="app_id"/>
+      <arg direction="out" type="s" name="app_name"/>
+      <arg direction="out" type="s" name="window_title"/>
+      <arg direction="out" type="u" name="width"/>
+      <arg direction="out" type="u" name="height"/>
+    </method>
     <signal name="OwnerChanged">
       <arg type="as" name="mimetypes"/>
     </signal>
@@ -43,6 +51,7 @@ class ClipboardBridge {
         this._readGeneration = 0;
         this._readTimeoutId = 0;
         this._cachedText = '';
+        this._screenCaptureInProgress = false;
         this._activitySignalId = 0;
         this._focusWindow = null;
         this._titleChangedId = 0;
@@ -151,19 +160,116 @@ class ClipboardBridge {
     }
 
     GetActivityState() {
-        const window = global.display.focus_window;
-        let appId = '';
-        let appName = '';
-        let windowTitle = '';
-        if (window !== null) {
-            const app = this._windowTracker.get_window_app(window);
-            appId = app?.get_id() ?? window.get_wm_class() ?? '';
-            appName = app?.get_name() ?? window.get_wm_class() ?? '';
-            windowTitle = window.get_title() ?? '';
-        }
+        const [, appId, appName, windowTitle] = this._focusedWindowInfo();
         const idleTime = Math.max(0, Math.trunc(this._idleMonitor.get_idletime()));
         const idleMs = Math.min(idleTime, 0xffffffff);
         return [appId, appName, windowTitle, idleMs, Boolean(Main.sessionMode.isLocked)];
+    }
+
+    CaptureWindowAsync(_parameters, invocation) {
+        if (this._screenCaptureInProgress) {
+            invocation.return_dbus_error(
+                'com.chuk.Membrie.Error.Busy',
+                'A private screen sample is already being captured'
+            );
+            return;
+        }
+        if (Main.sessionMode.isLocked) {
+            invocation.return_dbus_error(
+                'com.chuk.Membrie.Error.Locked',
+                'The screen is locked'
+            );
+            return;
+        }
+
+        const [window, appId, appName, windowTitle] = this._focusedWindowInfo();
+        if (window === null) {
+            invocation.return_dbus_error(
+                'com.chuk.Membrie.Error.NoWindow',
+                'There is no focused window to sample'
+            );
+            return;
+        }
+
+        const directory = GLib.build_filenamev([
+            GLib.get_user_runtime_dir(),
+            'membrie-screen',
+        ]);
+        if (GLib.mkdir_with_parents(directory, 0o700) !== 0) {
+            invocation.return_dbus_error(
+                'com.chuk.Membrie.Error.Storage',
+                'The private screen spool could not be prepared'
+            );
+            return;
+        }
+        const path = GLib.build_filenamev([
+            directory,
+            `${GLib.uuid_string_random()}.png`,
+        ]);
+        const file = Gio.File.new_for_path(path);
+        let stream;
+        try {
+            stream = file.replace(
+                null,
+                false,
+                Gio.FileCreateFlags.PRIVATE | Gio.FileCreateFlags.REPLACE_DESTINATION,
+                null
+            );
+        } catch (error) {
+            invocation.return_dbus_error(
+                'com.chuk.Membrie.Error.Storage',
+                error.message
+            );
+            return;
+        }
+
+        this._screenCaptureInProgress = true;
+        const screenshot = new Shell.Screenshot();
+        screenshot.screenshot_window(true, false, stream, (source, result) => {
+            try {
+                const [success, area] = source.screenshot_window_finish(result);
+                stream.close(null);
+                const [currentWindow] = this._focusedWindowInfo();
+                if (!success || currentWindow !== window)
+                    throw new Error('The focused window changed during capture');
+                invocation.return_value(new GLib.Variant('(ssssuu)', [
+                    path,
+                    appId,
+                    appName,
+                    windowTitle,
+                    Math.max(1, area.width),
+                    Math.max(1, area.height),
+                ]));
+            } catch (error) {
+                try {
+                    stream.close(null);
+                } catch (_closeError) {
+                    // The stream may already be closed by the screenshot operation.
+                }
+                try {
+                    file.delete(null);
+                } catch (_deleteError) {
+                    // The daemon also rejects stale or missing spool files.
+                }
+                invocation.return_dbus_error(
+                    'com.chuk.Membrie.Error.Capture',
+                    error.message
+                );
+            } finally {
+                this._screenCaptureInProgress = false;
+            }
+        });
+    }
+
+    _focusedWindowInfo() {
+        const window = global.display.focus_window;
+        if (window === null)
+            return [null, '', '', ''];
+        const app = this._windowTracker.get_window_app(window);
+        const appId = app?.get_id() ?? window.get_wm_class() ?? '';
+        const appName = app?.get_name() ?? window.get_wm_class() ?? '';
+        const windowTitle = window.get_title() ?? '';
+        return [window, appId, appName, windowTitle];
     }
 
     _trackFocusedWindow() {
