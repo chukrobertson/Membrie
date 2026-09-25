@@ -51,7 +51,7 @@ install -Dm644 "$temporary_desktop" "$desktop_file"
 "$project_dir/scripts/install-gnome-extension.sh"
 
 systemctl --user daemon-reload
-systemctl --user enable membried.service membrie-capture.service >/dev/null
+systemctl --user reenable membried.service membrie-capture.service >/dev/null
 systemctl --user start membried.service || true
 systemctl --user start membrie-capture.service || true
 

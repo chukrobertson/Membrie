@@ -2,7 +2,8 @@
 Description=Membrie GNOME clipboard capture service
 Documentation=https://github.com/chukrobertson/Membrie
 Requires=membried.service
-After=membried.service graphical-session.target
+After=membried.service
+PartOf=graphical-session.target
 
 [Service]
 Type=simple
@@ -15,4 +16,4 @@ PrivateTmp=true
 ProtectSystem=strict
 
 [Install]
-WantedBy=default.target
+WantedBy=graphical-session.target

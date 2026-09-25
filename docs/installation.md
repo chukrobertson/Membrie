@@ -65,7 +65,9 @@ systemctl --user status membried.service membrie-capture.service
 ```
 
 The clipboard helper intentionally restarts if it comes up before the GNOME bridge is
-ready.
+ready. It is attached to GNOME's graphical-session lifecycle, so logging out stops it
+cleanly and the next graphical login starts it again. The database daemon remains
+available as a separate per-user service.
 
 ## Uninstall
 
