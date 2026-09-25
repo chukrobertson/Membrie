@@ -25,10 +25,41 @@ The project is intentionally local-only:
 - Built-in password-manager and private-window exclusions
 - User-managed application exclusion rules
 - Temporary capture pauses and deletion by recent time range
+- Daily integrity-checked local backups with a rolling 14-backup history
+- Capture-service health reporting in the Privacy screen
+- Rootless Ubuntu installation, app launcher, and automatic user services
 
 Brie, OCR, embeddings, application-context adapters, and the interactive constellation
 are the next implementation milestones. Their UI surfaces are present but clearly
 marked as in progress.
+
+## Install on Ubuntu
+
+Install the native build requirements once:
+
+```bash
+sudo apt install build-essential cargo pkg-config libgtk-4-dev libadwaita-1-dev libglib2.0-dev gnome-shell
+```
+
+Then run the local installer from this checkout:
+
+```bash
+./scripts/install.sh
+```
+
+The installer never uses `sudo`. It builds Membrie, installs it only for the current
+user, adds it to the Ubuntu app grid, installs the GNOME clipboard bridge, and starts
+the local daemon and capture helper automatically at login. A new GNOME extension may
+need one log out and back in before clipboard capture becomes available.
+
+To remove the installed application while keeping every Remembrie and backup:
+
+```bash
+./scripts/uninstall.sh
+```
+
+See [Installation and data safety](docs/installation.md) for the installed locations,
+service checks, and backup details.
 
 ## Run the development build
 
@@ -60,6 +91,9 @@ $XDG_DATA_HOME/membrie/membrie.db
 
 or `~/.local/share/membrie/membrie.db` when `XDG_DATA_HOME` is unset. The socket is
 placed under `$XDG_RUNTIME_DIR` when available.
+
+Verified backups are written to `~/.local/share/membrie/backups` (or the equivalent
+directory beneath `$XDG_DATA_HOME`). Nothing is uploaded or transmitted.
 
 For an isolated development database:
 

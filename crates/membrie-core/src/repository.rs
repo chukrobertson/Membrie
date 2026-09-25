@@ -3,7 +3,7 @@ use crate::model::{
     Remembrie, SearchHit,
 };
 use crate::policy::{MAX_AUTOMATIC_CONTENT_BYTES, exclusion_reason, sensitive_reason};
-use rusqlite::{Connection, OptionalExtension, Row, params};
+use rusqlite::{Connection, DatabaseName, OptionalExtension, Row, params};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -231,6 +231,32 @@ impl Repository {
             connection,
             path: path.to_path_buf(),
         })
+    }
+
+    pub fn backup_to(&self, destination: impl AsRef<Path>) -> Result<(), RepositoryError> {
+        let destination = destination.as_ref();
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        self.connection
+            .backup(DatabaseName::Main, destination, None)?;
+
+        let backup = Connection::open(destination)?;
+        let integrity: String =
+            backup.pragma_query_value(None, "integrity_check", |row| row.get(0))?;
+        if integrity != "ok" {
+            return Err(RepositoryError::Validation(format!(
+                "backup integrity check failed: {integrity}"
+            )));
+        }
+        drop(backup);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(destination, fs::Permissions::from_mode(0o600))?;
+        }
+        Ok(())
     }
 
     pub fn create(&mut self, input: NewRemembrie) -> Result<Remembrie, RepositoryError> {
@@ -465,6 +491,7 @@ impl Repository {
             skipped_total,
             skipped_sensitive,
             skipped_duplicate,
+            clipboard_agent_last_seen_ms: None,
             database_path: self.path.display().to_string(),
         })
     }
@@ -839,6 +866,7 @@ mod tests {
         let repository = Repository::open(&path).unwrap();
         let status = repository.status().unwrap();
         assert!(!status.clipboard_enabled);
+        assert!(status.clipboard_agent_last_seen_ms.is_none());
         assert!(
             repository
                 .list_capture_rules()
@@ -847,6 +875,28 @@ mod tests {
                 .any(|rule| rule.label.as_deref() == Some("Bitwarden"))
         );
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn creates_an_integrity_checked_backup() {
+        let path = temporary_database("backup-source");
+        let backup_path = temporary_database("backup-destination");
+        let mut repository = Repository::open(&path).unwrap();
+        repository
+            .create(NewRemembrie::manual(
+                "Worth keeping",
+                "A verified database snapshot should contain this.",
+            ))
+            .unwrap();
+
+        repository.backup_to(&backup_path).unwrap();
+        let backup = Repository::open(&backup_path).unwrap();
+        let remembries = backup.list_recent(10).unwrap();
+        assert_eq!(remembries.len(), 1);
+        assert_eq!(remembries[0].title, "Worth keeping");
+
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(backup_path);
     }
 
     #[test]

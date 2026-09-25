@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+  <defs>
+    <linearGradient id="background" x1="28" y1="20" x2="226" y2="238" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#8167f1"/>
+      <stop offset="1" stop-color="#4932a8"/>
+    </linearGradient>
+    <linearGradient id="memory" x1="64" y1="71" x2="195" y2="184" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#d9d3ff"/>
+    </linearGradient>
+  </defs>
+  <rect x="16" y="16" width="224" height="224" rx="54" fill="url(#background)"/>
+  <path d="M61 181V82c0-10 12-15 20-8l47 46 47-46c8-7 20-2 20 8v99"
+        fill="none" stroke="url(#memory)" stroke-width="19" stroke-linecap="round" stroke-linejoin="round"/>
+  <g fill="#ffffff">
+    <circle cx="61" cy="181" r="12"/>
+    <circle cx="61" cy="82" r="12"/>
+    <circle cx="128" cy="120" r="12"/>
+    <circle cx="195" cy="82" r="12"/>
+    <circle cx="195" cy="181" r="12"/>
+  </g>
+</svg>

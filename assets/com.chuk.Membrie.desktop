@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Membrie
+GenericName=Memory Companion
+Comment=Remember and recall your activity privately
+Exec=@MEMBRIE_EXEC@
+TryExec=@MEMBRIE_EXEC@
+Icon=com.chuk.Membrie
+Terminal=false
+Categories=Utility;
+Keywords=memory;recall;notes;clipboard;local;
+StartupNotify=true

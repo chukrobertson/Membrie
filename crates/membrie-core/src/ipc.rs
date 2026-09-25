@@ -1,6 +1,6 @@
 use crate::model::{
-    CaptureCandidate, CaptureDecision, CaptureRule, CaptureStatus, NewRemembrie, PauseMode,
-    Remembrie, SearchHit,
+    BackupInfo, CaptureCandidate, CaptureDecision, CaptureRule, CaptureStatus, NewRemembrie,
+    PauseMode, Remembrie, SearchHit,
 };
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -46,6 +46,9 @@ pub enum Request {
     DeleteSince {
         timestamp_ms: i64,
     },
+    ClipboardAgentHeartbeat,
+    CreateBackup,
+    ListBackups,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -62,6 +65,9 @@ pub enum Response {
     CaptureRuleAdded { rule: CaptureRule },
     CaptureRuleDeleted { id: String },
     Deleted { count: u64 },
+    CaptureAgentHeartbeatRecorded { status: CaptureStatus },
+    BackupCreated { backup: BackupInfo },
+    Backups { backups: Vec<BackupInfo> },
     Error { message: String },
 }
 
@@ -235,6 +241,33 @@ impl DaemonClient {
     pub fn delete_since(&self, timestamp_ms: i64) -> Result<u64, ClientError> {
         match self.request(&Request::DeleteSince { timestamp_ms })? {
             Response::Deleted { count } => Ok(count),
+            other => Err(ClientError::Rejected(format!(
+                "unexpected response: {other:?}"
+            ))),
+        }
+    }
+
+    pub fn record_clipboard_agent_heartbeat(&self) -> Result<CaptureStatus, ClientError> {
+        match self.request(&Request::ClipboardAgentHeartbeat)? {
+            Response::CaptureAgentHeartbeatRecorded { status } => Ok(status),
+            other => Err(ClientError::Rejected(format!(
+                "unexpected response: {other:?}"
+            ))),
+        }
+    }
+
+    pub fn create_backup(&self) -> Result<BackupInfo, ClientError> {
+        match self.request(&Request::CreateBackup)? {
+            Response::BackupCreated { backup } => Ok(backup),
+            other => Err(ClientError::Rejected(format!(
+                "unexpected response: {other:?}"
+            ))),
+        }
+    }
+
+    pub fn list_backups(&self) -> Result<Vec<BackupInfo>, ClientError> {
+        match self.request(&Request::ListBackups)? {
+            Response::Backups { backups } => Ok(backups),
             other => Err(ClientError::Rejected(format!(
                 "unexpected response: {other:?}"
             ))),

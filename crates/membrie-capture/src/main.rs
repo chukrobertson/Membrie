@@ -37,14 +37,24 @@ fn main() -> Result<()> {
     }
 
     let client = DaemonClient::new(socket_path());
+    if let Err(error) = client.record_clipboard_agent_heartbeat() {
+        eprintln!("Could not report clipboard capture health: {error}");
+    }
+    let client_for_signals = client.clone();
     proxy.connect_g_signal(
         None,
         move |proxy, _, signal_name, parameters| match signal_name {
-            "OwnerChanged" => request_clipboard_text(proxy, &client, parameters),
-            "TextReady" => collect_clipboard_text(proxy, &client),
+            "OwnerChanged" => request_clipboard_text(proxy, &client_for_signals, parameters),
+            "TextReady" => collect_clipboard_text(proxy, &client_for_signals),
             _ => {}
         },
     );
+    glib::timeout_add_seconds_local(10, move || {
+        if let Err(error) = client.record_clipboard_agent_heartbeat() {
+            eprintln!("Could not report clipboard capture health: {error}");
+        }
+        glib::ControlFlow::Continue
+    });
 
     println!("Membrie GNOME clipboard capture ready");
     glib::MainLoop::new(None, false).run();

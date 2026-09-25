@@ -20,6 +20,10 @@ pub fn database_path() -> PathBuf {
     data_dir().join("membrie.db")
 }
 
+pub fn backup_dir() -> PathBuf {
+    data_dir().join("backups")
+}
+
 pub fn socket_path() -> PathBuf {
     if let Some(path) = env::var_os("MEMBRIE_SOCKET") {
         return PathBuf::from(path);

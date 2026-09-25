@@ -6,7 +6,7 @@ use membrie_core::{
 };
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const APP_ID: &str = "com.chuk.Membrie";
 const CLIPBOARD_DBUS_NAME: &str = "com.chuk.Membrie.Clipboard";
@@ -29,8 +29,12 @@ struct UiState {
     privacy_stats: gtk::Label,
     clipboard_button: gtk::Button,
     clipboard_bridge_label: gtk::Label,
+    clipboard_agent_label: gtk::Label,
     clipboard_bridge_available: Cell<bool>,
-    timeline_ids: RefCell<Vec<String>>,
+    backup_status: gtk::Label,
+    backup_button: gtk::Button,
+    backup_in_progress: Cell<bool>,
+    timeline_ids: RefCell<Option<Vec<String>>>,
     status_label: gtk::Label,
     pause_button: gtk::MenuButton,
     toast_overlay: adw::ToastOverlay,
@@ -49,6 +53,14 @@ fn build_ui(application: &adw::Application) {
     let clipboard_bridge_label = gtk::Label::new(None);
     clipboard_bridge_label.set_xalign(0.0);
     clipboard_bridge_label.set_wrap(true);
+    let clipboard_agent_label = gtk::Label::new(Some("Clipboard capture service · Checking…"));
+    clipboard_agent_label.set_xalign(0.0);
+    clipboard_agent_label.set_wrap(true);
+    let backup_status = gtk::Label::new(Some("Checking local backups…"));
+    backup_status.set_xalign(0.0);
+    backup_status.set_wrap(true);
+    let backup_button = gtk::Button::with_label("Create backup now");
+    backup_button.set_halign(Align::Start);
     let status_label = gtk::Label::new(Some("Connecting…"));
     status_label.add_css_class("dim-label");
     let pause_button = gtk::MenuButton::builder()
@@ -65,8 +77,12 @@ fn build_ui(application: &adw::Application) {
         privacy_stats,
         clipboard_button,
         clipboard_bridge_label,
+        clipboard_agent_label,
         clipboard_bridge_available: Cell::new(false),
-        timeline_ids: RefCell::new(Vec::new()),
+        backup_status,
+        backup_button,
+        backup_in_progress: Cell::new(false),
+        timeline_ids: RefCell::new(None),
         status_label,
         pause_button,
         toast_overlay: toast_overlay.clone(),
@@ -103,6 +119,7 @@ fn build_ui(application: &adw::Application) {
 
     refresh_clipboard_bridge(&state);
     refresh_status(&state);
+    refresh_backups(&state);
     refresh_timeline(&state);
     refresh_capture_rules(&state);
     let state_for_live_capture = Rc::clone(&state);
@@ -115,6 +132,7 @@ fn build_ui(application: &adw::Application) {
     gtk::glib::timeout_add_seconds_local(30, move || {
         refresh_clipboard_bridge(&state_for_timer);
         refresh_status(&state_for_timer);
+        refresh_backups(&state_for_timer);
         gtk::glib::ControlFlow::Continue
     });
     window.present();
@@ -424,6 +442,7 @@ fn build_privacy_page(state: &Rc<UiState>) -> gtk::Widget {
     clipboard_detail.set_wrap(true);
     status_card.append(&clipboard_heading);
     status_card.append(&state.clipboard_bridge_label);
+    status_card.append(&state.clipboard_agent_label);
     status_card.append(&clipboard_detail);
     status_card.append(&state.clipboard_button);
     let state_for_clipboard = Rc::clone(state);
@@ -452,6 +471,69 @@ fn build_privacy_page(state: &Rc<UiState>) -> gtk::Widget {
         }
     });
     page.append(&status_card);
+
+    let backup_card = gtk::Box::new(Orientation::Vertical, 8);
+    backup_card.add_css_class("card");
+    backup_card.add_css_class("capture-card");
+    let backup_heading = gtk::Label::new(Some("Local backups"));
+    backup_heading.add_css_class("heading");
+    backup_heading.set_xalign(0.0);
+    let backup_detail = gtk::Label::new(Some(
+        "Membrie creates one verified database snapshot per day and keeps the newest 14. Backups stay alongside your local Membrie data on this computer.",
+    ));
+    backup_detail.add_css_class("dim-label");
+    backup_detail.set_xalign(0.0);
+    backup_detail.set_wrap(true);
+    backup_card.append(&backup_heading);
+    backup_card.append(&state.backup_status);
+    backup_card.append(&backup_detail);
+    backup_card.append(&state.backup_button);
+    let state_for_backup = Rc::clone(state);
+    state.backup_button.connect_clicked(move |button| {
+        if state_for_backup.backup_in_progress.replace(true) {
+            return;
+        }
+        button.set_sensitive(false);
+        button.set_label("Creating backup…");
+        let client = state_for_backup.client.clone();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(client.create_backup());
+        });
+        let state = Rc::clone(&state_for_backup);
+        gtk::glib::timeout_add_local(Duration::from_millis(100), move || {
+            match receiver.try_recv() {
+                Ok(Ok(backup)) => {
+                    state.backup_in_progress.set(false);
+                    state.backup_button.set_sensitive(true);
+                    state.backup_button.set_label("Create backup now");
+                    state.backup_status.set_text(&format!(
+                        "Latest backup: {} · {}",
+                        format_timestamp(backup.created_at_ms),
+                        format_file_size(backup.size_bytes)
+                    ));
+                    toast(&state, "Verified local backup created");
+                    gtk::glib::ControlFlow::Break
+                }
+                Ok(Err(error)) => {
+                    state.backup_in_progress.set(false);
+                    state.backup_button.set_sensitive(true);
+                    state.backup_button.set_label("Create backup now");
+                    toast(&state, &format!("Backup failed: {error}"));
+                    gtk::glib::ControlFlow::Break
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    state.backup_in_progress.set(false);
+                    state.backup_button.set_sensitive(true);
+                    state.backup_button.set_label("Create backup now");
+                    toast(&state, "Backup worker stopped unexpectedly");
+                    gtk::glib::ControlFlow::Break
+                }
+            }
+        });
+    });
+    page.append(&backup_card);
 
     let rules_card = gtk::Box::new(Orientation::Vertical, 10);
     rules_card.add_css_class("card");
@@ -622,16 +704,19 @@ fn refresh_timeline(state: &Rc<UiState>) {
                 .iter()
                 .map(|remembrie| remembrie.id.clone())
                 .collect();
-            if *state.timeline_ids.borrow() != ids {
+            if state.timeline_ids.borrow().as_ref() != Some(&ids) {
                 render_remembries(&state.timeline, &remembries);
-                *state.timeline_ids.borrow_mut() = ids;
+                *state.timeline_ids.borrow_mut() = Some(ids);
             }
         }
-        Err(error) => render_error(
-            &state.timeline,
-            "Membrie daemon is not available",
-            &error.to_string(),
-        ),
+        Err(error) => {
+            *state.timeline_ids.borrow_mut() = None;
+            render_error(
+                &state.timeline,
+                "Membrie daemon is not available",
+                &error.to_string(),
+            );
+        }
     }
 }
 
@@ -670,6 +755,11 @@ fn refresh_status(state: &Rc<UiState>) {
             state.status_label.set_text("Daemon offline");
             state.pause_button.set_sensitive(false);
             state.clipboard_button.set_sensitive(false);
+            state
+                .clipboard_agent_label
+                .set_text("Clipboard capture service · Daemon offline");
+            state.clipboard_agent_label.remove_css_class("success");
+            state.clipboard_agent_label.add_css_class("error");
             state
                 .privacy_stats
                 .set_text("Capture statistics are unavailable while the daemon is offline.");
@@ -712,6 +802,22 @@ fn apply_status_ui(state: &UiState, status: &CaptureStatus) {
         } else {
             "Enable clipboard capture"
         });
+    let capture_agent_running = status
+        .clipboard_agent_last_seen_ms
+        .is_some_and(|last_seen| current_time_ms().saturating_sub(last_seen) <= 30_000);
+    if capture_agent_running {
+        state
+            .clipboard_agent_label
+            .set_text("Clipboard capture service · Running");
+        state.clipboard_agent_label.remove_css_class("error");
+        state.clipboard_agent_label.add_css_class("success");
+    } else {
+        state
+            .clipboard_agent_label
+            .set_text("Clipboard capture service · Not responding");
+        state.clipboard_agent_label.remove_css_class("success");
+        state.clipboard_agent_label.add_css_class("error");
+    }
     state.privacy_stats.set_text(&format!(
         "{} Remembries stored · {} automatic events safely skipped\n{} probable secrets blocked · {} duplicates ignored",
         status.remembrie_count,
@@ -719,6 +825,34 @@ fn apply_status_ui(state: &UiState, status: &CaptureStatus) {
         status.skipped_sensitive,
         status.skipped_duplicate
     ));
+}
+
+fn refresh_backups(state: &Rc<UiState>) {
+    match state.client.list_backups() {
+        Ok(backups) => {
+            state
+                .backup_button
+                .set_sensitive(!state.backup_in_progress.get());
+            if let Some(backup) = backups.first() {
+                state.backup_status.set_text(&format!(
+                    "Latest backup: {} · {} · {} stored",
+                    format_timestamp(backup.created_at_ms),
+                    format_file_size(backup.size_bytes),
+                    backups.len()
+                ));
+            } else {
+                state
+                    .backup_status
+                    .set_text("No verified local backups yet");
+            }
+        }
+        Err(_) => {
+            state.backup_button.set_sensitive(false);
+            state
+                .backup_status
+                .set_text("Backups are unavailable while the daemon is offline");
+        }
+    }
 }
 
 fn refresh_capture_rules(state: &Rc<UiState>) {
@@ -886,6 +1020,18 @@ fn format_timestamp(timestamp_ms: i64) -> String {
         .and_then(|date| date.format("%b %-d, %-I:%M %p"))
         .map(|text| text.to_string())
         .unwrap_or_else(|_| "Unknown time".to_owned())
+}
+
+fn format_file_size(size_bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = 1024.0 * KIB;
+    if size_bytes >= MIB as u64 {
+        format!("{:.1} MiB", size_bytes as f64 / MIB)
+    } else if size_bytes >= KIB as u64 {
+        format!("{:.1} KiB", size_bytes as f64 / KIB)
+    } else {
+        format!("{size_bytes} bytes")
+    }
 }
 
 fn current_time_ms() -> i64 {

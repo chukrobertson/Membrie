@@ -45,6 +45,9 @@ Unix socket. There is no network transport in this path.
 
 The desktop UI checks that the bridge actually owns its D-Bus name. It must never show
 clipboard capture as available merely because the database preference is enabled.
+The capture helper also sends a small content-free heartbeat to the daemon. This health
+timestamp exists only in daemon memory, avoiding needless database writes, and lets the
+UI distinguish an installed bridge from a capture process that has stopped responding.
 Application exclusions become fully effective for adapters that provide trusted
 source-application context; arbitrary clipboard text still cannot reliably identify its
 originating application under Wayland.
@@ -54,6 +57,10 @@ originating application under Wayland.
 SQLite owns identity, timestamps, metadata, captured text, processing state, and
 relationships. FTS5 maintains a lexical index. Binary attachments will live in a
 content-addressed directory and be referenced by hash.
+
+The daemon creates backups with SQLite's online backup API, verifies them with
+`integrity_check`, syncs the completed file before publishing it, and retains a rolling
+set of 14 snapshots. A partial or failed snapshot is never presented as a backup.
 
 Embeddings are modeled as derived artifacts with model provenance. Vector retrieval
 will be added behind the search service so its implementation can change without

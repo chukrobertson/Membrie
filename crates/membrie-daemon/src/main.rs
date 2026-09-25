@@ -1,19 +1,30 @@
 use anyhow::{Context, Result, anyhow};
-use membrie_core::{Repository, Request, Response, database_path, socket_path};
-use std::fs;
+use membrie_core::{
+    BackupInfo, Repository, Request, Response, backup_dir, database_path, socket_path,
+};
+use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const MAX_REQUEST_BYTES: u64 = 1_048_576;
+const BACKUP_INTERVAL_MS: i64 = 24 * 60 * 60 * 1000;
+const BACKUP_CHECK_INTERVAL: Duration = Duration::from_secs(60 * 60);
+const MAX_BACKUPS: usize = 14;
+static CLIPBOARD_AGENT_LAST_SEEN_MS: AtomicI64 = AtomicI64::new(0);
 
 fn main() -> Result<()> {
     let database_path = database_path();
     let socket_path = socket_path();
     let repository = Repository::open(&database_path)
         .with_context(|| format!("could not open {}", database_path.display()))?;
+    if let Err(error) = maybe_create_automatic_backup(&repository) {
+        eprintln!("automatic backup failed: {error:#}");
+    }
 
     prepare_socket(&socket_path)?;
     let listener = UnixListener::bind(&socket_path)
@@ -25,6 +36,7 @@ fn main() -> Result<()> {
     println!("  socket:   {}", socket_path.display());
 
     let repository = Arc::new(Mutex::new(repository));
+    start_backup_scheduler(&repository);
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
@@ -85,7 +97,7 @@ fn dispatch(request: Request, repository: &Mutex<Repository>) -> Result<Response
         .map_err(|_| anyhow!("database lock was poisoned"))?;
     match request {
         Request::Status => Ok(Response::Status {
-            status: repository.status()?,
+            status: with_capture_health(repository.status()?),
         }),
         Request::Create { remembrie } => Ok(Response::Created {
             remembrie: repository.create(remembrie)?,
@@ -100,10 +112,10 @@ fn dispatch(request: Request, repository: &Mutex<Repository>) -> Result<Response
             hits: repository.search(&query, limit)?,
         }),
         Request::SetPause { mode } => Ok(Response::PauseUpdated {
-            status: repository.set_pause(mode)?,
+            status: with_capture_health(repository.set_pause(mode)?),
         }),
         Request::SetClipboardEnabled { enabled } => Ok(Response::CaptureSourceUpdated {
-            status: repository.set_clipboard_enabled(enabled)?,
+            status: with_capture_health(repository.set_clipboard_enabled(enabled)?),
         }),
         Request::ListCaptureRules => Ok(Response::CaptureRules {
             rules: repository.list_capture_rules()?,
@@ -127,5 +139,132 @@ fn dispatch(request: Request, repository: &Mutex<Repository>) -> Result<Response
         Request::DeleteSince { timestamp_ms } => Ok(Response::Deleted {
             count: repository.delete_since(timestamp_ms)?,
         }),
+        Request::ClipboardAgentHeartbeat => {
+            CLIPBOARD_AGENT_LAST_SEEN_MS.store(now_ms(), Ordering::Relaxed);
+            Ok(Response::CaptureAgentHeartbeatRecorded {
+                status: with_capture_health(repository.status()?),
+            })
+        }
+        Request::CreateBackup => Ok(Response::BackupCreated {
+            backup: create_backup(&repository)?,
+        }),
+        Request::ListBackups => Ok(Response::Backups {
+            backups: list_backups()?,
+        }),
     }
+}
+
+fn with_capture_health(mut status: membrie_core::CaptureStatus) -> membrie_core::CaptureStatus {
+    let last_seen = CLIPBOARD_AGENT_LAST_SEEN_MS.load(Ordering::Relaxed);
+    status.clipboard_agent_last_seen_ms = (last_seen > 0).then_some(last_seen);
+    status
+}
+
+fn start_backup_scheduler(repository: &Arc<Mutex<Repository>>) {
+    let repository = Arc::clone(repository);
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(BACKUP_CHECK_INTERVAL);
+            let result = repository
+                .lock()
+                .map_err(|_| anyhow!("database lock was poisoned"))
+                .and_then(|repository| maybe_create_automatic_backup(&repository));
+            if let Err(error) = result {
+                eprintln!("automatic backup failed: {error:#}");
+            }
+        }
+    });
+}
+
+fn maybe_create_automatic_backup(repository: &Repository) -> Result<()> {
+    let newest = list_backups()?.into_iter().next();
+    let backup_is_current = newest
+        .as_ref()
+        .is_some_and(|backup| now_ms().saturating_sub(backup.created_at_ms) < BACKUP_INTERVAL_MS);
+    if !backup_is_current {
+        let backup = create_backup(repository)?;
+        println!("Created automatic backup {}", backup.path);
+    }
+    Ok(())
+}
+
+fn create_backup(repository: &Repository) -> Result<BackupInfo> {
+    let directory = backup_dir();
+    fs::create_dir_all(&directory)?;
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
+
+    let mut created_at_ms = now_ms();
+    let destination = loop {
+        let candidate = directory.join(format!("membrie-{created_at_ms}.db"));
+        if !candidate.exists() {
+            break candidate;
+        }
+        created_at_ms += 1;
+    };
+    let partial = destination.with_extension("db.partial");
+    let backup_result = repository.backup_to(&partial);
+    if let Err(error) = backup_result {
+        let _ = fs::remove_file(&partial);
+        return Err(error.into());
+    }
+
+    File::open(&partial)?.sync_all()?;
+    fs::rename(&partial, &destination)?;
+    File::open(&directory)?.sync_all()?;
+
+    let backup = BackupInfo {
+        path: destination.display().to_string(),
+        created_at_ms,
+        size_bytes: fs::metadata(&destination)?.len(),
+    };
+    if let Err(error) = prune_backups() {
+        eprintln!("could not prune old backups: {error:#}");
+    }
+    Ok(backup)
+}
+
+fn list_backups() -> Result<Vec<BackupInfo>> {
+    let directory = backup_dir();
+    if !directory.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut backups = Vec::new();
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(created_at_ms) = name
+            .to_str()
+            .and_then(|name| name.strip_prefix("membrie-"))
+            .and_then(|name| name.strip_suffix(".db"))
+            .and_then(|timestamp| timestamp.parse::<i64>().ok())
+        else {
+            continue;
+        };
+        backups.push(BackupInfo {
+            path: entry.path().display().to_string(),
+            created_at_ms,
+            size_bytes: entry.metadata()?.len(),
+        });
+    }
+    backups.sort_by_key(|backup| std::cmp::Reverse(backup.created_at_ms));
+    Ok(backups)
+}
+
+fn prune_backups() -> Result<()> {
+    for backup in list_backups()?.into_iter().skip(MAX_BACKUPS) {
+        fs::remove_file(&backup.path)
+            .with_context(|| format!("could not prune old backup {}", backup.path))?;
+    }
+    Ok(())
+}
+
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0)
 }

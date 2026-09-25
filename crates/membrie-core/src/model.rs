@@ -56,7 +56,16 @@ pub struct CaptureStatus {
     pub skipped_total: u64,
     pub skipped_sensitive: u64,
     pub skipped_duplicate: u64,
+    #[serde(default)]
+    pub clipboard_agent_last_seen_ms: Option<i64>,
     pub database_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BackupInfo {
+    pub path: String,
+    pub created_at_ms: i64,
+    pub size_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
