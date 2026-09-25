@@ -1,6 +1,6 @@
 use adw::prelude::*;
 use gtk::{Align, Orientation};
-use membrie_a11y::ProbeSummary;
+use membrie_a11y::{ProbeSummary, WindowTarget};
 use membrie_core::{
     ActivitySnapshot, BrieAnswer, BrieCitation, CaptureRule, CaptureStatus, DaemonClient,
     IntelligenceSettings, IntelligenceStatus, LocalModel, NewRemembrie, PauseMode, Remembrie,
@@ -1524,9 +1524,26 @@ fn start_semantic_probe_countdown(parent: &gtk::Button, state: &Rc<UiState>) {
 }
 
 fn run_semantic_probe(parent: &gtk::Button, state: &Rc<UiState>) {
+    let target = match focused_semantic_target() {
+        Ok(target) => target,
+        Err(error) => {
+            finish_semantic_probe(state);
+            let dialog = adw::AlertDialog::builder()
+                .heading("The focused window could not be identified")
+                .body(format!(
+                    "Membrie stopped before inspecting accessibility content and stored nothing.\n\nDetails: {}",
+                    truncate_display_text(&error, 800)
+                ))
+                .build();
+            dialog.add_response("close", "Close");
+            dialog.set_default_response(Some("close"));
+            dialog.present(Some(parent));
+            return;
+        }
+    };
     let (sender, receiver) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let _ = sender.send(membrie_a11y::inspect_active_window(true));
+        let _ = sender.send(membrie_a11y::inspect_target_window(target, true));
     });
     let started_at = Instant::now();
     let parent_for_result = parent.clone();
@@ -1578,6 +1595,44 @@ fn run_semantic_probe(parent: &gtk::Button, state: &Rc<UiState>) {
             }
         }
     });
+}
+
+fn focused_semantic_target() -> Result<WindowTarget, String> {
+    let proxy = gtk::gio::DBusProxy::for_bus_sync(
+        gtk::gio::BusType::Session,
+        gtk::gio::DBusProxyFlags::DO_NOT_AUTO_START,
+        None,
+        CLIPBOARD_DBUS_NAME,
+        CLIPBOARD_DBUS_PATH,
+        CLIPBOARD_DBUS_INTERFACE,
+        None::<&gtk::gio::Cancellable>,
+    )
+    .map_err(|error| format!("the GNOME Desktop Bridge is unavailable: {error}"))?;
+    if proxy.name_owner().is_none() {
+        return Err("the GNOME Desktop Bridge is not connected".to_owned());
+    }
+    let (app_id, app_name, window_title, _idle_ms, locked) = proxy
+        .call_sync(
+            "GetActivityState",
+            None,
+            gtk::gio::DBusCallFlags::NONE,
+            1_000,
+            None::<&gtk::gio::Cancellable>,
+        )
+        .map_err(|error| format!("the focused window could not be read: {error}"))?
+        .try_get::<(String, String, String, u32, bool)>()
+        .map_err(|error| format!("the focused-window identity was not understood: {error}"))?;
+    if locked {
+        return Err("the screen is locked".to_owned());
+    }
+    if app_id.trim().is_empty() && app_name.trim().is_empty() && window_title.trim().is_empty() {
+        return Err("GNOME did not report a focused window".to_owned());
+    }
+    Ok(WindowTarget {
+        app_id,
+        app_name,
+        window_title,
+    })
 }
 
 fn finish_semantic_probe(state: &Rc<UiState>) {
