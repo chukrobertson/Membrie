@@ -185,12 +185,16 @@ pub fn ask_brie(
         } else {
             hit.remembrie.body.as_str()
         };
+        let when = hit
+            .remembrie
+            .ended_at_ms
+            .map(|ended| format!("{} to {ended}", hit.remembrie.occurred_at_ms))
+            .unwrap_or_else(|| hit.remembrie.occurred_at_ms.to_string());
         evidence.push_str(&format!(
-            "\n<SOURCE number=\"{}\" remembrie_id=\"{}\">\nTitle: {}\nWhen: {}\nContent: {}\n</SOURCE>\n",
+            "\n<SOURCE number=\"{}\" remembrie_id=\"{}\">\nTitle: {}\nWhen: {when}\nContent: {}\n</SOURCE>\n",
             index + 1,
             hit.remembrie.id,
             hit.remembrie.title,
-            hit.remembrie.occurred_at_ms,
             truncate_chars(source_text, MAX_EVIDENCE_CHARACTERS)
         ));
     }

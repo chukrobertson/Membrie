@@ -21,6 +21,8 @@ The project is intentionally local-only:
 - Exact full-text search powered by SQLite FTS5/BM25
 - Persistent pause state
 - Safe, explicitly enabled clipboard capture through a local GNOME Shell bridge
+- Optional focused-application and window-title activity sessions with idle boundaries
+- Activity sessions become searchable, cited Remembries without capturing screenshots or input
 - Pre-storage secret detection and duplicate suppression
 - Built-in password-manager and private-window exclusions
 - User-managed application exclusion rules
@@ -33,8 +35,8 @@ The project is intentionally local-only:
 - Brie answers powered by local `gemma4:12b`, with exact Remembrie citations
 - Local model selection and visible indexing health
 
-OCR, application-context adapters, richer citation navigation, and the interactive
-constellation are the next implementation milestones.
+Change-triggered screen keyframes, local OCR, richer citation navigation, and the
+interactive constellation are the next implementation milestones.
 
 ## Install on Ubuntu
 
@@ -51,9 +53,9 @@ Then run the local installer from this checkout:
 ```
 
 The installer never uses `sudo`. It builds Membrie, installs it only for the current
-user, adds it to the Ubuntu app grid, installs the GNOME clipboard bridge, and starts
+user, adds it to the Ubuntu app grid, installs the GNOME desktop bridge, and starts
 the local daemon and capture helper automatically at login. A new GNOME extension may
-need one log out and back in before clipboard capture becomes available.
+need one log out and back in before desktop context and clipboard capture become available.
 
 Brie requires a local Ollama installation and two downloaded models. The recommended
 defaults are:
@@ -78,15 +80,17 @@ service checks, and backup details.
 ## Run the development build
 
 The native development libraries for GTK 4 and libadwaita are required. Install the
-small local GNOME Shell bridge once so Wayland can deliver clipboard changes while
+small local GNOME Shell bridge once so Wayland can deliver clipboard and desktop-context
+changes while
 Membrie is in the background:
 
 ```bash
 ./scripts/install-gnome-extension.sh
 ```
 
-The extension declares its clipboard access in GNOME, exports only a local session-bus
-interface, and has no network code. GNOME may require one log out and back in before it
+The extension exports only a local session-bus interface and has no network code.
+Activity context stays off until enabled in Membrie's Privacy & Capture screen, and this
+phase does not take screenshots or record keyboard input. GNOME may require one log out and back in before it
 can load a newly installed local extension; the installer queues it to enable on that
 next login. After the bridge is enabled, start Membrie:
 
@@ -120,9 +124,9 @@ MEMBRIE_DATA_DIR=/tmp/membrie-dev ./scripts/dev.sh
 ```text
 crates/membrie-core    Canonical model, SQLite repository, paths, and IPC client
 crates/membrie-daemon  Database owner, policy engine, and Unix-socket service
-crates/membrie-capture Local D-Bus client for the GNOME clipboard bridge
+crates/membrie-capture Local D-Bus client for the GNOME desktop bridge
 crates/membrie-app     Native GTK 4/libadwaita application
-gnome-shell-extension  Local clipboard bridge required by GNOME Wayland
+gnome-shell-extension  Local clipboard and desktop-context bridge for GNOME Wayland
 docs/                  Product and architecture decisions
 ```
 

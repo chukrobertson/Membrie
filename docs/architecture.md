@@ -52,6 +52,18 @@ Application exclusions become fully effective for adapters that provide trusted
 source-application context; arbitrary clipboard text still cannot reliably identify its
 originating application under Wayland.
 
+Activity context is independently disabled by default. When enabled, the same GNOME
+bridge exposes the focused application, focused window title, lock state, and Mutter's
+idle time only over the local session bus. The capture helper samples that state and the
+daemon applies pause, application, window, content, private-window, password-manager,
+and secret policies before persistence. Consecutive identical states update only the
+session's last-active time; application or title changes create deduplicated observations.
+An idle, lock, pause, exclusion, bridge loss, restart, manual finish, or disabled source
+closes the session. The daemon then atomically materializes one time-bounded Activity
+Remembrie and its enrichment job, keeping the Timeline and Brie's citations at the
+meaningful-session level rather than exposing low-level input events. No key presses,
+pointer events, or screenshots are captured in this phase.
+
 ## Storage
 
 SQLite owns identity, timestamps, metadata, captured text, processing state, and

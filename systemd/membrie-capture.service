@@ -1,5 +1,5 @@
 [Unit]
-Description=Membrie GNOME clipboard capture service
+Description=Membrie GNOME desktop capture service
 Documentation=https://github.com/chukrobertson/Membrie
 Requires=membried.service
 After=membried.service

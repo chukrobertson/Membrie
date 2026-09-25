@@ -1,7 +1,7 @@
 use crate::model::{
-    CaptureCandidate, CaptureDecision, CaptureRule, CaptureStatus, EmbeddedChunk,
-    IntelligenceSettings, IntelligenceStatus, LocalModel, NewRemembrie, PauseMode, ProcessingJob,
-    Remembrie, SearchHit,
+    ActivityRecordResult, ActivitySnapshot, CaptureCandidate, CaptureDecision, CaptureRule,
+    CaptureStatus, EmbeddedChunk, IntelligenceSettings, IntelligenceStatus, LocalModel,
+    NewRemembrie, PauseMode, ProcessingJob, Remembrie, SearchHit,
 };
 use crate::policy::{MAX_AUTOMATIC_CONTENT_BYTES, exclusion_reason, sensitive_reason};
 use rusqlite::{Connection, DatabaseName, OptionalExtension, Row, params};
@@ -12,7 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use uuid::Uuid;
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 const DUPLICATE_WINDOW_MS: i64 = 24 * 60 * 60 * 1000;
 const MIN_SEMANTIC_SIMILARITY: f64 = 0.25;
 const SEMANTIC_SCORE_WINDOW: f64 = 0.20;
@@ -208,6 +208,49 @@ SET state = 'pending', available_at_ms = 0, updated_at_ms = 0
 WHERE state = 'running';
 "#;
 
+const MIGRATION_4: &str = r#"
+ALTER TABLE capture_state ADD COLUMN activity_enabled INTEGER NOT NULL DEFAULT 0
+    CHECK(activity_enabled IN (0, 1));
+ALTER TABLE capture_state ADD COLUMN activity_idle_threshold_ms INTEGER NOT NULL DEFAULT 900000
+    CHECK(activity_idle_threshold_ms BETWEEN 300000 AND 14400000);
+
+CREATE TABLE IF NOT EXISTS activity_sessions (
+    id                  TEXT PRIMARY KEY NOT NULL,
+    started_at_ms       INTEGER NOT NULL,
+    ended_at_ms         INTEGER,
+    last_active_at_ms   INTEGER NOT NULL,
+    end_reason          TEXT,
+    remembrie_id        TEXT UNIQUE REFERENCES remembries(id) ON DELETE CASCADE,
+    created_at_ms       INTEGER NOT NULL,
+    updated_at_ms       INTEGER NOT NULL,
+    CHECK(ended_at_ms IS NULL OR ended_at_ms >= started_at_ms)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_activity_one_open_session
+    ON activity_sessions((1)) WHERE ended_at_ms IS NULL;
+CREATE INDEX IF NOT EXISTS idx_activity_sessions_time
+    ON activity_sessions(started_at_ms DESC);
+
+CREATE TABLE IF NOT EXISTS activity_observations (
+    id                  TEXT PRIMARY KEY NOT NULL,
+    session_id          TEXT NOT NULL REFERENCES activity_sessions(id) ON DELETE CASCADE,
+    observed_at_ms      INTEGER NOT NULL,
+    app_id              TEXT NOT NULL,
+    app_name            TEXT NOT NULL,
+    window_title        TEXT NOT NULL,
+    created_at_ms       INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_activity_observations_session
+    ON activity_observations(session_id, observed_at_ms);
+
+INSERT OR IGNORE INTO capture_rules(
+    id, rule_type, pattern, enabled, created_at_ms, label, is_default
+) VALUES(
+    'default-membrie', 'app', '*membrie*', 1, 0, 'Membrie itself', 1
+);
+"#;
+
 #[derive(Debug, Error)]
 pub enum RepositoryError {
     #[error("database error: {0}")]
@@ -223,6 +266,14 @@ pub enum RepositoryError {
 pub struct Repository {
     connection: Connection,
     path: PathBuf,
+}
+
+#[derive(Debug)]
+struct ActivityObservationRecord {
+    observed_at_ms: i64,
+    app_id: String,
+    app_name: String,
+    window_title: String,
 }
 
 impl Repository {
@@ -263,6 +314,13 @@ impl Repository {
         if version < 3 {
             let transaction = connection.unchecked_transaction()?;
             transaction.execute_batch(MIGRATION_3)?;
+            transaction.pragma_update(None, "user_version", 3)?;
+            transaction.commit()?;
+            version = 3;
+        }
+        if version < 4 {
+            let transaction = connection.unchecked_transaction()?;
+            transaction.execute_batch(MIGRATION_4)?;
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             transaction.commit()?;
         }
@@ -930,7 +988,13 @@ impl Repository {
 
     pub fn status(&self) -> Result<CaptureStatus, RepositoryError> {
         let (paused, paused_until_ms) = self.effective_pause(now_ms()?)?;
-        let clipboard_enabled = self.clipboard_enabled()?;
+        let (clipboard_enabled, activity_enabled, activity_idle_threshold_ms) =
+            self.connection.query_row(
+                "SELECT clipboard_enabled, activity_enabled, activity_idle_threshold_ms
+                 FROM capture_state WHERE singleton = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
         let count = self.connection.query_row(
             "SELECT COUNT(*) FROM remembries WHERE deleted_at_ms IS NULL",
             [],
@@ -952,6 +1016,32 @@ impl Repository {
                 ))
             },
         )?;
+        let activity_session_count = self.connection.query_row(
+            "SELECT COUNT(*) FROM activity_sessions WHERE ended_at_ms IS NOT NULL",
+            [],
+            |row| row.get::<_, u64>(0),
+        )?;
+        let current_activity = self
+            .connection
+            .query_row(
+                "SELECT s.started_at_ms, o.app_name, o.window_title
+                 FROM activity_sessions s
+                 LEFT JOIN activity_observations o ON o.id = (
+                    SELECT id FROM activity_observations
+                    WHERE session_id = s.id
+                    ORDER BY observed_at_ms DESC, created_at_ms DESC LIMIT 1
+                 )
+                 WHERE s.ended_at_ms IS NULL",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
         Ok(CaptureStatus {
             paused,
             paused_until_ms,
@@ -961,15 +1051,24 @@ impl Repository {
             skipped_sensitive,
             skipped_duplicate,
             clipboard_agent_last_seen_ms: None,
+            activity_enabled,
+            activity_idle_threshold_ms,
+            activity_session_count,
+            activity_active_since_ms: current_activity.as_ref().map(|activity| activity.0),
+            activity_current_app: current_activity
+                .as_ref()
+                .and_then(|activity| activity.1.clone()),
+            activity_current_window: current_activity.and_then(|activity| activity.2),
             database_path: self.path.display().to_string(),
         })
     }
 
-    pub fn set_pause(&self, mode: PauseMode) -> Result<CaptureStatus, RepositoryError> {
+    pub fn set_pause(&mut self, mode: PauseMode) -> Result<CaptureStatus, RepositoryError> {
+        let now = now_ms()?;
         let (paused, paused_until_ms) = match mode {
             PauseMode::Resume => (false, None),
             PauseMode::Until { timestamp_ms } => {
-                if timestamp_ms <= now_ms()? {
+                if timestamp_ms <= now {
                     return Err(RepositoryError::Validation(
                         "pause time must be in the future".to_owned(),
                     ));
@@ -982,8 +1081,11 @@ impl Repository {
             "UPDATE capture_state
              SET paused = ?1, paused_until_ms = ?2, updated_at_ms = ?3
              WHERE singleton = 1",
-            params![paused, paused_until_ms, now_ms()?],
+            params![paused, paused_until_ms, now],
         )?;
+        if paused {
+            self.finish_active_activity_session(now, "capture_paused")?;
+        }
         self.status()
     }
 
@@ -998,6 +1100,234 @@ impl Repository {
             params![clipboard_enabled, now_ms()?],
         )?;
         self.status()
+    }
+
+    pub fn set_activity_enabled(
+        &mut self,
+        activity_enabled: bool,
+    ) -> Result<CaptureStatus, RepositoryError> {
+        let now = now_ms()?;
+        self.connection.execute(
+            "UPDATE capture_state
+             SET activity_enabled = ?1, updated_at_ms = ?2
+             WHERE singleton = 1",
+            params![activity_enabled, now],
+        )?;
+        if !activity_enabled {
+            self.finish_active_activity_session(now, "activity_disabled")?;
+        }
+        self.status()
+    }
+
+    pub fn set_activity_idle_threshold(
+        &self,
+        idle_threshold_ms: u64,
+    ) -> Result<CaptureStatus, RepositoryError> {
+        if !(300_000..=14_400_000).contains(&idle_threshold_ms) {
+            return Err(RepositoryError::Validation(
+                "the activity idle threshold must be between 5 minutes and 4 hours".to_owned(),
+            ));
+        }
+        self.connection.execute(
+            "UPDATE capture_state
+             SET activity_idle_threshold_ms = ?1, updated_at_ms = ?2
+             WHERE singleton = 1",
+            params![idle_threshold_ms, now_ms()?],
+        )?;
+        self.status()
+    }
+
+    pub fn record_activity_snapshot(
+        &mut self,
+        snapshot: ActivitySnapshot,
+    ) -> Result<ActivityRecordResult, RepositoryError> {
+        validate_activity_text("application identifier", &snapshot.app_id, 512)?;
+        validate_activity_text("application name", &snapshot.app_name, 512)?;
+        validate_activity_text("window title", &snapshot.window_title, 4096)?;
+        let now = snapshot.occurred_at_ms.unwrap_or(now_ms()?);
+        if now < 0 {
+            return Err(RepositoryError::Validation(
+                "activity timestamps cannot be negative".to_owned(),
+            ));
+        }
+
+        let (paused, _) = self.effective_pause(now)?;
+        let (activity_enabled, idle_threshold_ms) = self.connection.query_row(
+            "SELECT activity_enabled, activity_idle_threshold_ms
+             FROM capture_state WHERE singleton = 1",
+            [],
+            |row| Ok((row.get::<_, bool>(0)?, row.get::<_, u64>(1)?)),
+        )?;
+        if !activity_enabled {
+            return Ok(activity_result(
+                "ignored",
+                Some("activity capture is disabled"),
+                None,
+            ));
+        }
+
+        let bounded_idle = snapshot.idle_ms.min(now as u64);
+        let last_active_at_ms = now.saturating_sub(bounded_idle as i64);
+        if paused {
+            self.finish_active_activity_session(last_active_at_ms, "capture_paused")?;
+            return Ok(activity_result("ignored", Some("capture is paused"), None));
+        }
+        if snapshot.locked {
+            self.finish_active_activity_session(last_active_at_ms, "screen_locked")?;
+            return Ok(activity_result(
+                "boundary",
+                Some("the screen is locked"),
+                None,
+            ));
+        }
+        if snapshot.idle_ms >= idle_threshold_ms {
+            self.finish_active_activity_session(last_active_at_ms, "idle")?;
+            return Ok(activity_result(
+                "boundary",
+                Some("the computer is idle"),
+                None,
+            ));
+        }
+
+        let app_id = snapshot.app_id.trim();
+        let app_name = snapshot.app_name.trim();
+        let window_title = snapshot.window_title.trim();
+        let source_app = match (app_name.is_empty(), app_id.is_empty()) {
+            (false, false) if !app_name.eq_ignore_ascii_case(app_id) => {
+                format!("{app_name} ({app_id})")
+            }
+            (false, _) => app_name.to_owned(),
+            (_, false) => app_id.to_owned(),
+            _ => "Desktop".to_owned(),
+        };
+        let candidate = CaptureCandidate {
+            kind: "activity".to_owned(),
+            title: "Desktop activity".to_owned(),
+            body: window_title.to_owned(),
+            source_app: Some(source_app),
+            window_title: (!window_title.is_empty()).then(|| window_title.to_owned()),
+            source_uri: None,
+            occurred_at_ms: Some(now),
+        };
+        let rules = self.list_capture_rules()?;
+        if let Some(rule) = exclusion_reason(&candidate, &rules) {
+            self.finish_active_activity_session(last_active_at_ms, "excluded_context")?;
+            let label = rule.label.as_deref().unwrap_or("a privacy rule");
+            return Ok(activity_result(
+                "skipped",
+                Some(&format!("excluded by {label}")),
+                None,
+            ));
+        }
+        if sensitive_reason(window_title).is_some() {
+            self.finish_active_activity_session(last_active_at_ms, "sensitive_context")?;
+            return Ok(activity_result(
+                "skipped",
+                Some("the window title looked sensitive"),
+                None,
+            ));
+        }
+
+        let active_session = self
+            .connection
+            .query_row(
+                "SELECT id FROM activity_sessions WHERE ended_at_ms IS NULL",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if active_session.is_none() && snapshot.idle_ms > 60_000 {
+            return Ok(activity_result(
+                "ignored",
+                Some("waiting for new user activity"),
+                None,
+            ));
+        }
+
+        let session_id = if let Some(id) = active_session {
+            id
+        } else {
+            let id = Uuid::now_v7().to_string();
+            self.connection.execute(
+                "INSERT INTO activity_sessions(
+                    id, started_at_ms, ended_at_ms, last_active_at_ms,
+                    end_reason, remembrie_id, created_at_ms, updated_at_ms
+                 ) VALUES(?1, ?2, NULL, ?2, NULL, NULL, ?2, ?2)",
+                params![id, now],
+            )?;
+            id
+        };
+        self.connection.execute(
+            "UPDATE activity_sessions
+             SET last_active_at_ms = MAX(last_active_at_ms, ?2), updated_at_ms = ?3
+             WHERE id = ?1",
+            params![session_id, last_active_at_ms, now],
+        )?;
+
+        let previous = self
+            .connection
+            .query_row(
+                "SELECT app_id, app_name, window_title
+                 FROM activity_observations WHERE session_id = ?1
+                 ORDER BY observed_at_ms DESC, created_at_ms DESC LIMIT 1",
+                [&session_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let current = (
+            app_id.to_owned(),
+            app_name.to_owned(),
+            window_title.to_owned(),
+        );
+        if previous.as_ref() != Some(&current) {
+            let observation_count = self.connection.query_row(
+                "SELECT COUNT(*) FROM activity_observations WHERE session_id = ?1",
+                [&session_id],
+                |row| row.get::<_, u64>(0),
+            )?;
+            if observation_count < 1000 {
+                self.connection.execute(
+                    "INSERT INTO activity_observations(
+                        id, session_id, observed_at_ms, app_id, app_name,
+                        window_title, created_at_ms
+                     ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?3)",
+                    params![
+                        Uuid::now_v7().to_string(),
+                        session_id,
+                        now,
+                        app_id,
+                        app_name,
+                        window_title
+                    ],
+                )?;
+            }
+        }
+
+        Ok(activity_result("recorded", None, Some(&session_id)))
+    }
+
+    pub fn end_activity_session(&mut self, reason: &str) -> Result<(), RepositoryError> {
+        if !matches!(
+            reason,
+            "desktop_bridge_unavailable" | "service_stopped" | "daemon_restart" | "manual"
+        ) {
+            return Err(RepositoryError::Validation(
+                "unsupported activity-session boundary".to_owned(),
+            ));
+        }
+        self.finish_active_activity_session(now_ms()?, reason)?;
+        Ok(())
+    }
+
+    pub fn reset_interrupted_activity(&mut self) -> Result<(), RepositoryError> {
+        self.finish_active_activity_session(now_ms()?, "daemon_restart")?;
+        Ok(())
     }
 
     pub fn list_capture_rules(&self) -> Result<Vec<CaptureRule>, RepositoryError> {
@@ -1087,18 +1417,193 @@ impl Repository {
         transaction.execute(
             "DELETE FROM remembrie_fts
              WHERE remembrie_id IN (
-                SELECT id FROM remembries WHERE occurred_at_ms >= ?1
+                SELECT id FROM remembries
+                WHERE occurred_at_ms >= ?1
+                   OR id IN (
+                       SELECT remembrie_id FROM activity_sessions
+                       WHERE last_active_at_ms >= ?1 AND remembrie_id IS NOT NULL
+                   )
              )",
             [timestamp_ms],
         )?;
         let count = transaction.execute(
-            "DELETE FROM remembries WHERE occurred_at_ms >= ?1",
+            "DELETE FROM remembries
+             WHERE occurred_at_ms >= ?1
+                OR id IN (
+                    SELECT remembrie_id FROM activity_sessions
+                    WHERE last_active_at_ms >= ?1 AND remembrie_id IS NOT NULL
+                )",
             [timestamp_ms],
         )? as u64;
+        transaction.execute(
+            "DELETE FROM activity_sessions WHERE last_active_at_ms >= ?1",
+            [timestamp_ms],
+        )?;
         transaction.commit()?;
         self.connection
             .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
         Ok(count)
+    }
+
+    fn finish_active_activity_session(
+        &mut self,
+        requested_end_ms: i64,
+        reason: &str,
+    ) -> Result<Option<Remembrie>, RepositoryError> {
+        let session = self
+            .connection
+            .query_row(
+                "SELECT id, started_at_ms, last_active_at_ms FROM activity_sessions
+                 WHERE ended_at_ms IS NULL",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((session_id, started_at_ms, last_active_at_ms)) = session else {
+            return Ok(None);
+        };
+
+        let observations = {
+            let mut statement = self.connection.prepare(
+                "SELECT observed_at_ms, app_id, app_name, window_title
+                 FROM activity_observations WHERE session_id = ?1
+                 ORDER BY observed_at_ms, created_at_ms",
+            )?;
+            let rows = statement.query_map([&session_id], |row| {
+                Ok(ActivityObservationRecord {
+                    observed_at_ms: row.get(0)?,
+                    app_id: row.get(1)?,
+                    app_name: row.get(2)?,
+                    window_title: row.get(3)?,
+                })
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        if observations.is_empty() {
+            self.connection
+                .execute("DELETE FROM activity_sessions WHERE id = ?1", [&session_id])?;
+            return Ok(None);
+        }
+
+        let ended_at_ms = if matches!(
+            reason,
+            "desktop_bridge_unavailable" | "service_stopped" | "daemon_restart"
+        ) {
+            last_active_at_ms
+        } else {
+            requested_end_ms
+        }
+        .max(started_at_ms);
+        let first_app = activity_app_label(&observations[0]);
+        let last = observations
+            .last()
+            .expect("activity observations are not empty");
+        let last_app = activity_app_label(last);
+        let title = if first_app == last_app {
+            format!("Activity session · {first_app}")
+        } else {
+            format!("Activity session · {first_app} → {last_app}")
+        };
+        let duration_ms = (ended_at_ms - started_at_ms).max(0);
+        let duration_minutes = (duration_ms + 59_999) / 60_000;
+        let duration = match (duration_ms, duration_minutes) {
+            (0..60_000, _) => "less than 1 minute".to_owned(),
+            (_, 1) => "1 minute".to_owned(),
+            _ => format!("{duration_minutes} minutes"),
+        };
+        let mut body = format!(
+            "Observed desktop activity over approximately {duration}.\n\
+             Session ended: {}.\n\nApplications and windows:\n",
+            activity_end_reason(reason)
+        );
+        let mut included = 0_usize;
+        for observation in &observations {
+            let offset_minutes = (observation.observed_at_ms - started_at_ms).max(0) / 60_000;
+            let app = activity_app_label(observation);
+            let identity = if observation.app_id.trim().is_empty()
+                || observation.app_id.eq_ignore_ascii_case(&app)
+            {
+                String::new()
+            } else {
+                format!(" ({})", observation.app_id)
+            };
+            let window = if observation.window_title.trim().is_empty() {
+                String::new()
+            } else {
+                format!(" — {}", observation.window_title)
+            };
+            let line = format!("- +{offset_minutes}m: {app}{identity}{window}\n");
+            if body.chars().count() + line.chars().count() > 20_000 {
+                break;
+            }
+            body.push_str(&line);
+            included += 1;
+        }
+        if included < observations.len() {
+            body.push_str(&format!(
+                "- {} additional window changes remain in the local activity ledger.\n",
+                observations.len() - included
+            ));
+        }
+
+        let now = now_ms()?;
+        let remembrie_id = Uuid::now_v7().to_string();
+        let content_id = Uuid::now_v7().to_string();
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "INSERT INTO remembries(
+                id, kind, occurred_at_ms, ended_at_ms, source_app, window_title,
+                title, sensitivity, importance, pinned, created_at_ms, updated_at_ms
+             ) VALUES(?1, 'activity', ?2, ?3, 'Membrie Activity', ?4, ?5,
+                      'normal', 0.4, 0, ?6, ?6)",
+            params![
+                remembrie_id,
+                started_at_ms,
+                ended_at_ms,
+                last.window_title,
+                title,
+                now
+            ],
+        )?;
+        transaction.execute(
+            "INSERT INTO remembrie_contents(
+                id, remembrie_id, role, mime_type, text_content, created_at_ms
+             ) VALUES(?1, ?2, 'captured', 'text/plain', ?3, ?4)",
+            params![content_id, remembrie_id, body, now],
+        )?;
+        transaction.execute(
+            "INSERT INTO remembrie_fts(remembrie_id, title, body, summary)
+             VALUES(?1, ?2, ?3, '')",
+            params![remembrie_id, title, body],
+        )?;
+        transaction.execute(
+            "INSERT INTO processing_jobs(
+                id, remembrie_id, kind, state, attempts,
+                available_at_ms, created_at_ms, updated_at_ms
+             ) VALUES(?1, ?2, 'enrich', 'pending', 0, 0, ?3, ?3)",
+            params![format!("enrich:{remembrie_id}"), remembrie_id, now],
+        )?;
+        transaction.execute(
+            "UPDATE activity_sessions
+             SET ended_at_ms = ?2, last_active_at_ms = MIN(last_active_at_ms, ?2),
+                 end_reason = ?3, remembrie_id = ?4, updated_at_ms = ?5
+             WHERE id = ?1",
+            params![session_id, ended_at_ms, reason, remembrie_id, now],
+        )?;
+        transaction.execute(
+            "INSERT INTO capture_events(
+                id, occurred_at_ms, source_kind, outcome, reason, remembrie_id
+             ) VALUES(?1, ?2, 'activity', 'stored', NULL, ?3)",
+            params![Uuid::now_v7().to_string(), ended_at_ms, remembrie_id],
+        )?;
+        transaction.commit()?;
+        self.get(&remembrie_id)
     }
 
     fn capture_rule(&self, id: &str) -> Result<Option<CaptureRule>, RepositoryError> {
@@ -1210,6 +1715,57 @@ impl Repository {
             ],
         )?;
         Ok(())
+    }
+}
+
+fn validate_activity_text(
+    label: &str,
+    value: &str,
+    maximum_bytes: usize,
+) -> Result<(), RepositoryError> {
+    if value.len() > maximum_bytes {
+        return Err(RepositoryError::Validation(format!(
+            "{label} cannot exceed {maximum_bytes} bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn activity_result(
+    outcome: &str,
+    reason: Option<&str>,
+    session_id: Option<&str>,
+) -> ActivityRecordResult {
+    ActivityRecordResult {
+        outcome: outcome.to_owned(),
+        reason: reason.map(str::to_owned),
+        session_id: session_id.map(str::to_owned),
+    }
+}
+
+fn activity_app_label(observation: &ActivityObservationRecord) -> String {
+    if !observation.app_name.trim().is_empty() {
+        observation.app_name.trim().to_owned()
+    } else if !observation.app_id.trim().is_empty() {
+        observation.app_id.trim().to_owned()
+    } else {
+        "Desktop".to_owned()
+    }
+}
+
+fn activity_end_reason(reason: &str) -> &'static str {
+    match reason {
+        "idle" => "the computer became idle",
+        "screen_locked" => "the screen was locked",
+        "capture_paused" => "automatic capture was paused",
+        "activity_disabled" => "activity capture was disabled",
+        "excluded_context" => "an excluded application or window became active",
+        "sensitive_context" => "a sensitive window context became active",
+        "desktop_bridge_unavailable" => "the GNOME desktop bridge became unavailable",
+        "service_stopped" => "the desktop capture service stopped",
+        "daemon_restart" => "the Membrie daemon restarted",
+        "manual" => "the session was finished manually",
+        _ => "the activity boundary was reached",
     }
 }
 
@@ -1335,6 +1891,23 @@ mod tests {
         std::env::temp_dir().join(format!("membrie-test-{name}-{}.db", Uuid::now_v7()))
     }
 
+    fn activity_snapshot(
+        occurred_at_ms: i64,
+        app_id: &str,
+        app_name: &str,
+        window_title: &str,
+        idle_ms: u64,
+    ) -> ActivitySnapshot {
+        ActivitySnapshot {
+            app_id: app_id.to_owned(),
+            app_name: app_name.to_owned(),
+            window_title: window_title.to_owned(),
+            idle_ms,
+            locked: false,
+            occurred_at_ms: Some(occurred_at_ms),
+        }
+    }
+
     #[test]
     fn creates_and_lists_a_remembrie() {
         let path = temporary_database("create");
@@ -1377,12 +1950,150 @@ mod tests {
     #[test]
     fn pause_state_is_persistent() {
         let path = temporary_database("pause");
-        let repository = Repository::open(&path).unwrap();
+        let mut repository = Repository::open(&path).unwrap();
         assert!(!repository.status().unwrap().paused);
         repository.set_pause(PauseMode::Indefinite).unwrap();
         assert!(repository.status().unwrap().paused);
         repository.set_pause(PauseMode::Resume).unwrap();
         assert!(!repository.status().unwrap().paused);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn upgrades_a_version_three_database_with_activity_off() {
+        let path = temporary_database("migration-v3");
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch(MIGRATION_1).unwrap();
+        connection.execute_batch(MIGRATION_2).unwrap();
+        connection.execute_batch(MIGRATION_3).unwrap();
+        connection.pragma_update(None, "user_version", 3).unwrap();
+        drop(connection);
+
+        let repository = Repository::open(&path).unwrap();
+        let status = repository.status().unwrap();
+        assert!(!status.activity_enabled);
+        assert_eq!(status.activity_idle_threshold_ms, 15 * 60 * 1000);
+        assert!(
+            repository
+                .list_capture_rules()
+                .unwrap()
+                .iter()
+                .any(|rule| rule.label.as_deref() == Some("Membrie itself"))
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn activity_context_closes_into_a_searchable_remembrie() {
+        let path = temporary_database("activity-session");
+        let mut repository = Repository::open(&path).unwrap();
+        repository.set_activity_enabled(true).unwrap();
+        let start = 1_700_000_000_000_i64;
+
+        let first = repository
+            .record_activity_snapshot(activity_snapshot(
+                start,
+                "org.gnome.TextEditor",
+                "Text Editor",
+                "Membrie architecture notes",
+                0,
+            ))
+            .unwrap();
+        assert_eq!(first.outcome, "recorded");
+        repository
+            .record_activity_snapshot(activity_snapshot(
+                start + 60_000,
+                "google-chrome.desktop",
+                "Google Chrome",
+                "Compose email to Duke Jones",
+                0,
+            ))
+            .unwrap();
+        let boundary = repository
+            .record_activity_snapshot(activity_snapshot(
+                start + 16 * 60_000,
+                "google-chrome.desktop",
+                "Google Chrome",
+                "Compose email to Duke Jones",
+                15 * 60_000,
+            ))
+            .unwrap();
+        assert_eq!(boundary.outcome, "boundary");
+
+        let remembries = repository.list_recent(10).unwrap();
+        assert_eq!(remembries.len(), 1);
+        assert_eq!(remembries[0].kind, "activity");
+        assert!(remembries[0].title.contains("Text Editor"));
+        assert!(remembries[0].title.contains("Google Chrome"));
+        assert!(remembries[0].body.contains("Duke Jones"));
+        assert_eq!(remembries[0].ended_at_ms, Some(start + 60_000));
+        assert_eq!(repository.search("Duke Jones", 10).unwrap().len(), 1);
+        let status = repository.status().unwrap();
+        assert_eq!(status.activity_session_count, 1);
+        assert!(status.activity_active_since_ms.is_none());
+
+        assert_eq!(repository.delete_since(start + 30_000).unwrap(), 1);
+        assert!(repository.list_recent(10).unwrap().is_empty());
+        assert_eq!(repository.status().unwrap().activity_session_count, 0);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn activity_context_never_stores_excluded_windows() {
+        let path = temporary_database("activity-exclusion");
+        let mut repository = Repository::open(&path).unwrap();
+        repository.set_activity_enabled(true).unwrap();
+
+        let result = repository
+            .record_activity_snapshot(activity_snapshot(
+                1_700_000_000_000,
+                "com.chuk.Membrie",
+                "Membrie",
+                "Private local memories",
+                0,
+            ))
+            .unwrap();
+        assert_eq!(result.outcome, "skipped");
+        let observations = repository
+            .connection
+            .query_row("SELECT COUNT(*) FROM activity_observations", [], |row| {
+                row.get::<_, u64>(0)
+            })
+            .unwrap();
+        assert_eq!(observations, 0);
+        assert!(repository.list_recent(10).unwrap().is_empty());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn interrupted_activity_ends_at_last_observed_input() {
+        let path = temporary_database("activity-restart");
+        let mut repository = Repository::open(&path).unwrap();
+        repository.set_activity_enabled(true).unwrap();
+        let start = 1_700_000_000_000_i64;
+        repository
+            .record_activity_snapshot(activity_snapshot(
+                start,
+                "org.gnome.Terminal",
+                "Terminal",
+                "Membrie build",
+                0,
+            ))
+            .unwrap();
+        repository
+            .record_activity_snapshot(activity_snapshot(
+                start + 60_000,
+                "org.gnome.Terminal",
+                "Terminal",
+                "Membrie tests",
+                0,
+            ))
+            .unwrap();
+
+        repository.reset_interrupted_activity().unwrap();
+        let remembries = repository.list_recent(10).unwrap();
+        assert_eq!(remembries.len(), 1);
+        assert_eq!(remembries[0].ended_at_ms, Some(start + 60_000));
         let _ = fs::remove_file(path);
     }
 

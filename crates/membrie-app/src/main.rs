@@ -31,6 +31,11 @@ struct UiState {
     clipboard_bridge_label: gtk::Label,
     clipboard_agent_label: gtk::Label,
     clipboard_bridge_available: Cell<bool>,
+    activity_status: gtk::Label,
+    activity_button: gtk::Button,
+    activity_finish_button: gtk::Button,
+    activity_idle_combo: gtk::ComboBoxText,
+    activity_settings_updating: Cell<bool>,
     backup_status: gtk::Label,
     backup_button: gtk::Button,
     backup_in_progress: Cell<bool>,
@@ -63,9 +68,27 @@ fn build_ui(application: &adw::Application) {
     let clipboard_bridge_label = gtk::Label::new(None);
     clipboard_bridge_label.set_xalign(0.0);
     clipboard_bridge_label.set_wrap(true);
-    let clipboard_agent_label = gtk::Label::new(Some("Clipboard capture service · Checking…"));
+    let clipboard_agent_label = gtk::Label::new(Some("Desktop capture service · Checking…"));
     clipboard_agent_label.set_xalign(0.0);
     clipboard_agent_label.set_wrap(true);
+    let activity_status = gtk::Label::new(Some("Activity context · Checking…"));
+    activity_status.set_xalign(0.0);
+    activity_status.set_wrap(true);
+    let activity_button = gtk::Button::with_label("Enable activity context");
+    activity_button.set_halign(Align::Start);
+    let activity_finish_button = gtk::Button::with_label("Finish current session now");
+    activity_finish_button.set_halign(Align::Start);
+    activity_finish_button.set_visible(false);
+    let activity_idle_combo = gtk::ComboBoxText::new();
+    for (id, label) in [
+        ("300000", "5 minutes"),
+        ("900000", "15 minutes"),
+        ("1800000", "30 minutes"),
+        ("3600000", "1 hour"),
+    ] {
+        activity_idle_combo.append(Some(id), label);
+    }
+    activity_idle_combo.set_active_id(Some("900000"));
     let backup_status = gtk::Label::new(Some("Checking local backups…"));
     backup_status.set_xalign(0.0);
     backup_status.set_wrap(true);
@@ -106,6 +129,11 @@ fn build_ui(application: &adw::Application) {
         clipboard_bridge_label,
         clipboard_agent_label,
         clipboard_bridge_available: Cell::new(false),
+        activity_status,
+        activity_button,
+        activity_finish_button,
+        activity_idle_combo,
+        activity_settings_updating: Cell::new(false),
         backup_status,
         backup_button,
         backup_in_progress: Cell::new(false),
@@ -669,6 +697,105 @@ fn build_privacy_page(state: &Rc<UiState>) -> gtk::Widget {
     });
     page.append(&status_card);
 
+    let activity_card = gtk::Box::new(Orientation::Vertical, 8);
+    activity_card.add_css_class("card");
+    activity_card.add_css_class("capture-card");
+    let activity_heading = gtk::Label::new(Some("Activity context"));
+    activity_heading.add_css_class("heading");
+    activity_heading.set_xalign(0.0);
+    let activity_detail = gtk::Label::new(Some(
+        "Off by default. When enabled, Membrie records focused application and window-title changes, then closes a session after inactivity. This phase does not take screenshots or record keyboard input.",
+    ));
+    activity_detail.add_css_class("dim-label");
+    activity_detail.set_xalign(0.0);
+    activity_detail.set_wrap(true);
+    let idle_row = gtk::Box::new(Orientation::Horizontal, 10);
+    let idle_label = gtk::Label::new(Some("Start a new session after"));
+    idle_label.set_xalign(0.0);
+    idle_label.set_hexpand(true);
+    idle_row.append(&idle_label);
+    idle_row.append(&state.activity_idle_combo);
+    let screen_note = gtk::Label::new(Some(
+        "Screen content · Not captured yet. Keyframes, OCR, retention, and visual-model controls come after this activity foundation is proven.",
+    ));
+    screen_note.add_css_class("dim-label");
+    screen_note.set_xalign(0.0);
+    screen_note.set_wrap(true);
+    activity_card.append(&activity_heading);
+    activity_card.append(&state.activity_status);
+    activity_card.append(&activity_detail);
+    activity_card.append(&idle_row);
+    activity_card.append(&state.activity_button);
+    activity_card.append(&state.activity_finish_button);
+    activity_card.append(&screen_note);
+    let state_for_activity = Rc::clone(state);
+    state.activity_button.connect_clicked(move |_| {
+        let enabled = state_for_activity
+            .client
+            .status()
+            .map(|status| !status.activity_enabled)
+            .unwrap_or(false);
+        match state_for_activity.client.set_activity_enabled(enabled) {
+            Ok(status) => {
+                apply_status_ui(&state_for_activity, &status);
+                refresh_timeline(&state_for_activity);
+                toast(
+                    &state_for_activity,
+                    if enabled {
+                        "Activity context enabled—no screenshots are being taken"
+                    } else {
+                        "Activity context disabled"
+                    },
+                );
+            }
+            Err(error) => toast(
+                &state_for_activity,
+                &format!("Could not update activity context: {error}"),
+            ),
+        }
+    });
+    let state_for_idle = Rc::clone(state);
+    state.activity_idle_combo.connect_changed(move |combo| {
+        if state_for_idle.activity_settings_updating.get() {
+            return;
+        }
+        let Some(value) = combo
+            .active_id()
+            .and_then(|value| value.parse::<u64>().ok())
+        else {
+            return;
+        };
+        match state_for_idle.client.set_activity_idle_threshold(value) {
+            Ok(status) => {
+                apply_status_ui(&state_for_idle, &status);
+                toast(&state_for_idle, "Activity-session boundary updated");
+            }
+            Err(error) => {
+                toast(
+                    &state_for_idle,
+                    &format!("Could not update session timing: {error}"),
+                );
+                refresh_status(&state_for_idle);
+            }
+        }
+    });
+    let state_for_finish = Rc::clone(state);
+    state.activity_finish_button.connect_clicked(move |_| {
+        match state_for_finish.client.end_activity_session("manual") {
+            Ok(()) => {
+                refresh_status(&state_for_finish);
+                refresh_timeline(&state_for_finish);
+                refresh_intelligence(&state_for_finish);
+                toast(&state_for_finish, "Activity session saved as a Remembrie");
+            }
+            Err(error) => toast(
+                &state_for_finish,
+                &format!("Could not finish the activity session: {error}"),
+            ),
+        }
+    });
+    page.append(&activity_card);
+
     let backup_card = gtk::Box::new(Orientation::Vertical, 8);
     backup_card.add_css_class("card");
     backup_card.add_css_class("capture-card");
@@ -803,7 +930,7 @@ fn build_privacy_page(state: &Rc<UiState>) -> gtk::Widget {
     delete_heading.add_css_class("heading");
     delete_heading.set_xalign(0.0);
     let delete_detail = gtk::Label::new(Some(
-        "Deletion removes matching Remembries and their search, relationship, and derived records.",
+        "Deletion removes matching Remembries, overlapping activity sessions, and their search, relationship, and derived records.",
     ));
     delete_detail.add_css_class("dim-label");
     delete_detail.set_xalign(0.0);
@@ -844,7 +971,7 @@ fn confirm_delete(
 ) {
     let dialog = adw::AlertDialog::builder()
         .heading("Delete these Remembries?")
-        .body("This removes the matching local evidence and derived records. This action cannot be undone.")
+        .body("This removes the matching local evidence, overlapping activity sessions, and derived records. This action cannot be undone.")
         .build();
     dialog.add_response("cancel", "Cancel");
     dialog.add_response("delete", label);
@@ -933,12 +1060,12 @@ fn refresh_clipboard_bridge(state: &UiState) {
     if available {
         state
             .clipboard_bridge_label
-            .set_text("GNOME Clipboard Bridge · Connected");
+            .set_text("GNOME Desktop Bridge · Connected");
         state.clipboard_bridge_label.remove_css_class("error");
         state.clipboard_bridge_label.add_css_class("success");
     } else {
         state.clipboard_bridge_label.set_text(
-            "GNOME Clipboard Bridge · Not installed or disabled\nRun ./scripts/install-gnome-extension.sh once. A new installation may require one log out and back in; then restart Membrie.",
+            "GNOME Desktop Bridge · Not installed or disabled\nRun ./scripts/install-gnome-extension.sh once. A new installation may require one log out and back in; then restart Membrie.",
         );
         state.clipboard_bridge_label.remove_css_class("success");
         state.clipboard_bridge_label.add_css_class("error");
@@ -952,14 +1079,20 @@ fn refresh_status(state: &Rc<UiState>) {
             state.status_label.set_text("Daemon offline");
             state.pause_button.set_sensitive(false);
             state.clipboard_button.set_sensitive(false);
+            state.activity_button.set_sensitive(false);
+            state.activity_finish_button.set_sensitive(false);
+            state.activity_idle_combo.set_sensitive(false);
             state
                 .clipboard_agent_label
-                .set_text("Clipboard capture service · Daemon offline");
+                .set_text("Desktop capture service · Daemon offline");
             state.clipboard_agent_label.remove_css_class("success");
             state.clipboard_agent_label.add_css_class("error");
             state
                 .privacy_stats
                 .set_text("Capture statistics are unavailable while the daemon is offline.");
+            state
+                .activity_status
+                .set_text("Activity context · Daemon offline");
         }
     }
 }
@@ -1269,6 +1402,18 @@ fn apply_status_ui(state: &UiState, status: &CaptureStatus) {
     state
         .clipboard_button
         .set_sensitive(state.clipboard_bridge_available.get() || status.clipboard_enabled);
+    state
+        .activity_button
+        .set_sensitive(state.clipboard_bridge_available.get() || status.activity_enabled);
+    state
+        .activity_idle_combo
+        .set_sensitive(status.activity_enabled);
+    state
+        .activity_finish_button
+        .set_visible(status.activity_active_since_ms.is_some());
+    state
+        .activity_finish_button
+        .set_sensitive(status.activity_active_since_ms.is_some());
     state.pause_button.set_icon_name(if status.paused {
         "media-playback-start-symbolic"
     } else {
@@ -1299,22 +1444,59 @@ fn apply_status_ui(state: &UiState, status: &CaptureStatus) {
         } else {
             "Enable clipboard capture"
         });
+    state.activity_button.set_label(if status.activity_enabled {
+        "Disable activity context"
+    } else {
+        "Enable activity context"
+    });
+    state.activity_settings_updating.set(true);
+    state
+        .activity_idle_combo
+        .set_active_id(Some(&status.activity_idle_threshold_ms.to_string()));
+    state.activity_settings_updating.set(false);
     let capture_agent_running = status
         .clipboard_agent_last_seen_ms
         .is_some_and(|last_seen| current_time_ms().saturating_sub(last_seen) <= 30_000);
     if capture_agent_running {
         state
             .clipboard_agent_label
-            .set_text("Clipboard capture service · Running");
+            .set_text("Desktop capture service · Running");
         state.clipboard_agent_label.remove_css_class("error");
         state.clipboard_agent_label.add_css_class("success");
     } else {
         state
             .clipboard_agent_label
-            .set_text("Clipboard capture service · Not responding");
+            .set_text("Desktop capture service · Not responding");
         state.clipboard_agent_label.remove_css_class("success");
         state.clipboard_agent_label.add_css_class("error");
     }
+    let activity_text = if !status.activity_enabled {
+        format!(
+            "Off · {} completed activity sessions stored",
+            status.activity_session_count
+        )
+    } else if !capture_agent_running {
+        "Enabled, but the desktop capture service is not responding".to_owned()
+    } else if let Some(started_at) = status.activity_active_since_ms {
+        let app = status.activity_current_app.as_deref().unwrap_or("Desktop");
+        let window = status
+            .activity_current_window
+            .as_deref()
+            .filter(|title| !title.is_empty())
+            .map(|title| format!(" · {title}"))
+            .unwrap_or_default();
+        format!(
+            "Recording local context since {} · {app}{window}\n{} completed sessions stored",
+            format_timestamp(started_at),
+            status.activity_session_count
+        )
+    } else {
+        format!(
+            "Enabled · waiting for active desktop context\n{} completed sessions stored",
+            status.activity_session_count
+        )
+    };
+    state.activity_status.set_text(&activity_text);
     state.privacy_stats.set_text(&format!(
         "{} Remembries stored · {} automatic events safely skipped\n{} probable secrets blocked · {} duplicates ignored",
         status.remembrie_count,

@@ -9,8 +9,10 @@ not an individual key press or low-level operating-system event.
 - `remembrie_contents`: original or user-authored text and future blob references
 - `remembrie_links`: explicit and inferred relationships between Remembries
 - `capture_rules`: exclusions and capture policy
-- `capture_state`: global pause state
+- `capture_state`: global pause state and opt-in source settings
 - `capture_events`: content-free decisions for stored or skipped automatic events
+- `activity_sessions`: bounded active-use periods and their closing reason
+- `activity_observations`: deduplicated focused application and window-title changes
 
 ## Derived records
 

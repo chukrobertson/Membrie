@@ -23,9 +23,10 @@ static CLIPBOARD_AGENT_LAST_SEEN_MS: AtomicI64 = AtomicI64::new(0);
 fn main() -> Result<()> {
     let database_path = database_path();
     let socket_path = socket_path();
-    let repository = Repository::open(&database_path)
+    let mut repository = Repository::open(&database_path)
         .with_context(|| format!("could not open {}", database_path.display()))?;
     repository.reset_interrupted_processing()?;
+    repository.reset_interrupted_activity()?;
     if let Err(error) = maybe_create_automatic_backup(&repository) {
         eprintln!("automatic backup failed: {error:#}");
     }
@@ -154,6 +155,23 @@ fn dispatch_database(request: Request, repository: &Mutex<Repository>) -> Result
         Request::SetClipboardEnabled { enabled } => Ok(Response::CaptureSourceUpdated {
             status: with_capture_health(repository.set_clipboard_enabled(enabled)?),
         }),
+        Request::SetActivityEnabled { enabled } => Ok(Response::CaptureSourceUpdated {
+            status: with_capture_health(repository.set_activity_enabled(enabled)?),
+        }),
+        Request::SetActivityIdleThreshold { idle_threshold_ms } => {
+            Ok(Response::CaptureSourceUpdated {
+                status: with_capture_health(
+                    repository.set_activity_idle_threshold(idle_threshold_ms)?,
+                ),
+            })
+        }
+        Request::RecordActivity { snapshot } => Ok(Response::ActivityRecorded {
+            result: repository.record_activity_snapshot(snapshot)?,
+        }),
+        Request::EndActivitySession { reason } => {
+            repository.end_activity_session(&reason)?;
+            Ok(Response::ActivitySessionEnded)
+        }
         Request::ListCaptureRules => Ok(Response::CaptureRules {
             rules: repository.list_capture_rules()?,
         }),

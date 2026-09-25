@@ -1,6 +1,7 @@
 use crate::model::{
-    BackupInfo, BrieAnswer, CaptureCandidate, CaptureDecision, CaptureRule, CaptureStatus,
-    IntelligenceSettings, IntelligenceStatus, NewRemembrie, PauseMode, Remembrie, SearchHit,
+    ActivityRecordResult, ActivitySnapshot, BackupInfo, BrieAnswer, CaptureCandidate,
+    CaptureDecision, CaptureRule, CaptureStatus, IntelligenceSettings, IntelligenceStatus,
+    NewRemembrie, PauseMode, Remembrie, SearchHit,
 };
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -33,6 +34,18 @@ pub enum Request {
     },
     SetClipboardEnabled {
         enabled: bool,
+    },
+    SetActivityEnabled {
+        enabled: bool,
+    },
+    SetActivityIdleThreshold {
+        idle_threshold_ms: u64,
+    },
+    RecordActivity {
+        snapshot: ActivitySnapshot,
+    },
+    EndActivitySession {
+        reason: String,
     },
     ListCaptureRules,
     AddCaptureRule {
@@ -69,6 +82,8 @@ pub enum Response {
     SearchResults { hits: Vec<SearchHit> },
     PauseUpdated { status: CaptureStatus },
     CaptureSourceUpdated { status: CaptureStatus },
+    ActivityRecorded { result: ActivityRecordResult },
+    ActivitySessionEnded,
     CaptureRules { rules: Vec<CaptureRule> },
     CaptureRuleAdded { rule: CaptureRule },
     CaptureRuleDeleted { id: String },
@@ -219,6 +234,50 @@ impl DaemonClient {
     pub fn set_clipboard_enabled(&self, enabled: bool) -> Result<CaptureStatus, ClientError> {
         match self.request(&Request::SetClipboardEnabled { enabled })? {
             Response::CaptureSourceUpdated { status } => Ok(status),
+            other => Err(ClientError::Rejected(format!(
+                "unexpected response: {other:?}"
+            ))),
+        }
+    }
+
+    pub fn set_activity_enabled(&self, enabled: bool) -> Result<CaptureStatus, ClientError> {
+        match self.request(&Request::SetActivityEnabled { enabled })? {
+            Response::CaptureSourceUpdated { status } => Ok(status),
+            other => Err(ClientError::Rejected(format!(
+                "unexpected response: {other:?}"
+            ))),
+        }
+    }
+
+    pub fn set_activity_idle_threshold(
+        &self,
+        idle_threshold_ms: u64,
+    ) -> Result<CaptureStatus, ClientError> {
+        match self.request(&Request::SetActivityIdleThreshold { idle_threshold_ms })? {
+            Response::CaptureSourceUpdated { status } => Ok(status),
+            other => Err(ClientError::Rejected(format!(
+                "unexpected response: {other:?}"
+            ))),
+        }
+    }
+
+    pub fn record_activity(
+        &self,
+        snapshot: ActivitySnapshot,
+    ) -> Result<ActivityRecordResult, ClientError> {
+        match self.request(&Request::RecordActivity { snapshot })? {
+            Response::ActivityRecorded { result } => Ok(result),
+            other => Err(ClientError::Rejected(format!(
+                "unexpected response: {other:?}"
+            ))),
+        }
+    }
+
+    pub fn end_activity_session(&self, reason: impl Into<String>) -> Result<(), ClientError> {
+        match self.request(&Request::EndActivitySession {
+            reason: reason.into(),
+        })? {
+            Response::ActivitySessionEnded => Ok(()),
             other => Err(ClientError::Rejected(format!(
                 "unexpected response: {other:?}"
             ))),

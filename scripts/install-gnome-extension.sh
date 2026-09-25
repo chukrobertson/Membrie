@@ -18,7 +18,7 @@ gnome-extensions install --force "$build_dir/$extension_uuid.shell-extension.zip
 
 if gnome-extensions enable "$extension_uuid" >/dev/null 2>&1 \
     && gnome-extensions info "$extension_uuid" 2>/dev/null | grep -q "State: ACTIVE"; then
-    echo "Membrie Clipboard Bridge installed and enabled."
+    echo "Membrie Desktop Bridge installed and enabled."
     echo "If this was an update, log out and back in once to load the new bridge code."
 else
     enabled_extensions="$(gsettings get org.gnome.shell enabled-extensions)"
@@ -31,6 +31,6 @@ else
         gsettings set org.gnome.shell enabled-extensions "$enabled_extensions"
     fi
 
-    echo "Membrie Clipboard Bridge installed and queued to enable."
+    echo "Membrie Desktop Bridge installed and queued to enable."
     echo "GNOME needs one log out and back in before it can load a newly installed local extension."
 fi

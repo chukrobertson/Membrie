@@ -120,7 +120,40 @@ pub struct CaptureStatus {
     pub skipped_duplicate: u64,
     #[serde(default)]
     pub clipboard_agent_last_seen_ms: Option<i64>,
+    #[serde(default)]
+    pub activity_enabled: bool,
+    #[serde(default = "default_activity_idle_threshold_ms")]
+    pub activity_idle_threshold_ms: u64,
+    #[serde(default)]
+    pub activity_session_count: u64,
+    #[serde(default)]
+    pub activity_active_since_ms: Option<i64>,
+    #[serde(default)]
+    pub activity_current_app: Option<String>,
+    #[serde(default)]
+    pub activity_current_window: Option<String>,
     pub database_path: String,
+}
+
+pub const fn default_activity_idle_threshold_ms() -> u64 {
+    15 * 60 * 1000
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ActivitySnapshot {
+    pub app_id: String,
+    pub app_name: String,
+    pub window_title: String,
+    pub idle_ms: u64,
+    pub locked: bool,
+    pub occurred_at_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ActivityRecordResult {
+    pub outcome: String,
+    pub reason: Option<String>,
+    pub session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
