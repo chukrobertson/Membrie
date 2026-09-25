@@ -777,6 +777,7 @@ impl Repository {
     }
 
     pub fn reset_interrupted_processing(&self) -> Result<(), RepositoryError> {
+        let now = now_ms()?;
         self.connection.execute(
             "INSERT OR IGNORE INTO processing_jobs(
                 id, remembrie_id, kind, state, attempts,
@@ -791,7 +792,25 @@ impl Repository {
             "UPDATE processing_jobs
              SET state = 'pending', available_at_ms = 0, updated_at_ms = ?1
              WHERE state = 'running'",
-            [now_ms()?],
+            [now],
+        )?;
+        self.connection.execute(
+            "UPDATE screen_observations
+             SET state = 'failed', last_error = 'local analysis was interrupted',
+                 updated_at_ms = ?1
+             WHERE state = 'processing'",
+            [now],
+        )?;
+        self.connection.execute(
+            "UPDATE processing_jobs
+             SET state = 'pending', attempts = 0, last_error = NULL,
+                 available_at_ms = 0, updated_at_ms = ?1
+             WHERE state = 'pending' AND available_at_ms > ?1
+               AND remembrie_id IN (
+                 SELECT remembrie_id FROM activity_sessions
+                 WHERE remembrie_id IS NOT NULL
+             )",
+            [now],
         )?;
         Ok(())
     }
@@ -1100,14 +1119,28 @@ impl Repository {
                 },
             )
             .optional()?;
-        let (screen_observation_count, screen_failed_count) = self.connection.query_row(
-            "SELECT
+        let (screen_observation_count, screen_failed_count, screen_processing_count) =
+            self.connection.query_row(
+                "SELECT
                 COALESCE(SUM(state = 'complete'), 0),
-                COALESCE(SUM(state = 'failed'), 0)
+                COALESCE(SUM(state = 'failed'), 0),
+                COALESCE(SUM(state = 'processing'), 0)
              FROM screen_observations",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )?;
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
+        let last_screen_observation = self
+            .connection
+            .query_row(
+                "SELECT observed_at_ms, app_name
+                 FROM screen_observations
+                 WHERE state = 'complete'
+                 ORDER BY observed_at_ms DESC, created_at_ms DESC
+                 LIMIT 1",
+                [],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
         Ok(CaptureStatus {
             paused,
             paused_until_ms,
@@ -1130,6 +1163,11 @@ impl Repository {
             screen_model,
             screen_observation_count,
             screen_failed_count,
+            screen_processing_count,
+            screen_last_observed_at_ms: last_screen_observation
+                .as_ref()
+                .map(|observation| observation.0),
+            screen_last_app: last_screen_observation.map(|observation| observation.1),
             database_path: self.path.display().to_string(),
         })
     }
@@ -1463,7 +1501,7 @@ impl Repository {
         Ok(())
     }
 
-    pub fn screen_model_for_candidate(
+    fn authorize_screen_candidate(
         &self,
         candidate: &ScreenCaptureCandidate,
     ) -> Result<String, RepositoryError> {
@@ -1538,36 +1576,11 @@ impl Repository {
         Ok(screen_model)
     }
 
-    pub fn record_screen_analysis(
+    pub fn begin_screen_analysis(
         &self,
         candidate: &ScreenCaptureCandidate,
-        analysis: &ScreenAnalysis,
-    ) -> Result<ScreenCaptureResult, RepositoryError> {
-        let model = self.screen_model_for_candidate(candidate)?;
-        if analysis.model != model {
-            return Ok(screen_capture_result(
-                "skipped",
-                Some("the screen model changed while analysis was running"),
-                None,
-            ));
-        }
-        validate_screen_analysis(analysis)?;
-        let combined = format!("{}\n{}", analysis.description, analysis.visible_text);
-        if sensitive_reason(&combined).is_some() {
-            return Ok(screen_capture_result(
-                "skipped",
-                Some("local analysis found content that looked sensitive"),
-                None,
-            ));
-        }
-        if analysis.description.trim().is_empty() && analysis.visible_text.trim().is_empty() {
-            return Ok(screen_capture_result(
-                "skipped",
-                Some("the local screen model found no useful visible context"),
-                None,
-            ));
-        }
-
+    ) -> Result<(String, String), RepositoryError> {
+        let model = self.authorize_screen_candidate(candidate)?;
         let observation_id = Uuid::now_v7().to_string();
         let now = now_ms()?;
         let observed_at_ms = candidate.observed_at_ms.unwrap_or(now);
@@ -1576,8 +1589,8 @@ impl Repository {
                 id, session_id, observed_at_ms, app_id, app_name, window_title,
                 width, height, state, description, visible_text, confidence,
                 model, last_error, image_retained, created_at_ms, updated_at_ms
-             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'complete', ?9, ?10,
-                      ?11, ?12, NULL, 0, ?13, ?13)",
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'processing', NULL, NULL,
+                      NULL, ?9, NULL, 0, ?10, ?10)",
             params![
                 observation_id,
                 candidate.session_id,
@@ -1587,56 +1600,317 @@ impl Repository {
                 candidate.window_title.trim(),
                 candidate.width,
                 candidate.height,
+                model,
+                now,
+            ],
+        )?;
+        Ok((observation_id, model))
+    }
+
+    pub fn complete_screen_analysis(
+        &mut self,
+        observation_id: &str,
+        analysis: &ScreenAnalysis,
+    ) -> Result<ScreenCaptureResult, RepositoryError> {
+        validate_activity_text("screen observation identifier", observation_id, 128)?;
+        if observation_id.trim().is_empty() {
+            return Err(RepositoryError::Validation(
+                "screen analysis needs an observation identifier".to_owned(),
+            ));
+        }
+        validate_screen_analysis(analysis)?;
+        let pending = self
+            .connection
+            .query_row(
+                "SELECT session_id, observed_at_ms, model
+                 FROM screen_observations
+                 WHERE id = ?1 AND state = 'processing'",
+                [observation_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((session_id, observed_at_ms, model)) = pending else {
+            return Err(RepositoryError::Validation(
+                "screen observation is no longer awaiting analysis".to_owned(),
+            ));
+        };
+        let now = now_ms()?;
+        let (paused, _) = self.effective_pause(now)?;
+        let (activity_enabled, screen_enabled, current_model) = self.connection.query_row(
+            "SELECT activity_enabled, screen_enabled, screen_model
+             FROM capture_state WHERE singleton = 1",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, bool>(0)?,
+                    row.get::<_, bool>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )?;
+        if paused || !activity_enabled || !screen_enabled {
+            self.discard_screen_analysis(
+                observation_id,
+                &session_id,
+                "Screen Memory was paused or disabled while analysis was running",
+                "disabled",
+                observed_at_ms,
+            )?;
+            return Ok(screen_capture_result(
+                "skipped",
+                Some("Screen Memory was paused or disabled while analysis was running"),
+                None,
+            ));
+        }
+        if analysis.model != model || current_model != model {
+            self.discard_screen_analysis(
+                observation_id,
+                &session_id,
+                "the screen model changed while analysis was running",
+                "model_changed",
+                observed_at_ms,
+            )?;
+            return Ok(screen_capture_result(
+                "skipped",
+                Some("the screen model changed while analysis was running"),
+                None,
+            ));
+        }
+        let combined = format!("{}\n{}", analysis.description, analysis.visible_text);
+        if sensitive_reason(&combined).is_some() {
+            self.discard_screen_analysis(
+                observation_id,
+                &session_id,
+                "local analysis found content that looked sensitive",
+                "sensitive",
+                observed_at_ms,
+            )?;
+            return Ok(screen_capture_result(
+                "skipped",
+                Some("local analysis found content that looked sensitive"),
+                None,
+            ));
+        }
+        if analysis.description.trim().is_empty() && analysis.visible_text.trim().is_empty() {
+            self.discard_screen_analysis(
+                observation_id,
+                &session_id,
+                "the local screen model found no useful visible context",
+                "empty",
+                observed_at_ms,
+            )?;
+            return Ok(screen_capture_result(
+                "skipped",
+                Some("the local screen model found no useful visible context"),
+                None,
+            ));
+        }
+
+        let updated = self.connection.execute(
+            "UPDATE screen_observations
+             SET state = 'complete', description = ?2, visible_text = ?3,
+                 confidence = ?4, last_error = NULL, updated_at_ms = ?5
+             WHERE id = ?1 AND state = 'processing'",
+            params![
+                observation_id,
                 analysis.description.trim(),
                 analysis.visible_text.trim(),
                 analysis.confidence,
-                analysis.model,
                 now,
             ],
         )?;
+        if updated == 0 {
+            return Err(RepositoryError::Validation(
+                "screen observation was resolved by another worker".to_owned(),
+            ));
+        }
+        self.materialize_late_screen_observation(&session_id, observation_id)?;
         self.record_capture_event("screen", "stored", None, None, observed_at_ms)?;
-        Ok(screen_capture_result("stored", None, Some(&observation_id)))
+        Ok(screen_capture_result("stored", None, Some(observation_id)))
     }
 
-    pub fn record_screen_failure(
-        &self,
-        candidate: &ScreenCaptureCandidate,
-        model: &str,
+    pub fn fail_screen_analysis(
+        &mut self,
+        observation_id: &str,
         error: &str,
     ) -> Result<(), RepositoryError> {
-        validate_screen_candidate(candidate)?;
-        validate_model_name(model)?;
-        let session_exists = self.connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM activity_sessions WHERE id = ?1)",
-            [&candidate.session_id],
-            |row| row.get::<_, bool>(0),
-        )?;
-        if !session_exists {
+        validate_activity_text("screen observation identifier", observation_id, 128)?;
+        let session_id = self
+            .connection
+            .query_row(
+                "SELECT session_id FROM screen_observations
+                 WHERE id = ?1 AND state = 'processing'",
+                [observation_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let Some(session_id) = session_id else {
             return Ok(());
-        }
+        };
         let now = now_ms()?;
         let safe_error: String = error.chars().take(500).collect();
         self.connection.execute(
-            "INSERT INTO screen_observations(
-                id, session_id, observed_at_ms, app_id, app_name, window_title,
-                width, height, state, description, visible_text, confidence,
-                model, last_error, image_retained, created_at_ms, updated_at_ms
-             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'failed', NULL, NULL,
-                      NULL, ?9, ?10, 0, ?11, ?11)",
-            params![
-                Uuid::now_v7().to_string(),
-                candidate.session_id,
-                candidate.observed_at_ms.unwrap_or(now),
-                candidate.app_id.trim(),
-                candidate.app_name.trim(),
-                candidate.window_title.trim(),
-                candidate.width,
-                candidate.height,
-                model,
-                safe_error,
-                now,
-            ],
+            "UPDATE screen_observations
+             SET state = 'failed', last_error = ?2, updated_at_ms = ?3
+             WHERE id = ?1 AND state = 'processing'",
+            params![observation_id, safe_error, now],
         )?;
+        self.release_enrichment_after_screen_work(&session_id)?;
+        Ok(())
+    }
+
+    fn discard_screen_analysis(
+        &mut self,
+        observation_id: &str,
+        session_id: &str,
+        reason: &str,
+        outcome: &str,
+        observed_at_ms: i64,
+    ) -> Result<(), RepositoryError> {
+        self.connection.execute(
+            "DELETE FROM screen_observations
+             WHERE id = ?1 AND state = 'processing'",
+            [observation_id],
+        )?;
+        self.record_capture_event("screen", outcome, Some(reason), None, observed_at_ms)?;
+        self.release_enrichment_after_screen_work(session_id)
+    }
+
+    fn materialize_late_screen_observation(
+        &mut self,
+        session_id: &str,
+        observation_id: &str,
+    ) -> Result<(), RepositoryError> {
+        let materialized = self
+            .connection
+            .query_row(
+                "SELECT s.started_at_ms, s.remembrie_id, c.id, c.text_content
+                 FROM activity_sessions s
+                 JOIN remembries r ON r.id = s.remembrie_id
+                 JOIN remembrie_contents c
+                   ON c.remembrie_id = r.id AND c.role = 'captured'
+                 WHERE s.id = ?1 AND s.ended_at_ms IS NOT NULL
+                 LIMIT 1",
+                [session_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((started_at_ms, remembrie_id, content_id, mut body)) = materialized else {
+            return Ok(());
+        };
+        let observation = self.connection.query_row(
+            "SELECT observed_at_ms, app_name, window_title, description,
+                    visible_text, confidence, model
+             FROM screen_observations
+             WHERE id = ?1 AND state = 'complete'",
+            [observation_id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                ))
+            },
+        )?;
+        let intro = screen_context_intro();
+        let line = screen_context_line(
+            started_at_ms,
+            observation.0,
+            &observation.1,
+            &observation.2,
+            &observation.3,
+            &observation.4,
+            &observation.5,
+            &observation.6,
+        );
+        let mut changed = false;
+        if !body.contains("Machine-described screen context:")
+            && body.chars().count() + intro.chars().count() <= 20_000
+        {
+            body.push_str(intro);
+            changed = true;
+        }
+        if body.chars().count() + line.chars().count() <= 20_000 {
+            body.push_str(&line);
+            changed = true;
+        }
+        if changed {
+            let now = now_ms()?;
+            let transaction = self.connection.transaction()?;
+            transaction.execute(
+                "UPDATE remembrie_contents SET text_content = ?1 WHERE id = ?2",
+                params![body, content_id],
+            )?;
+            transaction.execute(
+                "UPDATE remembries SET summary = NULL, updated_at_ms = ?1 WHERE id = ?2",
+                params![now, remembrie_id],
+            )?;
+            transaction.execute(
+                "UPDATE remembrie_fts SET body = ?1, summary = '' WHERE remembrie_id = ?2",
+                params![body, remembrie_id],
+            )?;
+            transaction.execute(
+                "DELETE FROM remembrie_chunks WHERE remembrie_id = ?1",
+                [&remembrie_id],
+            )?;
+            transaction.execute(
+                "DELETE FROM derived_artifacts
+                 WHERE remembrie_id = ?1 AND kind = 'summary'",
+                [&remembrie_id],
+            )?;
+            transaction.commit()?;
+        }
+        self.release_enrichment_after_screen_work(session_id)
+    }
+
+    fn release_enrichment_after_screen_work(
+        &self,
+        session_id: &str,
+    ) -> Result<(), RepositoryError> {
+        let pending = self.connection.query_row(
+            "SELECT COUNT(*) FROM screen_observations
+             WHERE session_id = ?1 AND state = 'processing'",
+            [session_id],
+            |row| row.get::<_, u64>(0),
+        )?;
+        if pending > 0 {
+            return Ok(());
+        }
+        let remembrie_id = self
+            .connection
+            .query_row(
+                "SELECT remembrie_id FROM activity_sessions WHERE id = ?1",
+                [session_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten();
+        if let Some(remembrie_id) = remembrie_id {
+            self.connection.execute(
+                "UPDATE processing_jobs
+                 SET state = 'pending', attempts = 0, last_error = NULL,
+                     available_at_ms = 0, updated_at_ms = ?1
+                 WHERE id = ?2",
+                params![now_ms()?, format!("enrich:{remembrie_id}")],
+            )?;
+        }
         Ok(())
     }
 
@@ -1884,12 +2158,7 @@ impl Repository {
             rows.collect::<Result<Vec<_>, _>>()?
         };
         if !screen_observations.is_empty() {
-            body.push_str(
-                "\nMachine-described screen context:\n\
-                 These notes were generated locally from temporary active-window screenshots. \
-                 The screenshots were immediately deleted. Descriptions can be incomplete or wrong, \
-                 so they are supporting context—not confirmation that an action occurred.\n",
-            );
+            body.push_str(screen_context_intro());
             let mut included_screen = 0_usize;
             for (
                 observed_at_ms,
@@ -1901,21 +2170,15 @@ impl Repository {
                 model,
             ) in &screen_observations
             {
-                let offset_minutes = (observed_at_ms - started_at_ms).max(0) / 60_000;
-                let window = if window_title.trim().is_empty() {
-                    String::new()
-                } else {
-                    format!(" — {}", window_title.trim())
-                };
-                let visible = if visible_text.trim().is_empty() {
-                    String::new()
-                } else {
-                    format!(" Visible text: {}", normalize_screen_text(visible_text))
-                };
-                let line = format!(
-                    "- +{offset_minutes}m: {}{window} [{confidence} confidence; model {model}] {}{visible}\n",
-                    app_name.trim(),
-                    normalize_screen_text(description),
+                let line = screen_context_line(
+                    started_at_ms,
+                    *observed_at_ms,
+                    app_name,
+                    window_title,
+                    description,
+                    visible_text,
+                    confidence,
+                    model,
                 );
                 if body.chars().count() + line.chars().count() > 20_000 {
                     break;
@@ -1932,6 +2195,17 @@ impl Repository {
         }
 
         let now = now_ms()?;
+        let processing_screen_count = self.connection.query_row(
+            "SELECT COUNT(*) FROM screen_observations
+             WHERE session_id = ?1 AND state = 'processing'",
+            [&session_id],
+            |row| row.get::<_, u64>(0),
+        )?;
+        let enrichment_available_at_ms = if processing_screen_count > 0 {
+            now + 16 * 60 * 1000
+        } else {
+            0
+        };
         let remembrie_id = Uuid::now_v7().to_string();
         let content_id = Uuid::now_v7().to_string();
         let transaction = self.connection.transaction()?;
@@ -1965,8 +2239,13 @@ impl Repository {
             "INSERT INTO processing_jobs(
                 id, remembrie_id, kind, state, attempts,
                 available_at_ms, created_at_ms, updated_at_ms
-             ) VALUES(?1, ?2, 'enrich', 'pending', 0, 0, ?3, ?3)",
-            params![format!("enrich:{remembrie_id}"), remembrie_id, now],
+             ) VALUES(?1, ?2, 'enrich', 'pending', 0, ?4, ?3, ?3)",
+            params![
+                format!("enrich:{remembrie_id}"),
+                remembrie_id,
+                now,
+                enrichment_available_at_ms
+            ],
         )?;
         transaction.execute(
             "UPDATE activity_sessions
@@ -2164,6 +2443,42 @@ fn activity_source_app(app_id: &str, app_name: &str) -> String {
 
 fn normalize_screen_text(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn screen_context_intro() -> &'static str {
+    "\nMachine-described screen context:\n\
+     These notes were generated locally from temporary active-window screenshots. \
+     The screenshots were immediately deleted. Descriptions can be incomplete or wrong, \
+     so they are supporting context—not confirmation that an action occurred.\n"
+}
+
+#[allow(clippy::too_many_arguments)]
+fn screen_context_line(
+    started_at_ms: i64,
+    observed_at_ms: i64,
+    app_name: &str,
+    window_title: &str,
+    description: &str,
+    visible_text: &str,
+    confidence: &str,
+    model: &str,
+) -> String {
+    let offset_minutes = (observed_at_ms - started_at_ms).max(0) / 60_000;
+    let window = if window_title.trim().is_empty() {
+        String::new()
+    } else {
+        format!(" — {}", window_title.trim())
+    };
+    let visible = if visible_text.trim().is_empty() {
+        String::new()
+    } else {
+        format!(" Visible text: {}", normalize_screen_text(visible_text))
+    };
+    format!(
+        "- +{offset_minutes}m: {}{window} [{confidence} confidence; model {model}] {}{visible}\n",
+        app_name.trim(),
+        normalize_screen_text(description),
+    )
 }
 
 fn activity_result(
@@ -2581,13 +2896,12 @@ mod tests {
             width: 1200,
             height: 800,
         };
-        assert_eq!(
-            repository.screen_model_for_candidate(&candidate).unwrap(),
-            "gemma4:e2b"
-        );
+        let (observation_id, model) = repository.begin_screen_analysis(&candidate).unwrap();
+        assert_eq!(model, "gemma4:e2b");
+        assert_eq!(repository.status().unwrap().screen_processing_count, 1);
         let stored = repository
-            .record_screen_analysis(
-                &candidate,
+            .complete_screen_analysis(
+                &observation_id,
                 &ScreenAnalysis {
                     description: "An email compose window is open.".to_owned(),
                     visible_text: "To: Duke Jones; Subject: Meeting notes".to_owned(),
@@ -2612,7 +2926,62 @@ mod tests {
                 .contains("supporting context—not confirmation")
         );
         assert!(remembries[0].body.contains("Duke Jones"));
-        assert_eq!(repository.status().unwrap().screen_observation_count, 1);
+        let status = repository.status().unwrap();
+        assert_eq!(status.screen_observation_count, 1);
+        assert_eq!(status.screen_processing_count, 0);
+        assert_eq!(status.screen_last_app.as_deref(), Some("Google Chrome"));
+        assert_eq!(status.screen_last_observed_at_ms, Some(start + 1_000));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn screen_analysis_finishing_after_session_close_is_added_before_enrichment() {
+        let path = temporary_database("screen-late-finish");
+        let mut repository = Repository::open(&path).unwrap();
+        repository.set_activity_enabled(true).unwrap();
+        repository.set_screen_enabled(true).unwrap();
+        let start = now_ms().unwrap() - 60_000;
+        let activity = repository
+            .record_activity_snapshot(activity_snapshot(
+                start,
+                "google-chrome.desktop",
+                "Google Chrome",
+                "Research notes",
+                0,
+            ))
+            .unwrap();
+        let candidate = ScreenCaptureCandidate {
+            session_id: activity.session_id.unwrap(),
+            screenshot_path: "/run/user/1000/membrie-screen/example.png".to_owned(),
+            app_id: "google-chrome.desktop".to_owned(),
+            app_name: "Google Chrome".to_owned(),
+            window_title: "Research notes".to_owned(),
+            observed_at_ms: Some(start + 1_000),
+            width: 1200,
+            height: 800,
+        };
+        let (observation_id, _) = repository.begin_screen_analysis(&candidate).unwrap();
+        repository.end_activity_session("manual").unwrap();
+        assert!(repository.claim_processing_job().unwrap().is_none());
+
+        let result = repository
+            .complete_screen_analysis(
+                &observation_id,
+                &ScreenAnalysis {
+                    description: "A browser shows advocacy research notes.".to_owned(),
+                    visible_text: "Duke Jones follow-up details".to_owned(),
+                    confidence: "high".to_owned(),
+                    model: "gemma4:e2b".to_owned(),
+                },
+            )
+            .unwrap();
+        assert_eq!(result.outcome, "stored");
+
+        let remembries = repository.list_recent(10).unwrap();
+        assert_eq!(remembries.len(), 1);
+        assert!(remembries[0].body.contains("Duke Jones follow-up details"));
+        let job = repository.claim_processing_job().unwrap().unwrap();
+        assert_eq!(job.remembrie.id, remembries[0].id);
         let _ = fs::remove_file(path);
     }
 
@@ -2632,18 +3001,20 @@ mod tests {
                 0,
             ))
             .unwrap();
+        let candidate = ScreenCaptureCandidate {
+            session_id: activity.session_id.unwrap(),
+            screenshot_path: "/run/user/1000/membrie-screen/example.png".to_owned(),
+            app_id: "org.gnome.TextEditor".to_owned(),
+            app_name: "Text Editor".to_owned(),
+            window_title: "Ordinary notes".to_owned(),
+            observed_at_ms: Some(start),
+            width: 800,
+            height: 600,
+        };
+        let (observation_id, _) = repository.begin_screen_analysis(&candidate).unwrap();
         let result = repository
-            .record_screen_analysis(
-                &ScreenCaptureCandidate {
-                    session_id: activity.session_id.unwrap(),
-                    screenshot_path: "/run/user/1000/membrie-screen/example.png".to_owned(),
-                    app_id: "org.gnome.TextEditor".to_owned(),
-                    app_name: "Text Editor".to_owned(),
-                    window_title: "Ordinary notes".to_owned(),
-                    observed_at_ms: Some(start),
-                    width: 800,
-                    height: 600,
-                },
+            .complete_screen_analysis(
+                &observation_id,
                 &ScreenAnalysis {
                     description: "A note contains an AWS access key.".to_owned(),
                     visible_text: "AKIAIOSFODNN7EXAMPLE".to_owned(),
@@ -2653,7 +3024,9 @@ mod tests {
             )
             .unwrap();
         assert_eq!(result.outcome, "skipped");
-        assert_eq!(repository.status().unwrap().screen_observation_count, 0);
+        let status = repository.status().unwrap();
+        assert_eq!(status.screen_observation_count, 0);
+        assert_eq!(status.screen_processing_count, 0);
         let _ = fs::remove_file(path);
     }
 

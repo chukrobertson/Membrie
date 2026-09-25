@@ -79,7 +79,13 @@ and active-window metadata enter SQLite. Model output is scanned again for recog
 secrets. Activity Remembries label this material as machine-described, fallible supporting
 context, and Brie is instructed not to treat a compose window or open form as proof that an
 action was completed. Screen Memory is off by default and automatically turns off when
-activity context is disabled. No screenshot pixels are retained in this first mode.
+activity context is disabled. A deliberate capture control gives the user five seconds to
+switch to the intended window. No screenshot pixels are retained in this first mode.
+
+Each accepted screen sample gets a durable `processing` observation before local vision
+begins. If its activity session closes while Ollama is still working, session enrichment is
+held until that observation completes or fails. Successful late context is appended to the
+canonical Remembrie and its replaceable search artifacts are rebuilt.
 
 ## Storage
 

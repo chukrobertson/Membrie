@@ -14,7 +14,7 @@ not an individual key press or low-level operating-system event.
 - `activity_sessions`: bounded active-use periods and their closing reason
 - `activity_observations`: deduplicated focused application and window-title changes
 - `screen_observations`: explicitly labeled local vision descriptions tied to activity sessions;
-  temporary source images are not retained
+  processing state survives session boundaries and temporary source images are not retained
 
 ## Derived records
 

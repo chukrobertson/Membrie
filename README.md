@@ -23,8 +23,10 @@ The project is intentionally local-only:
 - Safe, explicitly enabled clipboard capture through a local GNOME Shell bridge
 - Optional focused-application and window-title activity sessions with idle boundaries
 - Opt-in active-window Screen Memory with local visual-change filtering
+- A five-second “Remember this screen” control for deliberate one-off capture
 - Temporary PNGs removed from disk before their pixels are analyzed in memory by a selected loopback Ollama vision model
 - Machine-described screen context is explicitly labeled as fallible evidence for Brie
+- In-progress screen analysis survives an activity-session boundary and joins that Remembrance before local indexing
 - Activity sessions become searchable, cited Remembries without recording keyboard or pointer input
 - Pre-storage secret detection and duplicate suppression
 - Built-in password-manager and private-window exclusions

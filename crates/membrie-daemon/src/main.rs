@@ -239,16 +239,16 @@ fn analyze_screen_candidate(
     candidate: &ScreenCaptureCandidate,
 ) -> Result<membrie_core::ScreenCaptureResult> {
     let image = take_temporary_screen_image(&candidate.screenshot_path)?;
-    let model = repository
+    let (observation_id, model) = repository
         .lock()
         .map_err(|_| anyhow!("database lock was poisoned"))?
-        .screen_model_for_candidate(candidate)?;
+        .begin_screen_analysis(candidate)?;
     let analysis = match intelligence::analyze_screen(ollama, &model, &image) {
         Ok(analysis) => analysis,
         Err(error) => {
-            if let Ok(repository) = repository.lock()
+            if let Ok(mut repository) = repository.lock()
                 && let Err(record_error) =
-                    repository.record_screen_failure(candidate, &model, &error.to_string())
+                    repository.fail_screen_analysis(&observation_id, &error.to_string())
             {
                 eprintln!("could not record local screen-analysis failure: {record_error}");
             }
@@ -258,7 +258,7 @@ fn analyze_screen_candidate(
     repository
         .lock()
         .map_err(|_| anyhow!("database lock was poisoned"))?
-        .record_screen_analysis(candidate, &analysis)
+        .complete_screen_analysis(&observation_id, &analysis)
         .map_err(Into::into)
 }
 

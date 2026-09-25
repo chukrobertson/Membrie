@@ -142,6 +142,12 @@ pub struct CaptureStatus {
     pub screen_observation_count: u64,
     #[serde(default)]
     pub screen_failed_count: u64,
+    #[serde(default)]
+    pub screen_processing_count: u64,
+    #[serde(default)]
+    pub screen_last_observed_at_ms: Option<i64>,
+    #[serde(default)]
+    pub screen_last_app: Option<String>,
     pub database_path: String,
 }
 

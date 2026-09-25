@@ -1,10 +1,12 @@
 use adw::prelude::*;
 use gtk::{Align, Orientation};
 use membrie_core::{
-    BrieAnswer, BrieCitation, CaptureRule, CaptureStatus, DaemonClient, IntelligenceSettings,
-    IntelligenceStatus, LocalModel, NewRemembrie, PauseMode, Remembrie, SearchHit, socket_path,
+    ActivitySnapshot, BrieAnswer, BrieCitation, CaptureRule, CaptureStatus, DaemonClient,
+    IntelligenceSettings, IntelligenceStatus, LocalModel, NewRemembrie, PauseMode, Remembrie,
+    ScreenCaptureCandidate, ScreenCaptureResult, SearchHit, socket_path,
 };
 use std::cell::{Cell, RefCell};
+use std::fs;
 use std::rc::Rc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -38,6 +40,8 @@ struct UiState {
     activity_settings_updating: Cell<bool>,
     screen_status: gtk::Label,
     screen_button: gtk::Button,
+    screen_capture_now_button: gtk::Button,
+    screen_capture_now_busy: Cell<bool>,
     screen_interval_combo: gtk::ComboBoxText,
     screen_model_combo: gtk::ComboBoxText,
     screen_settings_updating: Cell<bool>,
@@ -99,6 +103,9 @@ fn build_ui(application: &adw::Application) {
     screen_status.set_wrap(true);
     let screen_button = gtk::Button::with_label("Enable screen memory");
     screen_button.set_halign(Align::Start);
+    let screen_capture_now_button = gtk::Button::with_label("Remember this screen in 5 seconds");
+    screen_capture_now_button.set_halign(Align::Start);
+    screen_capture_now_button.set_sensitive(false);
     let screen_interval_combo = gtk::ComboBoxText::new();
     for (id, label) in [
         ("30000", "30 seconds"),
@@ -159,6 +166,8 @@ fn build_ui(application: &adw::Application) {
         activity_settings_updating: Cell::new(false),
         screen_status,
         screen_button,
+        screen_capture_now_button,
+        screen_capture_now_busy: Cell::new(false),
         screen_interval_combo,
         screen_model_combo,
         screen_settings_updating: Cell::new(false),
@@ -861,6 +870,7 @@ fn build_privacy_page(state: &Rc<UiState>) -> gtk::Widget {
     screen_card.append(&screen_interval_row);
     screen_card.append(&screen_model_row);
     screen_card.append(&state.screen_button);
+    screen_card.append(&state.screen_capture_now_button);
 
     let state_for_screen = Rc::clone(state);
     state.screen_button.connect_clicked(move |_| {
@@ -887,6 +897,10 @@ fn build_privacy_page(state: &Rc<UiState>) -> gtk::Widget {
             ),
         }
     });
+    let state_for_screen_capture = Rc::clone(state);
+    state
+        .screen_capture_now_button
+        .connect_clicked(move |_| begin_manual_screen_capture(&state_for_screen_capture));
     let state_for_screen_interval = Rc::clone(state);
     state.screen_interval_combo.connect_changed(move |combo| {
         if state_for_screen_interval.screen_settings_updating.get() {
@@ -1218,6 +1232,157 @@ fn refresh_clipboard_bridge(state: &UiState) {
     }
 }
 
+fn begin_manual_screen_capture(state: &Rc<UiState>) {
+    if state.screen_capture_now_busy.replace(true) {
+        return;
+    }
+    state.screen_capture_now_button.set_sensitive(false);
+    state
+        .screen_capture_now_button
+        .set_label("Switch to the window… 5");
+    let remaining = Rc::new(Cell::new(5_u8));
+    let state_for_countdown = Rc::clone(state);
+    gtk::glib::timeout_add_seconds_local(1, move || {
+        let next = remaining.get().saturating_sub(1);
+        remaining.set(next);
+        if next > 0 {
+            state_for_countdown
+                .screen_capture_now_button
+                .set_label(&format!("Switch to the window… {next}"));
+            return gtk::glib::ControlFlow::Continue;
+        }
+
+        state_for_countdown
+            .screen_capture_now_button
+            .set_label("Remembering locally…");
+        let client = state_for_countdown.client.clone();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(remember_visible_window(&client));
+        });
+        let state_for_result = Rc::clone(&state_for_countdown);
+        gtk::glib::timeout_add_local(Duration::from_millis(100), move || {
+            match receiver.try_recv() {
+                Ok(Ok(result)) => {
+                    finish_manual_screen_capture(&state_for_result);
+                    if result.outcome == "stored" {
+                        toast(
+                            &state_for_result,
+                            "Screen context remembered—it will join the current activity session",
+                        );
+                    } else {
+                        toast(
+                            &state_for_result,
+                            result.reason.as_deref().unwrap_or(
+                                "That screen did not contain useful context to remember",
+                            ),
+                        );
+                    }
+                    gtk::glib::ControlFlow::Break
+                }
+                Ok(Err(error)) => {
+                    finish_manual_screen_capture(&state_for_result);
+                    toast(
+                        &state_for_result,
+                        &format!("Could not remember that screen: {error}"),
+                    );
+                    gtk::glib::ControlFlow::Break
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    finish_manual_screen_capture(&state_for_result);
+                    toast(
+                        &state_for_result,
+                        "The local screen-memory worker stopped unexpectedly",
+                    );
+                    gtk::glib::ControlFlow::Break
+                }
+            }
+        });
+        gtk::glib::ControlFlow::Break
+    });
+}
+
+fn finish_manual_screen_capture(state: &Rc<UiState>) {
+    state.screen_capture_now_busy.set(false);
+    state
+        .screen_capture_now_button
+        .set_label("Remember this screen in 5 seconds");
+    refresh_status(state);
+}
+
+fn remember_visible_window(client: &DaemonClient) -> Result<ScreenCaptureResult, String> {
+    let proxy = gtk::gio::DBusProxy::for_bus_sync(
+        gtk::gio::BusType::Session,
+        gtk::gio::DBusProxyFlags::DO_NOT_AUTO_START,
+        None,
+        CLIPBOARD_DBUS_NAME,
+        CLIPBOARD_DBUS_PATH,
+        CLIPBOARD_DBUS_INTERFACE,
+        None::<&gtk::gio::Cancellable>,
+    )
+    .map_err(|error| format!("the GNOME Desktop Bridge is unavailable: {error}"))?;
+    if proxy.name_owner().is_none() {
+        return Err("the GNOME Desktop Bridge is not connected".to_owned());
+    }
+    let state = proxy
+        .call_sync(
+            "GetActivityState",
+            None,
+            gtk::gio::DBusCallFlags::NONE,
+            1_000,
+            None::<&gtk::gio::Cancellable>,
+        )
+        .map_err(|error| format!("desktop context could not be read: {error}"))?
+        .try_get::<(String, String, String, u32, bool)>()
+        .map_err(|error| format!("desktop context was not understood: {error}"))?;
+    let activity = client
+        .record_activity(ActivitySnapshot {
+            app_id: state.0,
+            app_name: state.1,
+            window_title: state.2,
+            idle_ms: u64::from(state.3),
+            locked: state.4,
+            occurred_at_ms: None,
+        })
+        .map_err(|error| error.to_string())?;
+    if !activity.screen_capture_allowed {
+        return Err(activity.reason.unwrap_or_else(|| {
+            "Screen Memory is paused, disabled, or excluded for that window".to_owned()
+        }));
+    }
+    let session_id = activity.session_id.ok_or_else(|| {
+        "no activity session was available; switch away from Membrie before the countdown ends"
+            .to_owned()
+    })?;
+    let capture = proxy
+        .call_sync(
+            "CaptureWindow",
+            None,
+            gtk::gio::DBusCallFlags::NONE,
+            10_000,
+            None::<&gtk::gio::Cancellable>,
+        )
+        .map_err(|error| format!("the active window could not be captured: {error}"))?
+        .try_get::<(String, String, String, String, u32, u32)>()
+        .map_err(|error| format!("the active-window capture was not understood: {error}"))?;
+    let path = capture.0.clone();
+    let result = client
+        .analyze_screen(ScreenCaptureCandidate {
+            session_id,
+            screenshot_path: capture.0,
+            app_id: capture.1,
+            app_name: capture.2,
+            window_title: capture.3,
+            observed_at_ms: Some(current_time_ms()),
+            width: capture.4,
+            height: capture.5,
+        })
+        .map_err(|error| error.to_string());
+    let _ = fs::remove_file(path);
+    result
+}
+
 fn refresh_status(state: &Rc<UiState>) {
     match state.client.status() {
         Ok(status) => apply_status_ui(state, &status),
@@ -1229,6 +1394,7 @@ fn refresh_status(state: &Rc<UiState>) {
             state.activity_finish_button.set_sensitive(false);
             state.activity_idle_combo.set_sensitive(false);
             state.screen_button.set_sensitive(false);
+            state.screen_capture_now_button.set_sensitive(false);
             state.screen_interval_combo.set_sensitive(false);
             state.screen_model_combo.set_sensitive(false);
             state
@@ -1606,6 +1772,18 @@ fn apply_status_ui(state: &UiState, status: &CaptureStatus) {
         (state.clipboard_bridge_available.get() || status.screen_enabled)
             && status.activity_enabled,
     );
+    state.screen_capture_now_button.set_sensitive(
+        state.clipboard_bridge_available.get()
+            && status.activity_enabled
+            && status.screen_enabled
+            && !status.paused
+            && !state.screen_capture_now_busy.get(),
+    );
+    if !state.screen_capture_now_busy.get() {
+        state
+            .screen_capture_now_button
+            .set_label("Remember this screen in 5 seconds");
+    }
     state
         .screen_interval_combo
         .set_sensitive(status.screen_enabled);
@@ -1742,9 +1920,27 @@ fn apply_status_ui(state: &UiState, status: &CaptureStatus) {
         } else {
             String::new()
         };
+        let processing = if status.screen_processing_count > 0 {
+            format!(
+                " · {} local analysis in progress",
+                status.screen_processing_count
+            )
+        } else {
+            String::new()
+        };
+        let last_remembered = match (
+            status.screen_last_observed_at_ms,
+            status.screen_last_app.as_deref(),
+        ) {
+            (Some(timestamp), Some(app)) if !app.trim().is_empty() => {
+                format!("\nLast remembered: {} · {app}", format_timestamp(timestamp))
+            }
+            (Some(timestamp), _) => format!("\nLast remembered: {}", format_timestamp(timestamp)),
+            _ => String::new(),
+        };
         format!(
-            "On · active window only · up to once per {interval}\nModel: {} · {} observations stored · screenshots retained: 0{failures}",
-            status.screen_model, status.screen_observation_count
+            "On · active window only · up to once per {interval}\nModel: {} · {} observations stored · screenshots retained: 0{processing}{failures}{last_remembered}",
+            status.screen_model, status.screen_observation_count,
         )
     };
     state.screen_status.set_text(&screen_text);
