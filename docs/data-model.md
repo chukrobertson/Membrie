@@ -19,5 +19,6 @@ not an individual key press or low-level operating-system event.
 - `embeddings`: vectors with model and dimensionality provenance
 - `derived_artifacts`: summaries, OCR, entities, and other model output
 - `processing_jobs`: durable background work and retry state
+- `intelligence_settings`: selected local Ollama models and bounded working context
 
 Deleting or regenerating derived records must never destroy captured evidence.

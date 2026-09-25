@@ -1,3 +1,6 @@
+mod intelligence;
+mod ollama;
+
 use anyhow::{Context, Result, anyhow};
 use membrie_core::{
     BackupInfo, Repository, Request, Response, backup_dir, database_path, socket_path,
@@ -22,6 +25,7 @@ fn main() -> Result<()> {
     let socket_path = socket_path();
     let repository = Repository::open(&database_path)
         .with_context(|| format!("could not open {}", database_path.display()))?;
+    repository.reset_interrupted_processing()?;
     if let Err(error) = maybe_create_automatic_backup(&repository) {
         eprintln!("automatic backup failed: {error:#}");
     }
@@ -36,13 +40,16 @@ fn main() -> Result<()> {
     println!("  socket:   {}", socket_path.display());
 
     let repository = Arc::new(Mutex::new(repository));
+    let ollama = ollama::OllamaClient::default();
     start_backup_scheduler(&repository);
+    intelligence::start_worker(&repository, &ollama);
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
                 let repository = Arc::clone(&repository);
+                let ollama = ollama.clone();
                 std::thread::spawn(move || {
-                    if let Err(error) = handle_connection(stream, repository) {
+                    if let Err(error) = handle_connection(stream, repository, ollama) {
                         eprintln!("request failed: {error:#}");
                     }
                 });
@@ -67,7 +74,11 @@ fn prepare_socket(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn handle_connection(stream: UnixStream, repository: Arc<Mutex<Repository>>) -> Result<()> {
+fn handle_connection(
+    stream: UnixStream,
+    repository: Arc<Mutex<Repository>>,
+    ollama: ollama::OllamaClient,
+) -> Result<()> {
     let mut line = String::new();
     BufReader::new(stream.try_clone()?)
         .take(MAX_REQUEST_BYTES)
@@ -77,9 +88,11 @@ fn handle_connection(stream: UnixStream, repository: Arc<Mutex<Repository>>) -> 
     }
 
     let response = match serde_json::from_str::<Request>(&line) {
-        Ok(request) => dispatch(request, &repository).unwrap_or_else(|error| Response::Error {
-            message: error.to_string(),
-        }),
+        Ok(request) => {
+            dispatch(request, &repository, &ollama).unwrap_or_else(|error| Response::Error {
+                message: error.to_string(),
+            })
+        }
         Err(error) => Response::Error {
             message: format!("invalid request: {error}"),
         },
@@ -91,7 +104,34 @@ fn handle_connection(stream: UnixStream, repository: Arc<Mutex<Repository>>) -> 
     Ok(())
 }
 
-fn dispatch(request: Request, repository: &Mutex<Repository>) -> Result<Response> {
+fn dispatch(
+    request: Request,
+    repository: &Mutex<Repository>,
+    ollama: &ollama::OllamaClient,
+) -> Result<Response> {
+    match request {
+        Request::Search { query, limit } => Ok(Response::SearchResults {
+            hits: intelligence::search(repository, ollama, &query, limit)?,
+        }),
+        Request::IntelligenceStatus => Ok(Response::IntelligenceStatus {
+            status: intelligence::status(repository, ollama)?,
+        }),
+        Request::SetIntelligenceSettings { settings } => {
+            Ok(Response::IntelligenceSettingsUpdated {
+                status: intelligence::update_settings(repository, ollama, &settings)?,
+            })
+        }
+        Request::RetryIntelligence => Ok(Response::IntelligenceRetryQueued {
+            count: intelligence::retry_failed(repository)?,
+        }),
+        Request::AskBrie { question } => Ok(Response::BrieAnswered {
+            answer: intelligence::ask_brie(repository, ollama, &question)?,
+        }),
+        request => dispatch_database(request, repository),
+    }
+}
+
+fn dispatch_database(request: Request, repository: &Mutex<Repository>) -> Result<Response> {
     let mut repository = repository
         .lock()
         .map_err(|_| anyhow!("database lock was poisoned"))?;
@@ -107,9 +147,6 @@ fn dispatch(request: Request, repository: &Mutex<Repository>) -> Result<Response
         }),
         Request::ListRecent { limit } => Ok(Response::Remembries {
             remembries: repository.list_recent(limit)?,
-        }),
-        Request::Search { query, limit } => Ok(Response::SearchResults {
-            hits: repository.search(&query, limit)?,
         }),
         Request::SetPause { mode } => Ok(Response::PauseUpdated {
             status: with_capture_health(repository.set_pause(mode)?),
@@ -151,6 +188,11 @@ fn dispatch(request: Request, repository: &Mutex<Repository>) -> Result<Response
         Request::ListBackups => Ok(Response::Backups {
             backups: list_backups()?,
         }),
+        Request::Search { .. }
+        | Request::IntelligenceStatus
+        | Request::SetIntelligenceSettings { .. }
+        | Request::RetryIntelligence
+        | Request::AskBrie { .. } => unreachable!("handled before database dispatch"),
     }
 }
 

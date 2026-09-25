@@ -28,10 +28,13 @@ The project is intentionally local-only:
 - Daily integrity-checked local backups with a rolling 14-backup history
 - Capture-service health reporting in the Privacy screen
 - Rootless Ubuntu installation, app launcher, and automatic user services
+- Restart-safe local summary and embedding jobs
+- Hybrid exact-text and semantic search with `embeddinggemma`
+- Brie answers powered by local `gemma4:12b`, with exact Remembrie citations
+- Local model selection and visible indexing health
 
-Brie, OCR, embeddings, application-context adapters, and the interactive constellation
-are the next implementation milestones. Their UI surfaces are present but clearly
-marked as in progress.
+OCR, application-context adapters, richer citation navigation, and the interactive
+constellation are the next implementation milestones.
 
 ## Install on Ubuntu
 
@@ -51,6 +54,17 @@ The installer never uses `sudo`. It builds Membrie, installs it only for the cur
 user, adds it to the Ubuntu app grid, installs the GNOME clipboard bridge, and starts
 the local daemon and capture helper automatically at login. A new GNOME extension may
 need one log out and back in before clipboard capture becomes available.
+
+Brie requires a local Ollama installation and two downloaded models. The recommended
+defaults are:
+
+```bash
+ollama pull gemma4:12b
+ollama pull embeddinggemma
+```
+
+Membrie connects only to Ollama's fixed loopback address (`127.0.0.1`). Cloud-backed
+Ollama model names are deliberately rejected.
 
 To remove the installed application while keeping every Remembrie and backup:
 

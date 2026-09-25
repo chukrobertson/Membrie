@@ -45,6 +45,68 @@ pub struct SearchHit {
     pub remembrie: Remembrie,
     pub snippet: String,
     pub lexical_score: f64,
+    #[serde(default)]
+    pub semantic_score: Option<f64>,
+    #[serde(default)]
+    pub combined_score: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct IntelligenceSettings {
+    pub chat_model: String,
+    pub embedding_model: String,
+    pub context_tokens: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LocalModel {
+    pub name: String,
+    pub size_bytes: u64,
+    pub parameter_size: Option<String>,
+    pub quantization: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct IntelligenceStatus {
+    pub ollama_available: bool,
+    pub settings: IntelligenceSettings,
+    pub available_models: Vec<LocalModel>,
+    pub total_remembries: u64,
+    pub indexed_remembries: u64,
+    pub pending_jobs: u64,
+    pub running_jobs: u64,
+    pub failed_jobs: u64,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BrieCitation {
+    pub number: u32,
+    pub remembrie: Remembrie,
+    pub excerpt: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BrieAnswer {
+    pub answer: String,
+    pub citations: Vec<BrieCitation>,
+    pub model: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProcessingJob {
+    pub id: String,
+    pub remembrie: Remembrie,
+    pub attempts: u32,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct EmbeddedChunk {
+    pub ordinal: u32,
+    pub start_offset: usize,
+    pub end_offset: usize,
+    pub text: String,
+    pub embedding: Vec<f32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

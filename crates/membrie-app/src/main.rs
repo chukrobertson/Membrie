@@ -1,8 +1,8 @@
 use adw::prelude::*;
 use gtk::{Align, Orientation};
 use membrie_core::{
-    CaptureRule, CaptureStatus, DaemonClient, NewRemembrie, PauseMode, Remembrie, SearchHit,
-    socket_path,
+    BrieAnswer, BrieCitation, CaptureRule, CaptureStatus, DaemonClient, IntelligenceSettings,
+    IntelligenceStatus, LocalModel, NewRemembrie, PauseMode, Remembrie, SearchHit, socket_path,
 };
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -34,6 +34,16 @@ struct UiState {
     backup_status: gtk::Label,
     backup_button: gtk::Button,
     backup_in_progress: Cell<bool>,
+    brie_status: gtk::Label,
+    brie_retry_button: gtk::Button,
+    brie_models_button: gtk::Button,
+    brie_messages: gtk::ListBox,
+    brie_entry: gtk::Entry,
+    brie_send_button: gtk::Button,
+    brie_busy: Cell<bool>,
+    intelligence_refreshing: Cell<bool>,
+    intelligence_settings: RefCell<Option<IntelligenceSettings>>,
+    available_models: RefCell<Vec<LocalModel>>,
     timeline_ids: RefCell<Option<Vec<String>>>,
     status_label: gtk::Label,
     pause_button: gtk::MenuButton,
@@ -61,6 +71,23 @@ fn build_ui(application: &adw::Application) {
     backup_status.set_wrap(true);
     let backup_button = gtk::Button::with_label("Create backup now");
     backup_button.set_halign(Align::Start);
+    let brie_status = gtk::Label::new(Some("Checking local intelligence…"));
+    brie_status.set_xalign(0.0);
+    brie_status.set_wrap(true);
+    let brie_retry_button = gtk::Button::with_label("Retry failed processing");
+    brie_retry_button.set_halign(Align::Start);
+    brie_retry_button.set_visible(false);
+    let brie_models_button = gtk::Button::with_label("Choose local models");
+    brie_models_button.set_halign(Align::Start);
+    brie_models_button.set_sensitive(false);
+    let brie_messages = memory_list();
+    let brie_entry = gtk::Entry::builder()
+        .placeholder_text("Ask Brie about your Remembries…")
+        .hexpand(true)
+        .build();
+    let brie_send_button = gtk::Button::with_label("Ask Brie");
+    brie_send_button.add_css_class("suggested-action");
+    brie_send_button.set_sensitive(false);
     let status_label = gtk::Label::new(Some("Connecting…"));
     status_label.add_css_class("dim-label");
     let pause_button = gtk::MenuButton::builder()
@@ -82,6 +109,16 @@ fn build_ui(application: &adw::Application) {
         backup_status,
         backup_button,
         backup_in_progress: Cell::new(false),
+        brie_status,
+        brie_retry_button,
+        brie_models_button,
+        brie_messages,
+        brie_entry,
+        brie_send_button,
+        brie_busy: Cell::new(false),
+        intelligence_refreshing: Cell::new(false),
+        intelligence_settings: RefCell::new(None),
+        available_models: RefCell::new(Vec::new()),
         timeline_ids: RefCell::new(None),
         status_label,
         pause_button,
@@ -101,7 +138,7 @@ fn build_ui(application: &adw::Application) {
         .build();
     stack.add_named(&build_timeline_page(&state), Some("timeline"));
     stack.add_named(&build_search_page(&state), Some("search"));
-    stack.add_named(&build_brie_page(), Some("brie"));
+    stack.add_named(&build_brie_page(&state), Some("brie"));
     stack.add_named(&build_constellation_page(), Some("constellation"));
     stack.add_named(&build_privacy_page(&state), Some("privacy"));
     content.append(&build_sidebar(&stack));
@@ -122,6 +159,7 @@ fn build_ui(application: &adw::Application) {
     refresh_backups(&state);
     refresh_timeline(&state);
     refresh_capture_rules(&state);
+    refresh_intelligence(&state);
     let state_for_live_capture = Rc::clone(&state);
     gtk::glib::timeout_add_seconds_local(2, move || {
         refresh_timeline(&state_for_live_capture);
@@ -133,6 +171,11 @@ fn build_ui(application: &adw::Application) {
         refresh_clipboard_bridge(&state_for_timer);
         refresh_status(&state_for_timer);
         refresh_backups(&state_for_timer);
+        gtk::glib::ControlFlow::Continue
+    });
+    let state_for_intelligence = Rc::clone(&state);
+    gtk::glib::timeout_add_seconds_local(5, move || {
+        refresh_intelligence(&state_for_intelligence);
         gtk::glib::ControlFlow::Continue
     });
     window.present();
@@ -338,7 +381,10 @@ fn build_timeline_page(state: &Rc<UiState>) -> gtk::Widget {
 }
 
 fn build_search_page(state: &Rc<UiState>) -> gtk::Widget {
-    let page = page_shell("Search", "Exact local search across every Remembrie.");
+    let page = page_shell(
+        "Search",
+        "Hybrid local search combines exact language with related meaning.",
+    );
     let search_bar = gtk::Box::new(Orientation::Horizontal, 8);
     let entry = gtk::SearchEntry::builder()
         .placeholder_text("Search names, phrases, commands…")
@@ -350,19 +396,63 @@ fn build_search_page(state: &Rc<UiState>) -> gtk::Widget {
     search_bar.append(&button);
     page.append(&search_bar);
 
+    let search_busy = Rc::new(Cell::new(false));
     let perform_search: Rc<dyn Fn()> = {
         let state = Rc::clone(state);
         let entry = entry.clone();
+        let button = button.clone();
+        let search_busy = Rc::clone(&search_busy);
         Rc::new(move || {
             let query = entry.text();
             if query.trim().is_empty() {
                 clear_list(&state.search_results);
                 return;
             }
-            match state.client.search(query.as_str(), 50) {
-                Ok(hits) => render_search_hits(&state.search_results, &hits),
-                Err(error) => toast(&state, &format!("Search failed: {error}")),
+            if search_busy.replace(true) {
+                return;
             }
+            button.set_sensitive(false);
+            render_error(
+                &state.search_results,
+                "Searching locally…",
+                "Checking exact text and semantic meaning.",
+            );
+            let client = state.client.clone();
+            let query = query.to_string();
+            let (sender, receiver) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = sender.send(client.search(query, 50));
+            });
+            let state = Rc::clone(&state);
+            let button = button.clone();
+            let search_busy = Rc::clone(&search_busy);
+            gtk::glib::timeout_add_local(Duration::from_millis(100), move || {
+                match receiver.try_recv() {
+                    Ok(Ok(hits)) => {
+                        search_busy.set(false);
+                        button.set_sensitive(true);
+                        render_search_hits(&state.search_results, &hits);
+                        gtk::glib::ControlFlow::Break
+                    }
+                    Ok(Err(error)) => {
+                        search_busy.set(false);
+                        button.set_sensitive(true);
+                        render_error(
+                            &state.search_results,
+                            "Search could not finish",
+                            &error.to_string(),
+                        );
+                        gtk::glib::ControlFlow::Break
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        search_busy.set(false);
+                        button.set_sensitive(true);
+                        toast(&state, "The local search worker stopped unexpectedly");
+                        gtk::glib::ControlFlow::Break
+                    }
+                }
+            });
         })
     };
     let search_from_button = Rc::clone(&perform_search);
@@ -379,18 +469,125 @@ fn build_search_page(state: &Rc<UiState>) -> gtk::Widget {
     page.upcast()
 }
 
-fn build_brie_page() -> gtk::Widget {
+fn build_brie_page(state: &Rc<UiState>) -> gtk::Widget {
     let page = page_shell(
         "Brie",
         "Ask your history—and see exactly which Remembries answer.",
     );
-    let empty = adw::StatusPage::builder()
-        .icon_name("avatar-default-symbolic")
-        .title("Brie is waking up")
-        .description("Local retrieval and citation foundations come first. Ollama-backed conversation is the next milestone.")
+
+    let status_card = gtk::Box::new(Orientation::Vertical, 8);
+    status_card.add_css_class("card");
+    status_card.add_css_class("capture-card");
+    let status_heading = gtk::Label::new(Some("Local intelligence"));
+    status_heading.add_css_class("heading");
+    status_heading.set_xalign(0.0);
+    let privacy = gtk::Label::new(Some(
+        "Brie uses only Ollama on this PC. Questions, answers, summaries, and embeddings never leave it.",
+    ));
+    privacy.add_css_class("dim-label");
+    privacy.set_xalign(0.0);
+    privacy.set_wrap(true);
+    status_card.append(&status_heading);
+    status_card.append(&state.brie_status);
+    status_card.append(&privacy);
+    status_card.append(&state.brie_retry_button);
+    status_card.append(&state.brie_models_button);
+    page.append(&status_card);
+
+    append_brie_message(
+        &state.brie_messages,
+        "Brie",
+        "I'm here. Ask me about anything Membrie has remembered, and I'll show the Remembries supporting my answer.",
+        &[],
+    );
+    let conversation = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
         .vexpand(true)
+        .min_content_height(260)
+        .child(&state.brie_messages)
         .build();
-    page.append(&empty);
+    page.append(&conversation);
+
+    let ask_row = gtk::Box::new(Orientation::Horizontal, 8);
+    ask_row.append(&state.brie_entry);
+    ask_row.append(&state.brie_send_button);
+    page.append(&ask_row);
+
+    let ask: Rc<dyn Fn()> = {
+        let state = Rc::clone(state);
+        Rc::new(move || {
+            let question = state.brie_entry.text().trim().to_owned();
+            if question.is_empty() || state.brie_busy.replace(true) {
+                return;
+            }
+            state.brie_entry.set_text("");
+            state.brie_entry.set_sensitive(false);
+            state.brie_send_button.set_sensitive(false);
+            state.brie_send_button.set_label("Brie is thinking…");
+            append_brie_message(&state.brie_messages, "You", &question, &[]);
+            scroll_list_to_bottom(&conversation);
+
+            let client = state.client.clone();
+            let (sender, receiver) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = sender.send(client.ask_brie(question));
+            });
+            let state = Rc::clone(&state);
+            let conversation = conversation.clone();
+            gtk::glib::timeout_add_local(Duration::from_millis(100), move || {
+                match receiver.try_recv() {
+                    Ok(Ok(answer)) => {
+                        finish_brie_request(&state);
+                        append_brie_answer(&state.brie_messages, &answer);
+                        scroll_list_to_bottom(&conversation);
+                        gtk::glib::ControlFlow::Break
+                    }
+                    Ok(Err(error)) => {
+                        finish_brie_request(&state);
+                        append_brie_message(
+                            &state.brie_messages,
+                            "Brie",
+                            &format!("I couldn't complete that locally: {error}"),
+                            &[],
+                        );
+                        scroll_list_to_bottom(&conversation);
+                        gtk::glib::ControlFlow::Break
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        finish_brie_request(&state);
+                        toast(&state, "Brie's local worker stopped unexpectedly");
+                        gtk::glib::ControlFlow::Break
+                    }
+                }
+            });
+        })
+    };
+    let ask_from_button = Rc::clone(&ask);
+    state
+        .brie_send_button
+        .connect_clicked(move |_| ask_from_button());
+    let ask_from_entry = Rc::clone(&ask);
+    state.brie_entry.connect_activate(move |_| ask_from_entry());
+
+    let state_for_retry = Rc::clone(state);
+    state.brie_retry_button.connect_clicked(move |_| {
+        match state_for_retry.client.retry_intelligence() {
+            Ok(count) => {
+                toast(
+                    &state_for_retry,
+                    &format!("Queued {count} Remembries for another local attempt"),
+                );
+                refresh_intelligence(&state_for_retry);
+            }
+            Err(error) => toast(&state_for_retry, &format!("Could not retry: {error}")),
+        }
+    });
+    let state_for_models = Rc::clone(state);
+    state
+        .brie_models_button
+        .connect_clicked(move |button| show_model_dialog(button, &state_for_models));
+
     page.upcast()
 }
 
@@ -767,6 +964,306 @@ fn refresh_status(state: &Rc<UiState>) {
     }
 }
 
+fn show_model_dialog(parent: &gtk::Button, state: &Rc<UiState>) {
+    let Some(settings) = state.intelligence_settings.borrow().clone() else {
+        toast(state, "Local model information is still loading");
+        return;
+    };
+    let models = state.available_models.borrow().clone();
+    if models.is_empty() {
+        toast(state, "No local Ollama models are available");
+        return;
+    }
+
+    let controls = gtk::Box::new(Orientation::Vertical, 10);
+    let chat_label = gtk::Label::new(Some("Brie and summary model"));
+    chat_label.add_css_class("heading");
+    chat_label.set_xalign(0.0);
+    let chat_models = gtk::ComboBoxText::new();
+    for model in models.iter().filter(|model| {
+        let name = model.name.to_ascii_lowercase();
+        !name.contains("embed") && !name.contains("whisper")
+    }) {
+        chat_models.append(Some(&model.name), &model.name);
+    }
+    if !chat_models.set_active_id(Some(&settings.chat_model)) {
+        chat_models.append(Some(&settings.chat_model), &settings.chat_model);
+        chat_models.set_active_id(Some(&settings.chat_model));
+    }
+
+    let embedding_label = gtk::Label::new(Some("Semantic search model"));
+    embedding_label.add_css_class("heading");
+    embedding_label.set_xalign(0.0);
+    let embedding_models = gtk::ComboBoxText::new();
+    for model in models.iter().filter(|model| {
+        let name = model.name.to_ascii_lowercase();
+        name.contains("embed")
+    }) {
+        embedding_models.append(Some(&model.name), &model.name);
+    }
+    if !embedding_models.set_active_id(Some(&settings.embedding_model)) {
+        embedding_models.append(Some(&settings.embedding_model), &settings.embedding_model);
+        embedding_models.set_active_id(Some(&settings.embedding_model));
+    }
+
+    let context_label = gtk::Label::new(Some("Working context (tokens)"));
+    context_label.add_css_class("heading");
+    context_label.set_xalign(0.0);
+    let context = gtk::SpinButton::with_range(2048.0, 32768.0, 1024.0);
+    context.set_value(f64::from(settings.context_tokens));
+    context.set_tooltip_text(Some("8192 is recommended for Gemma 4 12B on this computer"));
+
+    controls.append(&chat_label);
+    controls.append(&chat_models);
+    controls.append(&embedding_label);
+    controls.append(&embedding_models);
+    controls.append(&context_label);
+    controls.append(&context);
+
+    let dialog = adw::AlertDialog::builder()
+        .heading("Local intelligence models")
+        .body("Changing either model safely re-queues derived summaries and embeddings. Original Remembries are not changed.")
+        .extra_child(&controls)
+        .build();
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("save", "Save and reprocess");
+    dialog.set_close_response("cancel");
+    dialog.set_default_response(Some("save"));
+    dialog.set_response_appearance("save", adw::ResponseAppearance::Suggested);
+    let state_for_save = Rc::clone(state);
+    dialog.connect_response(Some("save"), move |_, _| {
+        let Some(chat_model) = chat_models.active_id() else {
+            toast(&state_for_save, "Choose a model for Brie");
+            return;
+        };
+        let Some(embedding_model) = embedding_models.active_id() else {
+            toast(&state_for_save, "Choose a semantic search model");
+            return;
+        };
+        let settings = IntelligenceSettings {
+            chat_model: chat_model.to_string(),
+            embedding_model: embedding_model.to_string(),
+            context_tokens: context.value_as_int() as u32,
+        };
+        state_for_save.brie_models_button.set_sensitive(false);
+        state_for_save
+            .brie_status
+            .set_text("Saving local models and re-queuing derived data…");
+        let client = state_for_save.client.clone();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(client.set_intelligence_settings(settings));
+        });
+        let state = Rc::clone(&state_for_save);
+        gtk::glib::timeout_add_local(Duration::from_millis(100), move || {
+            match receiver.try_recv() {
+                Ok(Ok(status)) => {
+                    apply_intelligence_status(&state, &status);
+                    toast(&state, "Local intelligence models updated");
+                    gtk::glib::ControlFlow::Break
+                }
+                Ok(Err(error)) => {
+                    state.brie_models_button.set_sensitive(true);
+                    toast(&state, &format!("Could not update models: {error}"));
+                    refresh_intelligence(&state);
+                    gtk::glib::ControlFlow::Break
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    state.brie_models_button.set_sensitive(true);
+                    toast(&state, "The local model update stopped unexpectedly");
+                    gtk::glib::ControlFlow::Break
+                }
+            }
+        });
+    });
+    dialog.present(Some(parent));
+}
+
+fn refresh_intelligence(state: &Rc<UiState>) {
+    if state.intelligence_refreshing.replace(true) {
+        return;
+    }
+    let client = state.client.clone();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = sender.send(client.intelligence_status());
+    });
+    let state = Rc::clone(state);
+    gtk::glib::timeout_add_local(Duration::from_millis(100), move || {
+        match receiver.try_recv() {
+            Ok(Ok(status)) => {
+                state.intelligence_refreshing.set(false);
+                apply_intelligence_status(&state, &status);
+                gtk::glib::ControlFlow::Break
+            }
+            Ok(Err(error)) => {
+                state.intelligence_refreshing.set(false);
+                state
+                    .brie_status
+                    .set_text(&format!("Local intelligence unavailable · {error}"));
+                state.brie_status.remove_css_class("success");
+                state.brie_status.add_css_class("error");
+                state.brie_send_button.set_sensitive(false);
+                gtk::glib::ControlFlow::Break
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                state.intelligence_refreshing.set(false);
+                state
+                    .brie_status
+                    .set_text("Local intelligence status stopped unexpectedly");
+                state.brie_send_button.set_sensitive(false);
+                gtk::glib::ControlFlow::Break
+            }
+        }
+    });
+}
+
+fn apply_intelligence_status(state: &UiState, status: &IntelligenceStatus) {
+    if !status.ollama_available {
+        state.brie_status.set_text(
+            "Ollama is not responding locally. Start Ollama and Brie will resume automatically.",
+        );
+        state.brie_status.remove_css_class("success");
+        state.brie_status.add_css_class("error");
+        state.brie_send_button.set_sensitive(false);
+        state.brie_models_button.set_sensitive(false);
+        return;
+    }
+
+    *state.intelligence_settings.borrow_mut() = Some(status.settings.clone());
+    *state.available_models.borrow_mut() = status.available_models.clone();
+
+    let processing = if status.running_jobs > 0 {
+        format!(" · processing {} now", status.running_jobs)
+    } else if status.pending_jobs > 0 {
+        format!(" · {} queued", status.pending_jobs)
+    } else {
+        String::new()
+    };
+    state.brie_status.set_text(&format!(
+        "Ollama connected · {} · {} of {} Remembries indexed{}\nEmbeddings: {} · Context: {} tokens",
+        status.settings.chat_model,
+        status.indexed_remembries,
+        status.total_remembries,
+        processing,
+        status.settings.embedding_model,
+        status.settings.context_tokens
+    ));
+    state.brie_status.remove_css_class("error");
+    state.brie_status.add_css_class("success");
+    state.brie_retry_button.set_visible(status.failed_jobs > 0);
+    state
+        .brie_retry_button
+        .set_label(&format!("Retry {} failed Remembries", status.failed_jobs));
+    state
+        .brie_send_button
+        .set_sensitive(status.total_remembries > 0 && !state.brie_busy.get());
+    state.brie_models_button.set_sensitive(true);
+}
+
+fn finish_brie_request(state: &UiState) {
+    state.brie_busy.set(false);
+    state.brie_entry.set_sensitive(true);
+    state.brie_send_button.set_sensitive(true);
+    state.brie_send_button.set_label("Ask Brie");
+    state.brie_entry.grab_focus();
+}
+
+fn append_brie_answer(list: &gtk::ListBox, answer: &BrieAnswer) {
+    append_brie_message(list, "Brie", &answer.answer, &answer.citations);
+}
+
+fn append_brie_message(
+    list: &gtk::ListBox,
+    speaker: &str,
+    message: &str,
+    citations: &[BrieCitation],
+) {
+    let row = gtk::ListBoxRow::new();
+    row.set_activatable(false);
+    let content = gtk::Box::new(Orientation::Vertical, 6);
+    content.set_margin_top(12);
+    content.set_margin_bottom(12);
+    content.set_margin_start(14);
+    content.set_margin_end(14);
+    content.add_css_class(if speaker == "You" {
+        "chat-user"
+    } else {
+        "chat-assistant"
+    });
+
+    let speaker_label = gtk::Label::new(Some(speaker));
+    speaker_label.add_css_class("heading");
+    speaker_label.set_xalign(0.0);
+    let message_label = gtk::Label::new(Some(message));
+    message_label.set_xalign(0.0);
+    message_label.set_wrap(true);
+    message_label.set_selectable(true);
+    content.append(&speaker_label);
+    content.append(&message_label);
+
+    if !citations.is_empty() {
+        let source_heading = gtk::Label::new(Some("Supporting Remembries"));
+        source_heading.add_css_class("caption");
+        source_heading.add_css_class("dim-label");
+        source_heading.set_xalign(0.0);
+        source_heading.set_margin_top(4);
+        content.append(&source_heading);
+        for citation in citations {
+            let label = format!("[{}] {}", citation.number, citation.remembrie.title);
+            let button = gtk::Button::with_label(&label);
+            button.add_css_class("flat");
+            button.set_halign(Align::Start);
+            button.set_tooltip_text(Some("Open the exact supporting Remembrie"));
+            let citation = citation.clone();
+            button.connect_clicked(move |button| {
+                let source = citation
+                    .remembrie
+                    .source_app
+                    .as_deref()
+                    .unwrap_or("Unknown source");
+                let body = if citation.remembrie.body.trim().is_empty() {
+                    citation.excerpt.as_str()
+                } else {
+                    citation.remembrie.body.as_str()
+                };
+                let dialog = adw::AlertDialog::builder()
+                    .heading(&citation.remembrie.title)
+                    .body(format!(
+                        "{} · {}\n\n{}",
+                        format_timestamp(citation.remembrie.occurred_at_ms),
+                        source,
+                        truncate_display_text(body, 5000)
+                    ))
+                    .build();
+                dialog.add_response("close", "Close");
+                dialog.set_default_response(Some("close"));
+                dialog.present(Some(button));
+            });
+            content.append(&button);
+        }
+    }
+    row.set_child(Some(&content));
+    list.append(&row);
+}
+
+fn scroll_list_to_bottom(scroll: &gtk::ScrolledWindow) {
+    let adjustment = scroll.vadjustment();
+    gtk::glib::idle_add_local_once(move || {
+        adjustment.set_value(adjustment.upper() - adjustment.page_size());
+    });
+}
+
+fn truncate_display_text(text: &str, maximum: usize) -> String {
+    let mut result: String = text.chars().take(maximum).collect();
+    if text.chars().count() > maximum {
+        result.push('…');
+    }
+    result
+}
+
 fn apply_status_ui(state: &UiState, status: &CaptureStatus) {
     state.pause_button.set_sensitive(true);
     state
@@ -934,8 +1431,8 @@ fn render_search_hits(list: &gtk::ListBox, hits: &[SearchHit]) {
     if hits.is_empty() {
         render_error(
             list,
-            "No exact matches",
-            "Semantic recall will arrive with the hybrid-search milestone.",
+            "No matching Remembries",
+            "Try a different phrase or let local indexing finish.",
         );
         return;
     }
@@ -1060,6 +1557,8 @@ fn install_css() {
          .capture-card { padding: 18px; }
          .memory-editor { background: @view_bg_color; }
          .memory-preview { opacity: 0.88; }
+         .chat-user { border-left: 3px solid @accent_bg_color; padding-left: 10px; }
+         .chat-assistant { border-left: 3px solid @success_color; padding-left: 10px; }
          .title { font-weight: 700; }
          .heading { font-weight: 600; }",
     );

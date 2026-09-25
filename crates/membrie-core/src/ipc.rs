@@ -1,6 +1,6 @@
 use crate::model::{
-    BackupInfo, CaptureCandidate, CaptureDecision, CaptureRule, CaptureStatus, NewRemembrie,
-    PauseMode, Remembrie, SearchHit,
+    BackupInfo, BrieAnswer, CaptureCandidate, CaptureDecision, CaptureRule, CaptureStatus,
+    IntelligenceSettings, IntelligenceStatus, NewRemembrie, PauseMode, Remembrie, SearchHit,
 };
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -49,6 +49,14 @@ pub enum Request {
     ClipboardAgentHeartbeat,
     CreateBackup,
     ListBackups,
+    IntelligenceStatus,
+    SetIntelligenceSettings {
+        settings: IntelligenceSettings,
+    },
+    RetryIntelligence,
+    AskBrie {
+        question: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -68,6 +76,10 @@ pub enum Response {
     CaptureAgentHeartbeatRecorded { status: CaptureStatus },
     BackupCreated { backup: BackupInfo },
     Backups { backups: Vec<BackupInfo> },
+    IntelligenceStatus { status: IntelligenceStatus },
+    IntelligenceSettingsUpdated { status: IntelligenceStatus },
+    IntelligenceRetryQueued { count: u64 },
+    BrieAnswered { answer: BrieAnswer },
     Error { message: String },
 }
 
@@ -105,12 +117,20 @@ impl DaemonClient {
     }
 
     pub fn request(&self, request: &Request) -> Result<Response, ClientError> {
+        self.request_with_timeout(request, Duration::from_secs(10))
+    }
+
+    fn request_with_timeout(
+        &self,
+        request: &Request,
+        timeout: Duration,
+    ) -> Result<Response, ClientError> {
         let mut stream =
             UnixStream::connect(&self.socket_path).map_err(|source| ClientError::Connect {
                 path: self.socket_path.display().to_string(),
                 source,
             })?;
-        stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+        stream.set_read_timeout(Some(timeout))?;
         stream.set_write_timeout(Some(Duration::from_secs(10)))?;
 
         serde_json::to_writer(&mut stream, request)?;
@@ -173,10 +193,13 @@ impl DaemonClient {
         query: impl Into<String>,
         limit: u32,
     ) -> Result<Vec<SearchHit>, ClientError> {
-        match self.request(&Request::Search {
-            query: query.into(),
-            limit,
-        })? {
+        match self.request_with_timeout(
+            &Request::Search {
+                query: query.into(),
+                limit,
+            },
+            Duration::from_secs(120),
+        )? {
             Response::SearchResults { hits } => Ok(hits),
             other => Err(ClientError::Rejected(format!(
                 "unexpected response: {other:?}"
@@ -268,6 +291,50 @@ impl DaemonClient {
     pub fn list_backups(&self) -> Result<Vec<BackupInfo>, ClientError> {
         match self.request(&Request::ListBackups)? {
             Response::Backups { backups } => Ok(backups),
+            other => Err(ClientError::Rejected(format!(
+                "unexpected response: {other:?}"
+            ))),
+        }
+    }
+
+    pub fn intelligence_status(&self) -> Result<IntelligenceStatus, ClientError> {
+        match self.request(&Request::IntelligenceStatus)? {
+            Response::IntelligenceStatus { status } => Ok(status),
+            other => Err(ClientError::Rejected(format!(
+                "unexpected response: {other:?}"
+            ))),
+        }
+    }
+
+    pub fn set_intelligence_settings(
+        &self,
+        settings: IntelligenceSettings,
+    ) -> Result<IntelligenceStatus, ClientError> {
+        match self.request(&Request::SetIntelligenceSettings { settings })? {
+            Response::IntelligenceSettingsUpdated { status } => Ok(status),
+            other => Err(ClientError::Rejected(format!(
+                "unexpected response: {other:?}"
+            ))),
+        }
+    }
+
+    pub fn retry_intelligence(&self) -> Result<u64, ClientError> {
+        match self.request(&Request::RetryIntelligence)? {
+            Response::IntelligenceRetryQueued { count } => Ok(count),
+            other => Err(ClientError::Rejected(format!(
+                "unexpected response: {other:?}"
+            ))),
+        }
+    }
+
+    pub fn ask_brie(&self, question: impl Into<String>) -> Result<BrieAnswer, ClientError> {
+        match self.request_with_timeout(
+            &Request::AskBrie {
+                question: question.into(),
+            },
+            Duration::from_secs(15 * 60),
+        )? {
+            Response::BrieAnswered { answer } => Ok(answer),
             other => Err(ClientError::Rejected(format!(
                 "unexpected response: {other:?}"
             ))),

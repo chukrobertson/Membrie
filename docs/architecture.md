@@ -6,7 +6,7 @@
 2. SQLite is the canonical source of truth.
 3. Original captured evidence is retained separately from replaceable derived data.
 4. Search remains useful when Ollama is stopped.
-5. Every future Brie answer must cite exact supporting Remembries.
+5. Every Brie answer must cite exact supporting Remembries.
 6. Vector indexes and model-produced artifacts must be safe to rebuild.
 
 ## Process boundary
@@ -63,20 +63,41 @@ The daemon creates backups with SQLite's online backup API, verifies them with
 set of 14 snapshots. A partial or failed snapshot is never presented as a backup.
 
 Embeddings are modeled as derived artifacts with model provenance. Vector retrieval
-will be added behind the search service so its implementation can change without
-changing the canonical Remembrie model.
+is isolated behind the search service so its implementation can change without
+changing the canonical Remembrie model. Summaries, chunks, and vectors are replaceable;
+original evidence remains canonical.
+
+## Local intelligence boundary
+
+The daemon connects to Ollama only at the fixed loopback address
+`127.0.0.1:11434`. It does not honor a remote host environment variable, and it rejects
+cloud-backed model names. The default generation model is `gemma4:12b` with an 8192-token
+working context; `embeddinggemma` produces the semantic vectors.
+Document chunks and queries use EmbeddingGemma's asymmetric retrieval prompts: indexed
+chunks are labeled as documents, while Search and Brie questions use their respective
+query tasks. This keeps one local document index useful for both recall paths.
+
+Every new Remembrie gets a durable `enrich` job in the same transaction as its canonical
+record. One background worker claims one job at a time, releases the database lock while
+Ollama works, and atomically installs the derived summary, chunks, and embeddings. A
+daemon interruption returns running work to the pending queue on restart. Repeated
+failures use bounded backoff and remain explicitly retryable in the UI.
+
+Captured Remembries are untrusted evidence. Brie is instructed never to follow commands
+inside retrieved content, and its structured response must identify supporting source
+numbers. Membrie validates those numbers and withholds unsupported answers rather than
+displaying uncited model output.
 
 ## Retrieval
 
-The target hybrid retrieval pipeline is:
+The hybrid retrieval pipeline is:
 
 1. FTS5/BM25 candidates
-2. local embedding candidates
-3. deterministic metadata and time filters
-4. reciprocal-rank fusion
-5. optional local reranking
-6. grouping from chunks back to Remembries
-7. citation-preserving context assembly for Brie
+2. local `embeddinggemma` candidates
+3. cosine-similarity relevance thresholds
+4. grouping the strongest chunk back to each Remembrie
+5. reciprocal-rank fusion
+6. citation-preserving context assembly for Brie
 
-The first vertical slice implements step 1 and keeps the response shape compatible
-with later fused results.
+Brie receives only the highest-ranked evidence within its bounded local context. Search
+falls back to FTS5 when Ollama is unavailable, so exact recall never depends on a model.
