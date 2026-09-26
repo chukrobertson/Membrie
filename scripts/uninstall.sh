@@ -11,6 +11,7 @@ systemctl --user disable --now membrie-capture.service membried.service >/dev/nu
 rm -f "$HOME/.local/bin/membrie"
 rm -f "$HOME/.local/libexec/membrie/membried"
 rm -f "$HOME/.local/libexec/membrie/membrie-capture"
+rm -f "$HOME/.local/libexec/membrie/membrie-calendar"
 rmdir "$HOME/.local/libexec/membrie" 2>/dev/null || true
 rm -f "$data_home/applications/com.chuk.Membrie.desktop"
 rm -f "$data_home/icons/hicolor/scalable/apps/com.chuk.Membrie.svg"

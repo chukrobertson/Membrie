@@ -1,3 +1,4 @@
+mod calendar;
 mod intelligence;
 mod ollama;
 
@@ -45,6 +46,7 @@ fn main() -> Result<()> {
     let repository = Arc::new(Mutex::new(repository));
     let ollama = ollama::OllamaClient::default();
     start_backup_scheduler(&repository);
+    calendar::start_scheduler(&repository);
     intelligence::start_worker(&repository, &ollama);
     for stream in listener.incoming() {
         match stream {
@@ -133,6 +135,9 @@ fn dispatch(
         Request::AnalyzeScreen { candidate } => Ok(Response::ScreenAnalyzed {
             result: analyze_screen_candidate(repository, ollama, &candidate)?,
         }),
+        Request::SyncCalendarNow => Ok(Response::CalendarSynced {
+            result: calendar::sync(repository)?,
+        }),
         request => dispatch_database(request, repository),
     }
 }
@@ -205,6 +210,9 @@ fn dispatch_database(request: Request, repository: &Mutex<Repository>) -> Result
         Request::SetScreenModel { model } => Ok(Response::CaptureSourceUpdated {
             status: with_capture_health(repository.set_screen_model(&model)?),
         }),
+        Request::SetCalendarEnabled { enabled } => Ok(Response::CaptureSourceUpdated {
+            status: with_capture_health(repository.set_calendar_enabled(enabled)?),
+        }),
         Request::RecordActivity { snapshot } => Ok(Response::ActivityRecorded {
             result: repository.record_activity_snapshot(snapshot)?,
         }),
@@ -254,7 +262,8 @@ fn dispatch_database(request: Request, repository: &Mutex<Repository>) -> Result
         | Request::SetIntelligenceSettings { .. }
         | Request::RetryIntelligence
         | Request::AskBrie { .. }
-        | Request::AnalyzeScreen { .. } => unreachable!("handled before database dispatch"),
+        | Request::AnalyzeScreen { .. }
+        | Request::SyncCalendarNow => unreachable!("handled before database dispatch"),
     }
 }
 

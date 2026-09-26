@@ -46,17 +46,18 @@ The project is intentionally local-only:
 - Brie answers powered by local `gemma4:12b`, with exact Remembrie citations
 - Brie citations open the matching Timeline day, highlight the source, and show its exact evidence
 - Quick Brie compact window for local recall and note capture without leaving the current workflow
+- Opt-in read-only GNOME Calendar integration with recurring-event expansion and local reconciliation
 - Local model selection and visible indexing health
 
-Dedicated OCR, optional retained evidence controls, and deeper pattern detection are the next
-implementation milestones.
+Per-calendar controls, the Tailscale WebUI, Thunderbird evidence, meeting transcripts, and deeper
+pattern detection are the next implementation milestones.
 
 ## Install on Ubuntu
 
 Install the native build requirements once:
 
 ```bash
-sudo apt install build-essential cargo pkg-config libgtk-4-dev libadwaita-1-dev libglib2.0-dev gnome-shell
+sudo apt install build-essential cargo pkg-config libgtk-4-dev libadwaita-1-dev libglib2.0-dev gnome-shell gir1.2-ecal-2.0
 ```
 
 Then run the local installer from this checkout:
@@ -85,6 +86,11 @@ ollama pull gemma4:e2b
 The first two models power Brie and hybrid recall. The optional third model powers
 Screen Memory and is not used unless that source is explicitly enabled. Other installed
 vision-capable Ollama models can be selected in Privacy & Capture.
+
+Calendar access is separately opt-in. Membrie reads enabled calendars from Ubuntu's local
+Evolution Data Server, never receives calendar-account credentials, and exposes no calendar write
+or refresh operation. A provider configured in GNOME may continue its own normal synchronization;
+Membrie only reads the resulting local calendar view.
 
 Membrie connects only to Ollama's fixed loopback address (`127.0.0.1`). Cloud-backed
 Ollama model names are deliberately rejected.
@@ -149,7 +155,7 @@ MEMBRIE_DATA_DIR=/tmp/membrie-dev ./scripts/dev.sh
 
 ```text
 crates/membrie-core    Canonical model, SQLite repository, paths, and IPC client
-crates/membrie-daemon  Database owner, policy engine, and Unix-socket service
+crates/membrie-daemon  Database owner, policy engine, calendar reader, and Unix-socket service
 crates/membrie-capture Local D-Bus client for the GNOME desktop bridge
 crates/membrie-a11y    Bounded, read-only AT-SPI semantic-context reader
 crates/membrie-app     Native GTK 4/libadwaita application

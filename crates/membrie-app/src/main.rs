@@ -104,6 +104,10 @@ struct UiState {
     screen_interval_combo: gtk::ComboBoxText,
     screen_model_combo: gtk::ComboBoxText,
     screen_settings_updating: Cell<bool>,
+    calendar_status: gtk::Label,
+    calendar_button: gtk::Button,
+    calendar_sync_button: gtk::Button,
+    calendar_syncing: Cell<bool>,
     backup_status: gtk::Label,
     backup_button: gtk::Button,
     backup_in_progress: Cell<bool>,
@@ -228,6 +232,14 @@ fn build_ui(application: &adw::Application) {
     let screen_model_combo = gtk::ComboBoxText::new();
     screen_model_combo.append(Some("gemma4:e2b"), "gemma4:e2b");
     screen_model_combo.set_active_id(Some("gemma4:e2b"));
+    let calendar_status = gtk::Label::new(Some("Local calendar access · Checking…"));
+    calendar_status.set_xalign(0.0);
+    calendar_status.set_wrap(true);
+    let calendar_button = gtk::Button::with_label("Enable calendar access");
+    calendar_button.set_halign(Align::Start);
+    let calendar_sync_button = gtk::Button::with_label("Sync local calendars now");
+    calendar_sync_button.set_halign(Align::Start);
+    calendar_sync_button.set_sensitive(false);
     let backup_status = gtk::Label::new(Some("Checking local backups…"));
     backup_status.set_xalign(0.0);
     backup_status.set_wrap(true);
@@ -298,6 +310,10 @@ fn build_ui(application: &adw::Application) {
         screen_interval_combo,
         screen_model_combo,
         screen_settings_updating: Cell::new(false),
+        calendar_status,
+        calendar_button,
+        calendar_sync_button,
+        calendar_syncing: Cell::new(false),
         backup_status,
         backup_button,
         backup_in_progress: Cell::new(false),
@@ -1589,6 +1605,62 @@ fn build_privacy_page(state: &Rc<UiState>) -> gtk::Widget {
     });
     page.append(&screen_card);
 
+    let calendar_card = gtk::Box::new(Orientation::Vertical, 8);
+    calendar_card.add_css_class("card");
+    calendar_card.add_css_class("capture-card");
+    let calendar_heading = gtk::Label::new(Some("Calendar · Early access"));
+    calendar_heading.add_css_class("heading");
+    calendar_heading.set_xalign(0.0);
+    let calendar_detail = gtk::Label::new(Some(
+        "Off by default. Membrie reads enabled calendars through Ubuntu's local Evolution Data Server and mirrors a bounded one-year history and one-year look-ahead as searchable Remembries. It never receives account credentials and exposes no create, edit, delete, or refresh operation.",
+    ));
+    calendar_detail.add_css_class("dim-label");
+    calendar_detail.set_xalign(0.0);
+    calendar_detail.set_wrap(true);
+    let calendar_sync_detail = gtk::Label::new(Some(
+        "Membrie checks locally every 15 minutes while enabled. Your desktop's calendar accounts may continue their own normal synchronization independently of Membrie.",
+    ));
+    calendar_sync_detail.add_css_class("dim-label");
+    calendar_sync_detail.set_xalign(0.0);
+    calendar_sync_detail.set_wrap(true);
+    calendar_card.append(&calendar_heading);
+    calendar_card.append(&state.calendar_status);
+    calendar_card.append(&calendar_detail);
+    calendar_card.append(&calendar_sync_detail);
+    calendar_card.append(&state.calendar_button);
+    calendar_card.append(&state.calendar_sync_button);
+    let state_for_calendar = Rc::clone(state);
+    state.calendar_button.connect_clicked(move |_| {
+        let enabled = state_for_calendar
+            .client
+            .status()
+            .map(|status| !status.calendar_enabled)
+            .unwrap_or(false);
+        match state_for_calendar.client.set_calendar_enabled(enabled) {
+            Ok(status) => {
+                apply_status_ui(&state_for_calendar, &status);
+                if enabled {
+                    toast(
+                        &state_for_calendar,
+                        "Read-only local calendar access enabled",
+                    );
+                    begin_calendar_sync(&state_for_calendar);
+                } else {
+                    toast(&state_for_calendar, "Calendar access disabled");
+                }
+            }
+            Err(error) => toast(
+                &state_for_calendar,
+                &format!("Could not update calendar access: {error}"),
+            ),
+        }
+    });
+    let state_for_calendar_sync = Rc::clone(state);
+    state
+        .calendar_sync_button
+        .connect_clicked(move |_| begin_calendar_sync(&state_for_calendar_sync));
+    page.append(&calendar_card);
+
     let backup_card = gtk::Box::new(Orientation::Vertical, 8);
     backup_card.add_css_class("card");
     backup_card.add_css_class("capture-card");
@@ -2822,6 +2894,8 @@ fn refresh_status(state: &Rc<UiState>) {
             state.screen_capture_now_button.set_sensitive(false);
             state.screen_interval_combo.set_sensitive(false);
             state.screen_model_combo.set_sensitive(false);
+            state.calendar_button.set_sensitive(false);
+            state.calendar_sync_button.set_sensitive(false);
             state
                 .clipboard_agent_label
                 .set_text("Desktop capture service · Daemon offline");
@@ -2839,8 +2913,71 @@ fn refresh_status(state: &Rc<UiState>) {
             state
                 .screen_status
                 .set_text("Screen Memory · Daemon offline");
+            state
+                .calendar_status
+                .set_text("Local calendar access · Daemon offline");
         }
     }
+}
+
+fn begin_calendar_sync(state: &Rc<UiState>) {
+    if state.calendar_syncing.replace(true) {
+        return;
+    }
+    state.calendar_sync_button.set_sensitive(false);
+    state
+        .calendar_sync_button
+        .set_label("Reading local calendars…");
+    state
+        .calendar_status
+        .set_text("Reading enabled calendars through Ubuntu's local calendar service…");
+    let client = state.client.clone();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = sender.send(client.sync_calendar_now());
+    });
+    let state = Rc::clone(state);
+    gtk::glib::timeout_add_local(Duration::from_millis(100), move || {
+        match receiver.try_recv() {
+            Ok(Ok(result)) => {
+                state.calendar_syncing.set(false);
+                state
+                    .calendar_sync_button
+                    .set_label("Sync local calendars now");
+                refresh_status(&state);
+                refresh_timeline(&state);
+                refresh_intelligence(&state);
+                let changes = result.added + result.updated + result.removed;
+                toast(
+                    &state,
+                    &format!(
+                        "Calendar sync complete · {} events available · {changes} changes",
+                        result.event_count
+                    ),
+                );
+                gtk::glib::ControlFlow::Break
+            }
+            Ok(Err(error)) => {
+                state.calendar_syncing.set(false);
+                state
+                    .calendar_sync_button
+                    .set_label("Sync local calendars now");
+                refresh_status(&state);
+                toast(&state, &format!("Calendar sync needs attention: {error}"));
+                gtk::glib::ControlFlow::Break
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                state.calendar_syncing.set(false);
+                state
+                    .calendar_sync_button
+                    .set_label("Sync local calendars now");
+                refresh_status(&state);
+                toast(&state, "The local calendar worker stopped unexpectedly");
+                gtk::glib::ControlFlow::Break
+            }
+        }
+    });
 }
 
 fn show_model_dialog(parent: &gtk::Button, state: &Rc<UiState>) {
@@ -3268,6 +3405,12 @@ fn apply_status_ui(state: &UiState, status: &CaptureStatus) {
     state
         .screen_model_combo
         .set_sensitive(!status.screen_enabled);
+    state
+        .calendar_button
+        .set_sensitive(!state.calendar_syncing.get());
+    state
+        .calendar_sync_button
+        .set_sensitive(status.calendar_enabled && !status.paused && !state.calendar_syncing.get());
     state.pause_button.set_icon_name(if status.paused {
         "media-playback-start-symbolic"
     } else {
@@ -3314,6 +3457,11 @@ fn apply_status_ui(state: &UiState, status: &CaptureStatus) {
         "Disable screen memory"
     } else {
         "Enable screen memory"
+    });
+    state.calendar_button.set_label(if status.calendar_enabled {
+        "Disable calendar access"
+    } else {
+        "Enable calendar access"
     });
     state.activity_settings_updating.set(true);
     state
@@ -3474,6 +3622,33 @@ fn apply_status_ui(state: &UiState, status: &CaptureStatus) {
         )
     };
     state.screen_status.set_text(&screen_text);
+    if !state.calendar_syncing.get() {
+        let calendar_text = if !status.calendar_enabled {
+            format!(
+                "Off · {} calendar events remain available locally",
+                status.calendar_event_count
+            )
+        } else if let Some(error) = status.calendar_last_error.as_deref() {
+            let last_sync = status
+                .calendar_last_sync_ms
+                .map(|timestamp| format!("\nLast completed: {}", format_timestamp(timestamp)))
+                .unwrap_or_default();
+            format!(
+                "On · local calendar access needs attention\n{}{last_sync}",
+                truncate_display_text(error, 500)
+            )
+        } else if let Some(timestamp) = status.calendar_last_sync_ms {
+            format!(
+                "On · {} enabled calendars · {} searchable events\nLast local sync: {}",
+                status.calendar_source_count,
+                status.calendar_event_count,
+                format_timestamp(timestamp)
+            )
+        } else {
+            "On · waiting for the first local calendar sync".to_owned()
+        };
+        state.calendar_status.set_text(&calendar_text);
+    }
     state.privacy_stats.set_text(&format!(
         "{} Remembries stored · {} automatic events safely skipped\n{} probable secrets blocked · {} duplicates ignored",
         status.remembrie_count,

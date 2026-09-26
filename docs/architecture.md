@@ -122,6 +122,21 @@ The five-second compatibility test remains available as a store-nothing diagnost
 stays in app memory and is never sent to the daemon. Neither automatic Semantic Context nor the
 compatibility test invokes Ollama or any network service.
 
+Calendar access is an independent opt-in adapter. A small read-only helper uses Ubuntu's installed
+Evolution Data Server introspection runtime to enumerate enabled calendar sources and expand event
+instances across a bounded one-year history and one-year look-ahead. The helper has no create,
+modify, delete, or refresh operation and never receives account credentials. Calendar providers
+already configured in GNOME remain owned by the desktop and may perform their normal synchronization
+independently; Membrie reads only the local EDS view.
+
+The daemon validates and bounds every helper field, applies application/content exclusions and
+high-confidence secret detection before persistence, and reconciles changed or removed instances
+transactionally. Successful sources can be reconciled even when another source fails; a failed
+source's existing records are preserved. Calendar instances become explicitly typed `calendar`
+Remembries so FTS, local embeddings, Timeline evidence, and Brie citations use the same canonical
+path as other evidence. Disabling access stops future reads without silently deleting previously
+remembered events.
+
 ## Storage
 
 SQLite owns identity, timestamps, metadata, captured text, processing state, and

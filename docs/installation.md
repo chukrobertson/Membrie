@@ -9,7 +9,7 @@ service.
 From a Membrie source checkout:
 
 ```bash
-sudo apt install build-essential cargo pkg-config libgtk-4-dev libadwaita-1-dev libglib2.0-dev gnome-shell
+sudo apt install build-essential cargo pkg-config libgtk-4-dev libadwaita-1-dev libglib2.0-dev gnome-shell gir1.2-ecal-2.0
 ./scripts/install.sh
 ```
 
@@ -49,6 +49,14 @@ When both Semantic Context and Screen Memory are enabled, rich application-provi
 a redundant screenshot. Partial or unavailable semantic context lets Screen Memory provide a local
 visual fallback. Both sources remain dependent on Activity Context, and all processing stays local.
 Some already-open applications may need to be restarted after accessibility is enabled.
+
+Calendar access is also off by default. When enabled, Membrie reads the calendars already exposed by
+Ubuntu's Evolution Data Server every 15 minutes. It imports a bounded one-year history and one-year
+look-ahead, expands recurring events, and makes them locally searchable by Brie. The connector does
+not receive account credentials and contains no calendar write or forced-refresh operation. GNOME
+calendar providers may continue their own configured synchronization independently of Membrie.
+The `gir1.2-ecal-2.0` package in the install command supplies the small runtime description needed
+to call the calendar library; the installer reports an ordinary-language reminder when it is absent.
 
 ## Backups
 

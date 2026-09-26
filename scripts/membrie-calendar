@@ -1,0 +1,179 @@
+#!/usr/bin/python3
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+"""Read enabled GNOME calendars through Evolution Data Server and emit JSON.
+
+This helper deliberately exposes no write operation. It does not request a refresh;
+it only reads the local calendar view already managed by the desktop session.
+"""
+
+import argparse
+import html
+import json
+import re
+import sys
+import time
+from datetime import datetime
+
+MAX_EVENTS = 5000
+MAX_TITLE_CHARS = 1000
+MAX_DESCRIPTION_CHARS = 8_000
+MAX_LOCATION_CHARS = 2000
+
+
+def load_calendar_runtime():
+    try:
+        import gi
+
+        gi.require_version("ECal", "2.0")
+        gi.require_version("EDataServer", "1.2")
+        gi.require_version("ICalGLib", "3.0")
+        from gi.repository import ECal, EDataServer, ICalGLib
+    except (ImportError, ValueError) as error:
+        raise RuntimeError(
+            "Ubuntu calendar support is missing; install gir1.2-ecal-2.0"
+        ) from error
+    return ECal, EDataServer, ICalGLib
+
+
+def clean_text(value, maximum):
+    if not value:
+        return ""
+    value = html.unescape(str(value)).replace("\x00", "")
+    value = re.sub(r"<\s*br\s*/?\s*>", "\n", value, flags=re.IGNORECASE)
+    value = re.sub(r"<[^>]+>", " ", value)
+    value = value.replace("\r\n", "\n").replace("\r", "\n")
+    value = "\n".join(line.strip() for line in value.splitlines())
+    value = re.sub(r"[ \t]+", " ", value).strip()
+    return value[:maximum]
+
+
+def time_label(timestamp, all_day):
+    local = datetime.fromtimestamp(timestamp).astimezone()
+    if all_day:
+        return local.strftime("%A, %Y-%m-%d")
+    return local.isoformat(timespec="minutes")
+
+
+def status_name(component):
+    status = component.get_status()
+    nick = getattr(status, "value_nick", None)
+    if nick:
+        return str(nick).replace("ical-status-", "").lower()
+    return ""
+
+
+def read_snapshot(start_ms, end_ms):
+    ECal, EDataServer, ICalGLib = load_calendar_runtime()
+    registry = EDataServer.SourceRegistry.new_sync(None)
+    sources = []
+    events = []
+    start_seconds = start_ms // 1000
+    end_seconds = end_ms // 1000
+
+    for source in registry.list_sources(EDataServer.SOURCE_EXTENSION_CALENDAR):
+        if not source.get_enabled():
+            continue
+        source_uid = clean_text(source.get_uid(), 512)
+        source_name = clean_text(source.get_display_name(), 1000) or "Calendar"
+        source_result = {
+            "source_uid": source_uid,
+            "name": source_name,
+            "error": None,
+        }
+        source_event_count = 0
+        try:
+            client = ECal.Client.connect_sync(
+                source, ECal.ClientSourceType.EVENTS, 10, None
+            )
+            timezone = ICalGLib.Timezone.get_builtin_timezone(
+                ECal.system_timezone_get_location()
+            )
+            client.set_default_timezone(
+                timezone or ICalGLib.Timezone.get_utc_timezone()
+            )
+
+            def collect(component, instance_start, instance_end, _data, _cancellable):
+                nonlocal source_event_count
+                if len(events) >= MAX_EVENTS:
+                    return False
+                starts_at = int(instance_start.as_timet())
+                ends_at = max(starts_at, int(instance_end.as_timet()))
+                all_day = bool(instance_start.is_date())
+                uid = clean_text(component.get_uid(), 2048)
+                title = clean_text(component.get_summary(), MAX_TITLE_CHARS)
+                if not uid or not title:
+                    return True
+                events.append(
+                    {
+                        "source_uid": source_uid,
+                        "calendar_name": source_name,
+                        "event_uid": uid,
+                        "starts_at_ms": starts_at * 1000,
+                        "ends_at_ms": ends_at * 1000,
+                        "start_label": time_label(starts_at, all_day),
+                        "end_label": time_label(ends_at, all_day),
+                        "all_day": all_day,
+                        "title": title,
+                        "description": clean_text(
+                            component.get_description(), MAX_DESCRIPTION_CHARS
+                        ),
+                        "location": clean_text(
+                            component.get_location(), MAX_LOCATION_CHARS
+                        ),
+                        "status": status_name(component),
+                    }
+                )
+                source_event_count += 1
+                return True
+
+            client.generate_instances_sync(
+                start_seconds, end_seconds, None, collect, None
+            )
+            if len(events) >= MAX_EVENTS:
+                raise RuntimeError(
+                    f"calendar event limit reached ({MAX_EVENTS}); narrow the sync range"
+                )
+        except Exception as error:  # GI raises several backend-specific errors.
+            source_result["error"] = clean_text(error, 1000)
+        source_result["event_count"] = source_event_count
+        sources.append(source_result)
+
+    return {
+        "version": 1,
+        "generated_at_ms": int(time.time() * 1000),
+        "range_start_ms": start_ms,
+        "range_end_ms": end_ms,
+        "sources": sources,
+        "events": events,
+    }
+
+
+def parse_arguments():
+    now_ms = int(time.time() * 1000)
+    day_ms = 24 * 60 * 60 * 1000
+    parser = argparse.ArgumentParser(description="Read local GNOME calendars")
+    parser.add_argument("--start-ms", type=int, default=now_ms - 365 * day_ms)
+    parser.add_argument("--end-ms", type=int, default=now_ms + 365 * day_ms)
+    return parser.parse_args()
+
+
+def main():
+    arguments = parse_arguments()
+    if arguments.start_ms < 0 or arguments.end_ms <= arguments.start_ms:
+        raise RuntimeError("calendar range is invalid")
+    json.dump(
+        read_snapshot(arguments.start_ms, arguments.end_ms),
+        sys.stdout,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    sys.stdout.write("\n")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as error:
+        print(str(error), file=sys.stderr)
+        raise SystemExit(1) from error

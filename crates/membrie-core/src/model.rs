@@ -203,6 +203,16 @@ pub struct CaptureStatus {
     pub screen_last_observed_at_ms: Option<i64>,
     #[serde(default)]
     pub screen_last_app: Option<String>,
+    #[serde(default)]
+    pub calendar_enabled: bool,
+    #[serde(default)]
+    pub calendar_source_count: u64,
+    #[serde(default)]
+    pub calendar_event_count: u64,
+    #[serde(default)]
+    pub calendar_last_sync_ms: Option<i64>,
+    #[serde(default)]
+    pub calendar_last_error: Option<String>,
     pub database_path: String,
 }
 
@@ -296,6 +306,53 @@ pub struct BackupInfo {
     pub path: String,
     pub created_at_ms: i64,
     pub size_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CalendarSourceSnapshot {
+    pub source_uid: String,
+    pub name: String,
+    pub error: Option<String>,
+    #[serde(default)]
+    pub event_count: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CalendarEventSnapshot {
+    pub source_uid: String,
+    pub calendar_name: String,
+    pub event_uid: String,
+    pub starts_at_ms: i64,
+    pub ends_at_ms: i64,
+    pub start_label: String,
+    pub end_label: String,
+    pub all_day: bool,
+    pub title: String,
+    pub description: String,
+    pub location: String,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CalendarSnapshot {
+    pub version: u32,
+    pub generated_at_ms: i64,
+    pub range_start_ms: i64,
+    pub range_end_ms: i64,
+    pub sources: Vec<CalendarSourceSnapshot>,
+    pub events: Vec<CalendarEventSnapshot>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CalendarSyncResult {
+    pub source_count: u64,
+    pub event_count: u64,
+    pub added: u64,
+    pub updated: u64,
+    pub removed: u64,
+    pub skipped_private: u64,
+    pub partial_error: Option<String>,
+    pub synced_at_ms: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

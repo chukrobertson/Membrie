@@ -40,6 +40,7 @@ fi
 install -Dm755 "$project_dir/target/release/membrie" "$local_bin/membrie"
 install -Dm755 "$project_dir/target/release/membried" "$libexec_dir/membried"
 install -Dm755 "$project_dir/target/release/membrie-capture" "$libexec_dir/membrie-capture"
+install -Dm755 "$project_dir/scripts/membrie-calendar" "$libexec_dir/membrie-calendar"
 install -Dm644 "$project_dir/assets/com.chuk.Membrie.svg" "$icons_dir/com.chuk.Membrie.svg"
 install -Dm644 "$project_dir/systemd/membried.service" "$units_dir/membried.service"
 install -Dm644 "$project_dir/systemd/membrie-capture.service" "$units_dir/membrie-capture.service"
@@ -69,5 +70,8 @@ if ! systemctl --user is-active --quiet membried.service; then
     echo "Close that copy, then log out and back in once."
 elif ! systemctl --user is-active --quiet membrie-capture.service; then
     echo "Clipboard capture will start after the GNOME bridge loads. Log out and back in once."
+fi
+if ! /usr/bin/python3 -c "import gi; gi.require_version('ECal', '2.0')" >/dev/null 2>&1; then
+    echo "Optional calendar support needs: sudo apt install gir1.2-ecal-2.0"
 fi
 echo "Your Remembries remain in $data_home/membrie."

@@ -1,21 +1,21 @@
 use crate::model::{
-    ActivityRecordResult, ActivitySnapshot, CaptureCandidate, CaptureDecision, CaptureRule,
-    CaptureStatus, EmbeddedChunk, IntelligenceSettings, IntelligenceStatus, LocalModel,
-    NewRemembrie, PauseMode, ProcessingJob, Remembrie, ScreenAnalysis, ScreenCaptureCandidate,
-    ScreenCaptureResult, SearchHit, SemanticCaptureCandidate, SemanticCaptureResult,
-    TimelineActivityObservation, TimelineActivitySummary, TimelineEntry, TimelineHistorySpan,
-    TimelineMapSlice,
+    ActivityRecordResult, ActivitySnapshot, CalendarEventSnapshot, CalendarSnapshot,
+    CalendarSyncResult, CaptureCandidate, CaptureDecision, CaptureRule, CaptureStatus,
+    EmbeddedChunk, IntelligenceSettings, IntelligenceStatus, LocalModel, NewRemembrie, PauseMode,
+    ProcessingJob, Remembrie, ScreenAnalysis, ScreenCaptureCandidate, ScreenCaptureResult,
+    SearchHit, SemanticCaptureCandidate, SemanticCaptureResult, TimelineActivityObservation,
+    TimelineActivitySummary, TimelineEntry, TimelineHistorySpan, TimelineMapSlice,
 };
 use crate::policy::{MAX_AUTOMATIC_CONTENT_BYTES, exclusion_reason, sensitive_reason};
-use rusqlite::{Connection, DatabaseName, OptionalExtension, Row, params};
-use std::collections::HashMap;
+use rusqlite::{Connection, DatabaseName, OptionalExtension, Row, Transaction, params};
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use uuid::Uuid;
 
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 const DUPLICATE_WINDOW_MS: i64 = 24 * 60 * 60 * 1000;
 const MIN_SEMANTIC_SIMILARITY: f64 = 0.25;
 const SEMANTIC_SCORE_WINDOW: f64 = 0.20;
@@ -315,6 +315,48 @@ CREATE INDEX IF NOT EXISTS idx_semantic_observations_app
     ON semantic_observations(app_id, observed_at_ms DESC);
 "#;
 
+const MIGRATION_7: &str = r#"
+CREATE TABLE IF NOT EXISTS calendar_state (
+    singleton           INTEGER PRIMARY KEY CHECK(singleton = 1),
+    enabled             INTEGER NOT NULL DEFAULT 0 CHECK(enabled IN (0, 1)),
+    last_attempt_ms     INTEGER,
+    last_sync_ms        INTEGER,
+    last_error          TEXT,
+    source_count        INTEGER NOT NULL DEFAULT 0,
+    event_count         INTEGER NOT NULL DEFAULT 0,
+    updated_at_ms       INTEGER NOT NULL
+);
+
+INSERT OR IGNORE INTO calendar_state(
+    singleton, enabled, source_count, event_count, updated_at_ms
+) VALUES(1, 0, 0, 0, 0);
+
+CREATE TABLE IF NOT EXISTS calendar_sources (
+    source_uid          TEXT PRIMARY KEY NOT NULL,
+    name                TEXT NOT NULL,
+    last_sync_ms        INTEGER,
+    last_error          TEXT,
+    updated_at_ms       INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS calendar_events (
+    source_uid          TEXT NOT NULL REFERENCES calendar_sources(source_uid) ON DELETE CASCADE,
+    event_uid           TEXT NOT NULL,
+    starts_at_ms        INTEGER NOT NULL,
+    ends_at_ms          INTEGER NOT NULL,
+    all_day             INTEGER NOT NULL DEFAULT 0 CHECK(all_day IN (0, 1)),
+    remembrie_id        TEXT UNIQUE NOT NULL REFERENCES remembries(id) ON DELETE CASCADE,
+    last_seen_sync_ms   INTEGER NOT NULL,
+    created_at_ms       INTEGER NOT NULL,
+    updated_at_ms       INTEGER NOT NULL,
+    PRIMARY KEY(source_uid, event_uid, starts_at_ms),
+    CHECK(ends_at_ms >= starts_at_ms)
+);
+
+CREATE INDEX IF NOT EXISTS idx_calendar_events_time
+    ON calendar_events(starts_at_ms, ends_at_ms);
+"#;
+
 #[derive(Debug, Error)]
 pub enum RepositoryError {
     #[error("database error: {0}")]
@@ -399,6 +441,13 @@ impl Repository {
         if version < 6 {
             let transaction = connection.unchecked_transaction()?;
             transaction.execute_batch(MIGRATION_6)?;
+            transaction.pragma_update(None, "user_version", 6)?;
+            transaction.commit()?;
+            version = 6;
+        }
+        if version < 7 {
+            let transaction = connection.unchecked_transaction()?;
+            transaction.execute_batch(MIGRATION_7)?;
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             transaction.commit()?;
         }
@@ -1387,6 +1436,26 @@ impl Repository {
                 |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
             )
             .optional()?;
+        let (
+            calendar_enabled,
+            calendar_source_count,
+            calendar_event_count,
+            calendar_last_sync_ms,
+            calendar_last_error,
+        ) = self.connection.query_row(
+            "SELECT enabled, source_count, event_count, last_sync_ms, last_error
+             FROM calendar_state WHERE singleton = 1",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )?;
         Ok(CaptureStatus {
             paused,
             paused_until_ms,
@@ -1421,7 +1490,322 @@ impl Repository {
                 .as_ref()
                 .map(|observation| observation.0),
             screen_last_app: last_screen_observation.map(|observation| observation.1),
+            calendar_enabled,
+            calendar_source_count,
+            calendar_event_count,
+            calendar_last_sync_ms,
+            calendar_last_error,
             database_path: self.path.display().to_string(),
+        })
+    }
+
+    pub fn calendar_enabled(&self) -> Result<bool, RepositoryError> {
+        self.connection
+            .query_row(
+                "SELECT enabled FROM calendar_state WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+    }
+
+    pub fn set_calendar_enabled(
+        &self,
+        calendar_enabled: bool,
+    ) -> Result<CaptureStatus, RepositoryError> {
+        self.connection.execute(
+            "UPDATE calendar_state
+             SET enabled = ?1, updated_at_ms = ?2
+             WHERE singleton = 1",
+            params![calendar_enabled, now_ms()?],
+        )?;
+        self.status()
+    }
+
+    pub fn record_calendar_error(&self, error: &str) -> Result<(), RepositoryError> {
+        let safe_error: String = error.chars().take(1000).collect();
+        let now = now_ms()?;
+        self.connection.execute(
+            "UPDATE calendar_state
+             SET last_attempt_ms = ?1, last_error = ?2, updated_at_ms = ?1
+             WHERE singleton = 1",
+            params![now, safe_error],
+        )?;
+        Ok(())
+    }
+
+    pub fn sync_calendar_snapshot(
+        &mut self,
+        snapshot: &CalendarSnapshot,
+    ) -> Result<CalendarSyncResult, RepositoryError> {
+        validate_calendar_snapshot(snapshot)?;
+        let rules = self.list_capture_rules()?;
+        let sync_marker = now_ms()?;
+        let successful_sources: HashSet<&str> = snapshot
+            .sources
+            .iter()
+            .filter(|source| source.error.is_none())
+            .map(|source| source.source_uid.as_str())
+            .collect();
+        let mut added = 0_u64;
+        let mut updated = 0_u64;
+        let mut removed = 0_u64;
+        let mut skipped_private = 0_u64;
+        let transaction = self.connection.transaction()?;
+
+        for source in &snapshot.sources {
+            transaction.execute(
+                "INSERT INTO calendar_sources(
+                    source_uid, name, last_sync_ms, last_error, updated_at_ms
+                 ) VALUES(?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(source_uid) DO UPDATE SET
+                    name = excluded.name,
+                    last_sync_ms = excluded.last_sync_ms,
+                    last_error = excluded.last_error,
+                    updated_at_ms = excluded.updated_at_ms",
+                params![
+                    source.source_uid.trim(),
+                    source.name.trim(),
+                    if source.error.is_none() {
+                        Some(sync_marker)
+                    } else {
+                        None
+                    },
+                    source
+                        .error
+                        .as_deref()
+                        .map(|error| truncate_owned(error, 1000)),
+                    sync_marker,
+                ],
+            )?;
+        }
+
+        for event in &snapshot.events {
+            if !successful_sources.contains(event.source_uid.as_str()) {
+                continue;
+            }
+            let body = calendar_event_body(event);
+            let source_app = format!("Calendar · {}", event.calendar_name.trim());
+            let candidate = CaptureCandidate {
+                kind: "calendar".to_owned(),
+                title: event.title.clone(),
+                body: body.clone(),
+                source_app: Some(source_app.clone()),
+                window_title: None,
+                source_uri: None,
+                occurred_at_ms: Some(event.starts_at_ms),
+            };
+            let unsafe_event = event.status.eq_ignore_ascii_case("cancelled")
+                || exclusion_reason(&candidate, &rules).is_some()
+                || sensitive_reason(&body).is_some();
+            if unsafe_event {
+                if delete_calendar_event(&transaction, event)? {
+                    removed += 1;
+                }
+                if !event.status.eq_ignore_ascii_case("cancelled") {
+                    skipped_private += 1;
+                }
+                continue;
+            }
+
+            let existing = transaction
+                .query_row(
+                    "SELECT ce.remembrie_id, r.title, r.occurred_at_ms,
+                            r.ended_at_ms, r.source_app, COALESCE(c.text_content, '')
+                     FROM calendar_events ce
+                     JOIN remembries r ON r.id = ce.remembrie_id
+                     LEFT JOIN remembrie_contents c
+                        ON c.remembrie_id = r.id AND c.role = 'captured'
+                     WHERE ce.source_uid = ?1 AND ce.event_uid = ?2
+                       AND ce.starts_at_ms = ?3",
+                    params![event.source_uid, event.event_uid, event.starts_at_ms],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, Option<i64>>(3)?,
+                            row.get::<_, Option<String>>(4)?,
+                            row.get::<_, String>(5)?,
+                        ))
+                    },
+                )
+                .optional()?;
+
+            if let Some((remembrie_id, title, starts_at, ends_at, app, old_body)) = existing {
+                let changed = title != event.title.trim()
+                    || starts_at != event.starts_at_ms
+                    || ends_at != Some(event.ends_at_ms)
+                    || app.as_deref() != Some(source_app.as_str())
+                    || old_body != body;
+                transaction.execute(
+                    "UPDATE calendar_events
+                     SET ends_at_ms = ?4, all_day = ?5,
+                         last_seen_sync_ms = ?6, updated_at_ms = ?6
+                     WHERE source_uid = ?1 AND event_uid = ?2 AND starts_at_ms = ?3",
+                    params![
+                        event.source_uid,
+                        event.event_uid,
+                        event.starts_at_ms,
+                        event.ends_at_ms,
+                        event.all_day,
+                        sync_marker
+                    ],
+                )?;
+                if changed {
+                    transaction.execute(
+                        "UPDATE remembries
+                         SET occurred_at_ms = ?2, ended_at_ms = ?3, source_app = ?4,
+                             title = ?5, summary = NULL, updated_at_ms = ?6,
+                             deleted_at_ms = NULL
+                         WHERE id = ?1",
+                        params![
+                            remembrie_id,
+                            event.starts_at_ms,
+                            event.ends_at_ms,
+                            source_app,
+                            event.title.trim(),
+                            sync_marker
+                        ],
+                    )?;
+                    let content_updated = transaction.execute(
+                        "UPDATE remembrie_contents
+                         SET text_content = ?2 WHERE remembrie_id = ?1 AND role = 'captured'",
+                        params![remembrie_id, body],
+                    )?;
+                    if content_updated == 0 {
+                        transaction.execute(
+                            "INSERT INTO remembrie_contents(
+                                id, remembrie_id, role, mime_type, text_content, created_at_ms
+                             ) VALUES(?1, ?2, 'captured', 'text/plain', ?3, ?4)",
+                            params![Uuid::now_v7().to_string(), remembrie_id, body, sync_marker],
+                        )?;
+                    }
+                    transaction.execute(
+                        "UPDATE remembrie_fts
+                         SET title = ?2, body = ?3, summary = '' WHERE remembrie_id = ?1",
+                        params![remembrie_id, event.title.trim(), body],
+                    )?;
+                    transaction.execute(
+                        "DELETE FROM remembrie_chunks WHERE remembrie_id = ?1",
+                        [&remembrie_id],
+                    )?;
+                    transaction.execute(
+                        "DELETE FROM derived_artifacts WHERE remembrie_id = ?1",
+                        [&remembrie_id],
+                    )?;
+                    queue_calendar_enrichment(&transaction, &remembrie_id, sync_marker)?;
+                    updated += 1;
+                }
+            } else {
+                let remembrie_id = Uuid::now_v7().to_string();
+                transaction.execute(
+                    "INSERT INTO remembries(
+                        id, kind, occurred_at_ms, ended_at_ms, source_app, window_title,
+                        title, sensitivity, importance, pinned, created_at_ms, updated_at_ms
+                     ) VALUES(?1, 'calendar', ?2, ?3, ?4, NULL, ?5,
+                              'normal', 0.5, 0, ?6, ?6)",
+                    params![
+                        remembrie_id,
+                        event.starts_at_ms,
+                        event.ends_at_ms,
+                        source_app,
+                        event.title.trim(),
+                        sync_marker
+                    ],
+                )?;
+                transaction.execute(
+                    "INSERT INTO remembrie_contents(
+                        id, remembrie_id, role, mime_type, text_content, created_at_ms
+                     ) VALUES(?1, ?2, 'captured', 'text/plain', ?3, ?4)",
+                    params![Uuid::now_v7().to_string(), remembrie_id, body, sync_marker],
+                )?;
+                transaction.execute(
+                    "INSERT INTO remembrie_fts(remembrie_id, title, body, summary)
+                     VALUES(?1, ?2, ?3, '')",
+                    params![remembrie_id, event.title.trim(), body],
+                )?;
+                queue_calendar_enrichment(&transaction, &remembrie_id, sync_marker)?;
+                transaction.execute(
+                    "INSERT INTO calendar_events(
+                        source_uid, event_uid, starts_at_ms, ends_at_ms, all_day,
+                        remembrie_id, last_seen_sync_ms, created_at_ms, updated_at_ms
+                     ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?7)",
+                    params![
+                        event.source_uid,
+                        event.event_uid,
+                        event.starts_at_ms,
+                        event.ends_at_ms,
+                        event.all_day,
+                        remembrie_id,
+                        sync_marker
+                    ],
+                )?;
+                added += 1;
+            }
+        }
+
+        for source_uid in &successful_sources {
+            let stale_ids = {
+                let mut statement = transaction.prepare(
+                    "SELECT remembrie_id FROM calendar_events
+                     WHERE source_uid = ?1
+                       AND starts_at_ms >= ?2 AND starts_at_ms < ?3
+                       AND last_seen_sync_ms <> ?4",
+                )?;
+                let rows = statement.query_map(
+                    params![
+                        source_uid,
+                        snapshot.range_start_ms,
+                        snapshot.range_end_ms,
+                        sync_marker
+                    ],
+                    |row| row.get::<_, String>(0),
+                )?;
+                rows.collect::<Result<Vec<_>, _>>()?
+            };
+            for remembrie_id in stale_ids {
+                transaction.execute(
+                    "DELETE FROM remembrie_fts WHERE remembrie_id = ?1",
+                    [&remembrie_id],
+                )?;
+                removed += transaction
+                    .execute("DELETE FROM remembries WHERE id = ?1", [&remembrie_id])?
+                    as u64;
+            }
+        }
+
+        let event_count = transaction.query_row(
+            "SELECT COUNT(*) FROM calendar_events ce
+             JOIN remembries r ON r.id = ce.remembrie_id
+             WHERE r.deleted_at_ms IS NULL",
+            [],
+            |row| row.get::<_, u64>(0),
+        )?;
+        let partial_error = calendar_partial_error(snapshot);
+        transaction.execute(
+            "UPDATE calendar_state
+             SET last_attempt_ms = ?1, last_sync_ms = ?1, last_error = ?2,
+                 source_count = ?3, event_count = ?4, updated_at_ms = ?1
+             WHERE singleton = 1",
+            params![
+                sync_marker,
+                partial_error,
+                snapshot.sources.len() as u64,
+                event_count
+            ],
+        )?;
+        transaction.commit()?;
+
+        Ok(CalendarSyncResult {
+            source_count: snapshot.sources.len() as u64,
+            event_count,
+            added,
+            updated,
+            removed,
+            skipped_private,
+            partial_error,
+            synced_at_ms: sync_marker,
         })
     }
 
@@ -3140,6 +3524,172 @@ fn activity_app_label(observation: &ActivityObservationRecord) -> String {
     }
 }
 
+fn validate_calendar_snapshot(snapshot: &CalendarSnapshot) -> Result<(), RepositoryError> {
+    if snapshot.version != 1 {
+        return Err(RepositoryError::Validation(
+            "calendar connector returned an unsupported format".to_owned(),
+        ));
+    }
+    if snapshot.generated_at_ms < 0
+        || snapshot.range_start_ms < 0
+        || snapshot.range_end_ms <= snapshot.range_start_ms
+        || snapshot.range_end_ms - snapshot.range_start_ms > 3 * 366 * 24 * 60 * 60 * 1000
+    {
+        return Err(RepositoryError::Validation(
+            "calendar connector returned an invalid time range".to_owned(),
+        ));
+    }
+    if snapshot.sources.len() > 100 || snapshot.events.len() > 5000 {
+        return Err(RepositoryError::Validation(
+            "calendar connector returned too many records".to_owned(),
+        ));
+    }
+    let mut source_ids = HashSet::new();
+    for source in &snapshot.sources {
+        validate_calendar_text("calendar source identifier", &source.source_uid, 512, false)?;
+        validate_calendar_text("calendar name", &source.name, 1000, false)?;
+        if source
+            .error
+            .as_ref()
+            .is_some_and(|error| error.chars().count() > 1000)
+        {
+            return Err(RepositoryError::Validation(
+                "calendar source error was too large".to_owned(),
+            ));
+        }
+        if !source_ids.insert(source.source_uid.as_str()) {
+            return Err(RepositoryError::Validation(
+                "calendar connector returned a duplicate source".to_owned(),
+            ));
+        }
+    }
+    for event in &snapshot.events {
+        validate_calendar_text("calendar source identifier", &event.source_uid, 512, false)?;
+        validate_calendar_text("calendar name", &event.calendar_name, 1000, false)?;
+        validate_calendar_text("calendar event identifier", &event.event_uid, 2048, false)?;
+        validate_calendar_text("calendar title", &event.title, 1000, false)?;
+        validate_calendar_text("calendar description", &event.description, 8_000, true)?;
+        validate_calendar_text("calendar location", &event.location, 2000, true)?;
+        validate_calendar_text("calendar status", &event.status, 100, true)?;
+        validate_calendar_text("calendar start label", &event.start_label, 200, false)?;
+        validate_calendar_text("calendar end label", &event.end_label, 200, false)?;
+        if event.starts_at_ms < 0 || event.ends_at_ms < event.starts_at_ms {
+            return Err(RepositoryError::Validation(
+                "calendar connector returned invalid event times".to_owned(),
+            ));
+        }
+        if !source_ids.contains(event.source_uid.as_str()) {
+            return Err(RepositoryError::Validation(
+                "calendar event referenced an unknown source".to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_calendar_text(
+    label: &str,
+    value: &str,
+    maximum: usize,
+    empty_allowed: bool,
+) -> Result<(), RepositoryError> {
+    let characters = value.chars().count();
+    if (!empty_allowed && value.trim().is_empty()) || characters > maximum || value.contains('\0') {
+        return Err(RepositoryError::Validation(format!(
+            "{label} was empty or exceeded the local safety limit"
+        )));
+    }
+    Ok(())
+}
+
+fn calendar_event_body(event: &CalendarEventSnapshot) -> String {
+    let mut fields = vec![
+        format!("Calendar: {}", event.calendar_name.trim()),
+        format!(
+            "When: {} to {}{}",
+            event.start_label.trim(),
+            event.end_label.trim(),
+            if event.all_day { " · all day" } else { "" }
+        ),
+    ];
+    if !event.location.trim().is_empty() {
+        fields.push(format!("Location: {}", event.location.trim()));
+    }
+    if !event.status.trim().is_empty() {
+        fields.push(format!("Status: {}", event.status.trim()));
+    }
+    if !event.description.trim().is_empty() {
+        fields.push(format!("Description:\n{}", event.description.trim()));
+    }
+    fields.join("\n")
+}
+
+fn delete_calendar_event(
+    transaction: &Transaction<'_>,
+    event: &CalendarEventSnapshot,
+) -> Result<bool, RepositoryError> {
+    let remembrie_id = transaction
+        .query_row(
+            "SELECT remembrie_id FROM calendar_events
+             WHERE source_uid = ?1 AND event_uid = ?2 AND starts_at_ms = ?3",
+            params![event.source_uid, event.event_uid, event.starts_at_ms],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    let Some(remembrie_id) = remembrie_id else {
+        return Ok(false);
+    };
+    transaction.execute(
+        "DELETE FROM remembrie_fts WHERE remembrie_id = ?1",
+        [&remembrie_id],
+    )?;
+    Ok(transaction.execute("DELETE FROM remembries WHERE id = ?1", [&remembrie_id])? > 0)
+}
+
+fn queue_calendar_enrichment(
+    transaction: &Transaction<'_>,
+    remembrie_id: &str,
+    now: i64,
+) -> Result<(), RepositoryError> {
+    transaction.execute(
+        "INSERT INTO processing_jobs(
+            id, remembrie_id, kind, state, attempts,
+            available_at_ms, created_at_ms, updated_at_ms
+         ) VALUES(?1, ?2, 'enrich', 'pending', 0, 0, ?3, ?3)
+         ON CONFLICT(id) DO UPDATE SET
+            state = 'pending', attempts = 0, last_error = NULL,
+            available_at_ms = 0, updated_at_ms = excluded.updated_at_ms",
+        params![format!("enrich:{remembrie_id}"), remembrie_id, now],
+    )?;
+    Ok(())
+}
+
+fn calendar_partial_error(snapshot: &CalendarSnapshot) -> Option<String> {
+    let errors: Vec<String> = snapshot
+        .sources
+        .iter()
+        .filter_map(|source| {
+            source.error.as_deref().map(|error| {
+                format!(
+                    "{}: {}",
+                    source.name.trim(),
+                    truncate_owned(error.trim(), 240)
+                )
+            })
+        })
+        .take(3)
+        .collect();
+    (!errors.is_empty()).then(|| errors.join(" · "))
+}
+
+fn truncate_owned(value: &str, maximum: usize) -> String {
+    let mut result: String = value.chars().take(maximum).collect();
+    if value.chars().count() > maximum {
+        result.push('…');
+    }
+    result
+}
+
 fn activity_end_reason(reason: &str) -> &'static str {
     match reason {
         "idle" => "the computer became idle",
@@ -3281,6 +3831,120 @@ mod tests {
 
     fn temporary_database(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("membrie-test-{name}-{}.db", Uuid::now_v7()))
+    }
+
+    fn calendar_snapshot(
+        generated_at_ms: i64,
+        events: Vec<CalendarEventSnapshot>,
+    ) -> CalendarSnapshot {
+        CalendarSnapshot {
+            version: 1,
+            generated_at_ms,
+            range_start_ms: generated_at_ms - 86_400_000,
+            range_end_ms: generated_at_ms + 7 * 86_400_000,
+            sources: vec![crate::CalendarSourceSnapshot {
+                source_uid: "local-calendar".to_owned(),
+                name: "Personal".to_owned(),
+                error: None,
+                event_count: events.len() as u64,
+            }],
+            events,
+        }
+    }
+
+    fn calendar_event(start: i64, title: &str, description: &str) -> CalendarEventSnapshot {
+        CalendarEventSnapshot {
+            source_uid: "local-calendar".to_owned(),
+            calendar_name: "Personal".to_owned(),
+            event_uid: "event-1".to_owned(),
+            starts_at_ms: start,
+            ends_at_ms: start + 3_600_000,
+            start_label: "Monday, 2026-09-28 at 10:00".to_owned(),
+            end_label: "Monday, 2026-09-28 at 11:00".to_owned(),
+            all_day: false,
+            title: title.to_owned(),
+            description: description.to_owned(),
+            location: "Library".to_owned(),
+            status: "confirmed".to_owned(),
+        }
+    }
+
+    #[test]
+    fn calendar_sync_creates_updates_and_removes_searchable_events() {
+        let path = temporary_database("calendar-sync");
+        let mut repository = Repository::open(&path).unwrap();
+        repository.set_calendar_enabled(true).unwrap();
+        let generated = 1_800_000_000_000_i64;
+        let start = generated + 86_400_000;
+
+        let first = repository
+            .sync_calendar_snapshot(&calendar_snapshot(
+                generated,
+                vec![calendar_event(
+                    start,
+                    "Duke planning meeting",
+                    "Review the advocacy outline",
+                )],
+            ))
+            .unwrap();
+        assert_eq!(first.added, 1);
+        assert_eq!(first.event_count, 1);
+        let hit = repository.search("advocacy outline", 10).unwrap();
+        assert_eq!(hit.len(), 1);
+        assert_eq!(hit[0].remembrie.kind, "calendar");
+        assert_eq!(hit[0].remembrie.ended_at_ms, Some(start + 3_600_000));
+
+        let updated = repository
+            .sync_calendar_snapshot(&calendar_snapshot(
+                generated + 1_000,
+                vec![calendar_event(
+                    start,
+                    "Duke follow-up meeting",
+                    "Bring the revised support plan",
+                )],
+            ))
+            .unwrap();
+        assert_eq!(updated.updated, 1);
+        assert_eq!(
+            repository.search("revised support plan", 10).unwrap().len(),
+            1
+        );
+        assert!(
+            repository
+                .search("advocacy outline", 10)
+                .unwrap()
+                .is_empty()
+        );
+
+        let removed = repository
+            .sync_calendar_snapshot(&calendar_snapshot(generated + 2_000, Vec::new()))
+            .unwrap();
+        assert_eq!(removed.removed, 1);
+        assert_eq!(removed.event_count, 0);
+        assert!(repository.search("Duke", 10).unwrap().is_empty());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn calendar_sync_rejects_sensitive_event_content() {
+        let path = temporary_database("calendar-sensitive");
+        let mut repository = Repository::open(&path).unwrap();
+        repository.set_calendar_enabled(true).unwrap();
+        let generated = 1_800_000_000_000_i64;
+        let result = repository
+            .sync_calendar_snapshot(&calendar_snapshot(
+                generated,
+                vec![calendar_event(
+                    generated + 86_400_000,
+                    "Private credentials",
+                    "password=definitely-secret",
+                )],
+            ))
+            .unwrap();
+        assert_eq!(result.skipped_private, 1);
+        assert_eq!(result.event_count, 0);
+        assert!(repository.list_recent(10).unwrap().is_empty());
+        let _ = fs::remove_file(path);
     }
 
     fn activity_snapshot(

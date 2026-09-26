@@ -1,9 +1,9 @@
 use crate::model::{
-    ActivityRecordResult, ActivitySnapshot, BackupInfo, BrieAnswer, CaptureCandidate,
-    CaptureDecision, CaptureRule, CaptureStatus, IntelligenceSettings, IntelligenceStatus,
-    NewRemembrie, PauseMode, Remembrie, ScreenCaptureCandidate, ScreenCaptureResult, SearchHit,
-    SemanticCaptureCandidate, SemanticCaptureResult, TimelineEntry, TimelineHistorySpan,
-    TimelineMapSlice,
+    ActivityRecordResult, ActivitySnapshot, BackupInfo, BrieAnswer, CalendarSyncResult,
+    CaptureCandidate, CaptureDecision, CaptureRule, CaptureStatus, IntelligenceSettings,
+    IntelligenceStatus, NewRemembrie, PauseMode, Remembrie, ScreenCaptureCandidate,
+    ScreenCaptureResult, SearchHit, SemanticCaptureCandidate, SemanticCaptureResult, TimelineEntry,
+    TimelineHistorySpan, TimelineMapSlice,
 };
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -73,6 +73,10 @@ pub enum Request {
     SetScreenModel {
         model: String,
     },
+    SetCalendarEnabled {
+        enabled: bool,
+    },
+    SyncCalendarNow,
     RecordActivity {
         snapshot: ActivitySnapshot,
     },
@@ -139,6 +143,7 @@ pub enum Response {
     IntelligenceSettingsUpdated { status: IntelligenceStatus },
     IntelligenceRetryQueued { count: u64 },
     BrieAnswered { answer: BrieAnswer },
+    CalendarSynced { result: CalendarSyncResult },
     Error { message: String },
 }
 
@@ -400,6 +405,24 @@ impl DaemonClient {
             model: model.into(),
         })? {
             Response::CaptureSourceUpdated { status } => Ok(status),
+            other => Err(ClientError::Rejected(format!(
+                "unexpected response: {other:?}"
+            ))),
+        }
+    }
+
+    pub fn set_calendar_enabled(&self, enabled: bool) -> Result<CaptureStatus, ClientError> {
+        match self.request(&Request::SetCalendarEnabled { enabled })? {
+            Response::CaptureSourceUpdated { status } => Ok(status),
+            other => Err(ClientError::Rejected(format!(
+                "unexpected response: {other:?}"
+            ))),
+        }
+    }
+
+    pub fn sync_calendar_now(&self) -> Result<CalendarSyncResult, ClientError> {
+        match self.request_with_timeout(&Request::SyncCalendarNow, Duration::from_secs(120))? {
+            Response::CalendarSynced { result } => Ok(result),
             other => Err(ClientError::Rejected(format!(
                 "unexpected response: {other:?}"
             ))),
