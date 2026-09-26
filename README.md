@@ -4,11 +4,12 @@ Membrie is a private, local-first memory companion for Ubuntu. It captures usefu
 moments as **Remembries**, makes them searchable, and will use the local assistant
 **Brie** to help recall them with exact citations.
 
-The project is intentionally local-only:
+The project is intentionally local-first and self-hosted:
 
 - one SQLite database is the source of truth;
-- the daemon listens on a user-only Unix socket, never a network port;
-- the desktop app talks only to that socket;
+- the database daemon listens on a user-only Unix socket, never a network port;
+- the desktop app and companion gateway talk to that private daemon socket;
+- the optional companion gateway initially listens on loopback only and requires its own pairing token;
 - no telemetry, remote APIs, or cloud services are included.
 
 ## What works today
@@ -50,10 +51,12 @@ The project is intentionally local-only:
 - Brie citations open the matching Timeline day, highlight the source, and show its exact evidence
 - Quick Brie compact window for local recall and note capture without leaving the current workflow
 - Opt-in read-only GNOME Calendar integration with recurring-event expansion and local reconciliation
+- Responsive Mobile Companion preview for notes, explicit clipboard transfers, Brie, and compact recall
+- Independent Mobile Companion pairing plus a fail-closed locked-PC privacy boundary
 - Local model selection and visible indexing health
 
-Per-calendar controls, the Tailscale WebUI, Thunderbird evidence, meeting transcripts, and deeper
-pattern detection are the next implementation milestones.
+Tailscale exposure for the locally verified companion, per-calendar controls, Thunderbird evidence,
+meeting transcripts, and deeper pattern detection are the next implementation milestones.
 
 ## Install on Ubuntu
 
@@ -71,7 +74,7 @@ Then run the local installer from this checkout:
 
 The installer never uses `sudo`. It builds Membrie, installs it only for the current
 user, adds it to the Ubuntu app grid, installs the GNOME desktop bridge, and starts
-the local daemon and capture helper automatically at login. A new GNOME extension may
+the local daemon, capture helper, and loopback Mobile Companion automatically at login. A new GNOME extension may
 need one log out and back in before desktop context and clipboard capture become available.
 The same bridge registers `Super+Shift+B` for Quick Brie. The compact window receives only the
 previous application's name and window title as optional search context. Drag its header to move
@@ -97,6 +100,12 @@ Membrie only reads the resulting local calendar view.
 
 Membrie connects only to Ollama's fixed loopback address (`127.0.0.1`). Cloud-backed
 Ollama model names are deliberately rejected.
+
+Mobile Companion is separately opt-in in **Privacy & Capture**. Its first-stage preview is
+available only from the Ubuntu PC at `http://127.0.0.1:47381` and requires a private pairing
+token generated on that PC. While the PC is locked, paired devices can add notes but cannot read
+Remembries or clipboard text unless the user explicitly relaxes that boundary. Tailscale access
+is not opened automatically by this preview.
 
 To remove the installed application while keeping every Remembrie and backup:
 
@@ -162,6 +171,7 @@ crates/membrie-daemon  Database owner, policy engine, calendar reader, and Unix-
 crates/membrie-capture Local D-Bus client for the GNOME desktop bridge
 crates/membrie-a11y    Bounded, read-only AT-SPI semantic-context reader
 crates/membrie-app     Native GTK 4/libadwaita application
+crates/membrie-mobile  Paired, loopback-first responsive companion gateway
 gnome-shell-extension  Local clipboard and desktop-context bridge for GNOME Wayland
 docs/                  Product and architecture decisions
 ```

@@ -6,17 +6,19 @@ set -euo pipefail
 data_home="${XDG_DATA_HOME:-$HOME/.local/share}"
 config_home="${XDG_CONFIG_HOME:-$HOME/.config}"
 
-systemctl --user disable --now membrie-capture.service membried.service >/dev/null 2>&1 || true
+systemctl --user disable --now membrie-mobile.service membrie-capture.service membried.service >/dev/null 2>&1 || true
 
 rm -f "$HOME/.local/bin/membrie"
 rm -f "$HOME/.local/libexec/membrie/membried"
 rm -f "$HOME/.local/libexec/membrie/membrie-capture"
+rm -f "$HOME/.local/libexec/membrie/membrie-mobile"
 rm -f "$HOME/.local/libexec/membrie/membrie-calendar"
 rmdir "$HOME/.local/libexec/membrie" 2>/dev/null || true
 rm -f "$data_home/applications/com.chuk.Membrie.desktop"
 rm -f "$data_home/icons/hicolor/scalable/apps/com.chuk.Membrie.svg"
 rm -f "$config_home/systemd/user/membried.service"
 rm -f "$config_home/systemd/user/membrie-capture.service"
+rm -f "$config_home/systemd/user/membrie-mobile.service"
 
 if command -v gnome-extensions >/dev/null 2>&1; then
     gnome-extensions disable membrie@chuk.local >/dev/null 2>&1 || true

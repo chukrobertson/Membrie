@@ -159,6 +159,12 @@ fn dispatch_database(request: Request, repository: &Mutex<Repository>) -> Result
         Request::ListRecent { limit } => Ok(Response::Remembries {
             remembries: repository.list_recent(limit)?,
         }),
+        Request::RecallSnapshot {
+            recent_limit,
+            upcoming_limit,
+        } => Ok(Response::RecallSnapshot {
+            snapshot: repository.recall_snapshot(recent_limit, upcoming_limit)?,
+        }),
         Request::GetRemembrie { id } => Ok(Response::Remembrie {
             remembrie: repository.get(&id)?,
         }),
@@ -212,6 +218,12 @@ fn dispatch_database(request: Request, repository: &Mutex<Repository>) -> Result
         }),
         Request::SetCalendarEnabled { enabled } => Ok(Response::CaptureSourceUpdated {
             status: with_capture_health(repository.set_calendar_enabled(enabled)?),
+        }),
+        Request::SetMobileEnabled { enabled } => Ok(Response::CaptureSourceUpdated {
+            status: with_capture_health(repository.set_mobile_enabled(enabled)?),
+        }),
+        Request::SetMobileAllowWhileLocked { allowed } => Ok(Response::CaptureSourceUpdated {
+            status: with_capture_health(repository.set_mobile_allow_while_locked(allowed)?),
         }),
         Request::RecordActivity { snapshot } => Ok(Response::ActivityRecorded {
             result: repository.record_activity_snapshot(snapshot)?,

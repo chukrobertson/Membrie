@@ -28,7 +28,7 @@ The installer places files in:
 
 - `~/.local/bin` and `~/.local/libexec/membrie` for the application programs;
 - `~/.local/share/applications` and `~/.local/share/icons` for the app-grid entry;
-- `~/.config/systemd/user` for the two user services;
+- `~/.config/systemd/user` for the three user services;
 - the normal per-user GNOME Shell extension directory for the desktop bridge.
 
 No service runs as root. The database and local socket are readable only by the user.
@@ -57,6 +57,16 @@ not receive account credentials and contains no calendar write or forced-refresh
 calendar providers may continue their own configured synchronization independently of Membrie.
 The `gir1.2-ecal-2.0` package in the install command supplies the small runtime description needed
 to call the calendar library; the installer reports an ordinary-language reminder when it is absent.
+
+Mobile Companion is off by default. Its service listens only on `127.0.0.1:47381`, so installing it
+does not make Membrie reachable from the LAN or tailnet. Enable it in **Privacy & Capture**, open the
+local preview, and use **Show pairing token** to pair that browser. The token file is private to the
+current Ubuntu user and is retained with the rest of Membrie's data during uninstall.
+
+The default locked-PC rule permits paired devices to create notes but denies Recall, Brie, and both
+clipboard directions. **Allow recall while this PC is locked** is a separate explicit choice. The
+local preview intentionally does not configure Tailscale; tailnet exposure is a later, auditable
+step after this boundary has been tested on the PC.
 
 ## Backups
 
@@ -92,7 +102,7 @@ The Privacy & Capture screen reports the daemon and desktop capture helper in or
 language. For troubleshooting from a terminal:
 
 ```bash
-systemctl --user status membried.service membrie-capture.service
+systemctl --user status membried.service membrie-capture.service membrie-mobile.service
 ```
 
 The desktop helper intentionally restarts if it comes up before the GNOME bridge is

@@ -2,9 +2,10 @@ use crate::model::{
     ActivityRecordResult, ActivitySnapshot, CalendarEventSnapshot, CalendarSnapshot,
     CalendarSyncResult, CaptureCandidate, CaptureDecision, CaptureRule, CaptureStatus,
     EmbeddedChunk, IntelligenceSettings, IntelligenceStatus, LocalModel, NewRemembrie, PauseMode,
-    ProcessingJob, Remembrie, ScreenAnalysis, ScreenCaptureCandidate, ScreenCaptureResult,
-    SearchHit, SemanticCaptureCandidate, SemanticCaptureResult, TimelineActivityObservation,
-    TimelineActivitySummary, TimelineEntry, TimelineHistorySpan, TimelineMapSlice,
+    ProcessingJob, RecallSnapshot, Remembrie, ScreenAnalysis, ScreenCaptureCandidate,
+    ScreenCaptureResult, SearchHit, SemanticCaptureCandidate, SemanticCaptureResult,
+    TimelineActivityObservation, TimelineActivitySummary, TimelineEntry, TimelineHistorySpan,
+    TimelineMapSlice,
 };
 use crate::policy::{MAX_AUTOMATIC_CONTENT_BYTES, exclusion_reason, sensitive_reason};
 use rusqlite::{Connection, DatabaseName, OptionalExtension, Row, Transaction, params};
@@ -15,7 +16,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use uuid::Uuid;
 
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 8;
 const DUPLICATE_WINDOW_MS: i64 = 24 * 60 * 60 * 1000;
 const MIN_SEMANTIC_SIMILARITY: f64 = 0.25;
 const SEMANTIC_SCORE_WINDOW: f64 = 0.20;
@@ -357,6 +358,18 @@ CREATE INDEX IF NOT EXISTS idx_calendar_events_time
     ON calendar_events(starts_at_ms, ends_at_ms);
 "#;
 
+const MIGRATION_8: &str = r#"
+CREATE TABLE IF NOT EXISTS mobile_state (
+    singleton             INTEGER PRIMARY KEY CHECK(singleton = 1),
+    enabled               INTEGER NOT NULL DEFAULT 0 CHECK(enabled IN (0, 1)),
+    allow_while_locked    INTEGER NOT NULL DEFAULT 0 CHECK(allow_while_locked IN (0, 1)),
+    updated_at_ms         INTEGER NOT NULL
+);
+
+INSERT OR IGNORE INTO mobile_state(singleton, enabled, allow_while_locked, updated_at_ms)
+VALUES(1, 0, 0, 0);
+"#;
+
 #[derive(Debug, Error)]
 pub enum RepositoryError {
     #[error("database error: {0}")]
@@ -448,6 +461,13 @@ impl Repository {
         if version < 7 {
             let transaction = connection.unchecked_transaction()?;
             transaction.execute_batch(MIGRATION_7)?;
+            transaction.pragma_update(None, "user_version", 7)?;
+            transaction.commit()?;
+            version = 7;
+        }
+        if version < 8 {
+            let transaction = connection.unchecked_transaction()?;
+            transaction.execute_batch(MIGRATION_8)?;
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             transaction.commit()?;
         }
@@ -659,6 +679,45 @@ impl Repository {
         let mut statement = self.connection.prepare(&sql)?;
         let rows = statement.query_map([limit], map_remembrie)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn recall_snapshot(
+        &self,
+        recent_limit: u32,
+        upcoming_limit: u32,
+    ) -> Result<RecallSnapshot, RepositoryError> {
+        let now = now_ms()?;
+        let recent_limit = recent_limit.clamp(1, 50);
+        let upcoming_limit = upcoming_limit.clamp(1, 50);
+        let recent_sql = format!(
+            "{} WHERE r.deleted_at_ms IS NULL
+               AND r.occurred_at_ms <= ?1
+               AND r.kind != 'calendar'
+             GROUP BY r.id
+             ORDER BY r.occurred_at_ms DESC
+             LIMIT ?2",
+            remembrie_select()
+        );
+        let recent = {
+            let mut statement = self.connection.prepare(&recent_sql)?;
+            let rows = statement.query_map(params![now, recent_limit], map_remembrie)?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let upcoming_sql = format!(
+            "{} WHERE r.deleted_at_ms IS NULL
+               AND r.kind = 'calendar'
+               AND r.occurred_at_ms >= ?1
+             GROUP BY r.id
+             ORDER BY r.occurred_at_ms
+             LIMIT ?2",
+            remembrie_select()
+        );
+        let upcoming = {
+            let mut statement = self.connection.prepare(&upcoming_sql)?;
+            let rows = statement.query_map(params![now, upcoming_limit], map_remembrie)?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        Ok(RecallSnapshot { recent, upcoming })
     }
 
     pub fn timeline_history(
@@ -1459,6 +1518,11 @@ impl Repository {
                 ))
             },
         )?;
+        let (mobile_enabled, mobile_allow_while_locked) = self.connection.query_row(
+            "SELECT enabled, allow_while_locked FROM mobile_state WHERE singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
         Ok(CaptureStatus {
             paused,
             paused_until_ms,
@@ -1498,8 +1562,35 @@ impl Repository {
             calendar_event_count,
             calendar_last_sync_ms,
             calendar_last_error,
+            mobile_enabled,
+            mobile_allow_while_locked,
             database_path: self.path.display().to_string(),
         })
+    }
+
+    pub fn set_mobile_enabled(&self, enabled: bool) -> Result<CaptureStatus, RepositoryError> {
+        self.connection.execute(
+            "UPDATE mobile_state
+             SET enabled = ?1,
+                 allow_while_locked = CASE WHEN ?1 THEN allow_while_locked ELSE 0 END,
+                 updated_at_ms = ?2
+             WHERE singleton = 1",
+            params![enabled, now_ms()?],
+        )?;
+        self.status()
+    }
+
+    pub fn set_mobile_allow_while_locked(
+        &self,
+        allowed: bool,
+    ) -> Result<CaptureStatus, RepositoryError> {
+        self.connection.execute(
+            "UPDATE mobile_state
+             SET allow_while_locked = ?1, updated_at_ms = ?2
+             WHERE singleton = 1",
+            params![allowed, now_ms()?],
+        )?;
+        self.status()
     }
 
     pub fn calendar_enabled(&self) -> Result<bool, RepositoryError> {
@@ -4087,11 +4178,87 @@ mod tests {
         assert!(!status.semantic_enabled);
         assert_eq!(status.semantic_sample_interval_ms, 60_000);
         assert_eq!(status.semantic_observation_count, 0);
+        assert!(!status.mobile_enabled);
+        assert!(!status.mobile_allow_while_locked);
         let version: i64 = repository
             .connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn mobile_companion_is_opt_in_and_locked_reads_are_separate() {
+        let path = temporary_database("mobile-companion-settings");
+        let repository = Repository::open(&path).unwrap();
+
+        let initial = repository.status().unwrap();
+        assert!(!initial.mobile_enabled);
+        assert!(!initial.mobile_allow_while_locked);
+
+        let enabled = repository.set_mobile_enabled(true).unwrap();
+        assert!(enabled.mobile_enabled);
+        assert!(!enabled.mobile_allow_while_locked);
+
+        let unlocked = repository.set_mobile_allow_while_locked(true).unwrap();
+        assert!(unlocked.mobile_enabled);
+        assert!(unlocked.mobile_allow_while_locked);
+
+        let disabled = repository.set_mobile_enabled(false).unwrap();
+        assert!(!disabled.mobile_enabled);
+        assert!(!disabled.mobile_allow_while_locked);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn recall_snapshot_separates_recent_evidence_from_upcoming_plans() {
+        let path = temporary_database("recall-snapshot");
+        let mut repository = Repository::open(&path).unwrap();
+        let now = now_ms().unwrap();
+        let note = repository
+            .create(NewRemembrie::manual("Recent note", "Observed locally"))
+            .unwrap();
+        repository
+            .create(NewRemembrie {
+                kind: "calendar".to_owned(),
+                title: "Past appointment".to_owned(),
+                body: "Already scheduled in the past".to_owned(),
+                source_app: Some("Calendar".to_owned()),
+                window_title: None,
+                occurred_at_ms: Some(now - 60_000),
+            })
+            .unwrap();
+        let upcoming = repository
+            .create(NewRemembrie {
+                kind: "calendar".to_owned(),
+                title: "Upcoming appointment".to_owned(),
+                body: "A future plan".to_owned(),
+                source_app: Some("Calendar".to_owned()),
+                window_title: None,
+                occurred_at_ms: Some(now + 60_000),
+            })
+            .unwrap();
+
+        let snapshot = repository.recall_snapshot(8, 6).unwrap();
+        assert_eq!(
+            snapshot
+                .recent
+                .iter()
+                .map(|record| record.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![note.id.as_str()]
+        );
+        assert_eq!(
+            snapshot
+                .upcoming
+                .iter()
+                .map(|record| record.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![upcoming.id.as_str()]
+        );
+
         let _ = fs::remove_file(path);
     }
 

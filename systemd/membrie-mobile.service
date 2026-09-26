@@ -1,0 +1,22 @@
+[Unit]
+Description=Membrie local Mobile Companion
+Documentation=https://github.com/chukrobertson/Membrie
+Requires=membried.service
+After=membried.service
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/libexec/membrie/membrie-mobile
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+IPAddressDeny=any
+IPAddressAllow=localhost
+
+[Install]
+WantedBy=graphical-session.target

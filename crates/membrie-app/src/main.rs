@@ -5,7 +5,7 @@ use membrie_core::{
     ActivitySnapshot, BrieAnswer, BrieCitation, CaptureRule, CaptureStatus, DaemonClient,
     IntelligenceSettings, IntelligenceStatus, LocalModel, NewRemembrie, PauseMode, Remembrie,
     ScreenCaptureCandidate, ScreenCaptureResult, SearchHit, TimelineActivityObservation,
-    TimelineEntry, TimelineMapSlice, socket_path,
+    TimelineEntry, TimelineMapSlice, mobile_token_path, socket_path,
 };
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -120,6 +120,9 @@ struct UiState {
     calendar_button: gtk::Button,
     calendar_sync_button: gtk::Button,
     calendar_syncing: Cell<bool>,
+    mobile_status: gtk::Label,
+    mobile_button: gtk::Button,
+    mobile_locked_button: gtk::Button,
     backup_status: gtk::Label,
     backup_button: gtk::Button,
     backup_in_progress: Cell<bool>,
@@ -257,6 +260,14 @@ fn build_ui(application: &adw::Application) {
     let calendar_sync_button = gtk::Button::with_label("Sync local calendars now");
     calendar_sync_button.set_halign(Align::Start);
     calendar_sync_button.set_sensitive(false);
+    let mobile_status = gtk::Label::new(Some("Mobile Companion · Checking…"));
+    mobile_status.set_xalign(0.0);
+    mobile_status.set_wrap(true);
+    let mobile_button = gtk::Button::with_label("Enable Mobile Companion");
+    mobile_button.set_halign(Align::Start);
+    let mobile_locked_button = gtk::Button::with_label("Allow recall while this PC is locked");
+    mobile_locked_button.set_halign(Align::Start);
+    mobile_locked_button.set_sensitive(false);
     let backup_status = gtk::Label::new(Some("Checking local backups…"));
     backup_status.set_xalign(0.0);
     backup_status.set_wrap(true);
@@ -333,6 +344,9 @@ fn build_ui(application: &adw::Application) {
         calendar_button,
         calendar_sync_button,
         calendar_syncing: Cell::new(false),
+        mobile_status,
+        mobile_button,
+        mobile_locked_button,
         backup_status,
         backup_button,
         backup_in_progress: Cell::new(false),
@@ -1717,6 +1731,108 @@ fn build_privacy_page(state: &Rc<UiState>) -> gtk::Widget {
         .connect_clicked(move |_| begin_calendar_sync(&state_for_calendar_sync));
     page.append(&calendar_card);
 
+    let mobile_card = gtk::Box::new(Orientation::Vertical, 8);
+    mobile_card.add_css_class("card");
+    mobile_card.add_css_class("capture-card");
+    let mobile_heading = gtk::Label::new(Some("Mobile Companion · Local preview"));
+    mobile_heading.add_css_class("heading");
+    mobile_heading.set_xalign(0.0);
+    let mobile_detail = gtk::Label::new(Some(
+        "Use quick notes, explicit clipboard transfers, Brie, and a compact Recall view from another paired device. Every request is handled by this PC; Brie and your Remembries are never sent to a cloud service.",
+    ));
+    mobile_detail.add_css_class("dim-label");
+    mobile_detail.set_xalign(0.0);
+    mobile_detail.set_wrap(true);
+    let mobile_preview_detail = gtk::Label::new(Some(
+        "This first preview listens only on this PC. Tailscale access will be enabled separately after the local privacy boundary has been verified.",
+    ));
+    mobile_preview_detail.add_css_class("dim-label");
+    mobile_preview_detail.set_xalign(0.0);
+    mobile_preview_detail.set_wrap(true);
+    mobile_card.append(&mobile_heading);
+    mobile_card.append(&state.mobile_status);
+    mobile_card.append(&mobile_detail);
+    mobile_card.append(&mobile_preview_detail);
+    mobile_card.append(&state.mobile_button);
+    mobile_card.append(&state.mobile_locked_button);
+
+    let mobile_actions = gtk::Box::new(Orientation::Horizontal, 8);
+    let mobile_open_button = gtk::Button::with_label("Open local preview");
+    let mobile_token_button = gtk::Button::with_label("Show pairing token");
+    mobile_actions.append(&mobile_open_button);
+    mobile_actions.append(&mobile_token_button);
+    mobile_card.append(&mobile_actions);
+
+    let state_for_mobile = Rc::clone(state);
+    state.mobile_button.connect_clicked(move |_| {
+        let enabled = state_for_mobile
+            .client
+            .status()
+            .map(|status| !status.mobile_enabled)
+            .unwrap_or(false);
+        match state_for_mobile.client.set_mobile_enabled(enabled) {
+            Ok(status) => {
+                apply_status_ui(&state_for_mobile, &status);
+                toast(
+                    &state_for_mobile,
+                    if enabled {
+                        "Mobile Companion enabled on this PC"
+                    } else {
+                        "Mobile Companion disabled"
+                    },
+                );
+            }
+            Err(error) => toast(
+                &state_for_mobile,
+                &format!("Could not update Mobile Companion: {error}"),
+            ),
+        }
+    });
+    let state_for_mobile_locked = Rc::clone(state);
+    state.mobile_locked_button.connect_clicked(move |_| {
+        let allowed = state_for_mobile_locked
+            .client
+            .status()
+            .map(|status| !status.mobile_allow_while_locked)
+            .unwrap_or(false);
+        match state_for_mobile_locked
+            .client
+            .set_mobile_allow_while_locked(allowed)
+        {
+            Ok(status) => {
+                apply_status_ui(&state_for_mobile_locked, &status);
+                toast(
+                    &state_for_mobile_locked,
+                    if allowed {
+                        "Paired-device recall is now allowed while locked"
+                    } else {
+                        "Recall and clipboard access will stop while locked"
+                    },
+                );
+            }
+            Err(error) => toast(
+                &state_for_mobile_locked,
+                &format!("Could not update the locked-screen boundary: {error}"),
+            ),
+        }
+    });
+    let state_for_mobile_open = Rc::clone(state);
+    mobile_open_button.connect_clicked(move |_| {
+        if let Err(error) = gtk::gio::AppInfo::launch_default_for_uri(
+            "http://127.0.0.1:47381",
+            None::<&gtk::gio::AppLaunchContext>,
+        ) {
+            toast(
+                &state_for_mobile_open,
+                &format!("Could not open the local preview: {error}"),
+            );
+        }
+    });
+    let state_for_mobile_token = Rc::clone(state);
+    mobile_token_button
+        .connect_clicked(move |button| show_mobile_pairing_token(button, &state_for_mobile_token));
+    page.append(&mobile_card);
+
     let backup_card = gtk::Box::new(Orientation::Vertical, 8);
     backup_card.add_css_class("card");
     backup_card.add_css_class("capture-card");
@@ -2957,6 +3073,45 @@ fn display_or_unknown(value: &str) -> &str {
     }
 }
 
+fn show_mobile_pairing_token(parent: &gtk::Button, state: &Rc<UiState>) {
+    let token = match fs::read_to_string(mobile_token_path()) {
+        Ok(token) => token.trim().to_owned(),
+        Err(error) => {
+            toast(
+                state,
+                &format!("The pairing token is not ready yet: {error}"),
+            );
+            return;
+        }
+    };
+    if token.len() != 64 || !token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        toast(state, "The Mobile Companion pairing token is not valid");
+        return;
+    }
+
+    let token_label = gtk::Label::new(Some(&token));
+    token_label.add_css_class("monospace");
+    token_label.set_selectable(true);
+    token_label.set_wrap(true);
+    token_label.set_xalign(0.0);
+    let dialog = adw::AlertDialog::builder()
+        .heading("Pair another device")
+        .body("Enter this pairing token in Membrie Companion on a device you trust. Tailscale membership alone does not grant access. Treat the reusable token like a password.")
+        .extra_child(&token_label)
+        .build();
+    dialog.add_response("close", "Close");
+    dialog.add_response("copy", "Copy token");
+    dialog.set_default_response(Some("copy"));
+    dialog.set_response_appearance("copy", adw::ResponseAppearance::Suggested);
+    let clipboard = parent.display().clipboard();
+    let state_for_copy = Rc::clone(state);
+    dialog.connect_response(Some("copy"), move |_, _| {
+        clipboard.set_text(&token);
+        toast(&state_for_copy, "Pairing token copied");
+    });
+    dialog.present(Some(parent));
+}
+
 fn refresh_status(state: &Rc<UiState>) {
     match state.client.status() {
         Ok(status) => apply_status_ui(state, &status),
@@ -2975,6 +3130,8 @@ fn refresh_status(state: &Rc<UiState>) {
             state.screen_model_combo.set_sensitive(false);
             state.calendar_button.set_sensitive(false);
             state.calendar_sync_button.set_sensitive(false);
+            state.mobile_button.set_sensitive(false);
+            state.mobile_locked_button.set_sensitive(false);
             state
                 .clipboard_agent_label
                 .set_text("Desktop capture service · Daemon offline");
@@ -2995,6 +3152,9 @@ fn refresh_status(state: &Rc<UiState>) {
             state
                 .calendar_status
                 .set_text("Local calendar access · Daemon offline");
+            state
+                .mobile_status
+                .set_text("Mobile Companion · Daemon offline");
         }
     }
 }
@@ -3490,6 +3650,10 @@ fn apply_status_ui(state: &UiState, status: &CaptureStatus) {
     state
         .calendar_sync_button
         .set_sensitive(status.calendar_enabled && !status.paused && !state.calendar_syncing.get());
+    state.mobile_button.set_sensitive(true);
+    state
+        .mobile_locked_button
+        .set_sensitive(status.mobile_enabled);
     state.pause_button.set_icon_name(if status.paused {
         "media-playback-start-symbolic"
     } else {
@@ -3542,6 +3706,18 @@ fn apply_status_ui(state: &UiState, status: &CaptureStatus) {
     } else {
         "Enable calendar access"
     });
+    state.mobile_button.set_label(if status.mobile_enabled {
+        "Disable Mobile Companion"
+    } else {
+        "Enable Mobile Companion"
+    });
+    state
+        .mobile_locked_button
+        .set_label(if status.mobile_allow_while_locked {
+            "Block recall while this PC is locked"
+        } else {
+            "Allow recall while this PC is locked"
+        });
     state.activity_settings_updating.set(true);
     state
         .activity_idle_combo
@@ -3728,6 +3904,16 @@ fn apply_status_ui(state: &UiState, status: &CaptureStatus) {
         };
         state.calendar_status.set_text(&calendar_text);
     }
+    let mobile_text = if !status.mobile_enabled {
+        "Off · paired devices cannot access Membrie".to_owned()
+    } else if status.mobile_allow_while_locked {
+        "On · local preview: 127.0.0.1:47381\nPaired devices may use recall and clipboard features while this PC is locked"
+            .to_owned()
+    } else {
+        "On · local preview: 127.0.0.1:47381\nWhile this PC is locked, paired devices may add notes but cannot read Remembries or clipboard text"
+            .to_owned()
+    };
+    state.mobile_status.set_text(&mobile_text);
     state.privacy_stats.set_text(&format!(
         "{} Remembries stored · {} automatic events safely skipped\n{} probable secrets blocked · {} duplicates ignored",
         status.remembrie_count,

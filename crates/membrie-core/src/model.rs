@@ -18,6 +18,12 @@ pub struct Remembrie {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RecallSnapshot {
+    pub recent: Vec<Remembrie>,
+    pub upcoming: Vec<Remembrie>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TimelineHistorySpan {
     pub kind: String,
     pub started_at_ms: i64,
@@ -213,6 +219,10 @@ pub struct CaptureStatus {
     pub calendar_last_sync_ms: Option<i64>,
     #[serde(default)]
     pub calendar_last_error: Option<String>,
+    #[serde(default)]
+    pub mobile_enabled: bool,
+    #[serde(default)]
+    pub mobile_allow_while_locked: bool,
     pub database_path: String,
 }
 

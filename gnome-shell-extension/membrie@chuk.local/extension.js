@@ -21,6 +21,13 @@ const DBUS_XML = `
       <arg direction="out" type="s" name="text"/>
     </method>
     <method name="RequestText"/>
+    <method name="ReadText">
+      <arg direction="out" type="s" name="text"/>
+    </method>
+    <method name="SetText">
+      <arg direction="in" type="s" name="text"/>
+      <arg direction="out" type="b" name="accepted"/>
+    </method>
     <method name="GetActivityState">
       <arg direction="out" type="s" name="app_id"/>
       <arg direction="out" type="s" name="app_name"/>
@@ -130,6 +137,7 @@ class ClipboardBridge {
                 if (generation === this._readGeneration) {
                     this._cachedText = '';
                     this._reading = false;
+                    this._readGeneration++;
                     console.warn('Membrie clipboard read timed out');
                 }
                 this._readTimeoutId = 0;
@@ -157,6 +165,63 @@ class ClipboardBridge {
                 this._reading = false;
             }
         );
+    }
+
+    ReadTextAsync(_parameters, invocation) {
+        if (this._reading) {
+            invocation.return_dbus_error(
+                'com.chuk.Membrie.Error.Busy',
+                'The clipboard is already being read'
+            );
+            return;
+        }
+
+        this._reading = true;
+        const generation = ++this._readGeneration;
+        this._readTimeoutId = GLib.timeout_add(
+            GLib.PRIORITY_DEFAULT,
+            5000,
+            () => {
+                if (generation === this._readGeneration) {
+                    this._reading = false;
+                    this._readGeneration++;
+                    invocation.return_dbus_error(
+                        'com.chuk.Membrie.Error.Timeout',
+                        'The clipboard read timed out'
+                    );
+                }
+                this._readTimeoutId = 0;
+                return GLib.SOURCE_REMOVE;
+            }
+        );
+
+        this._clipboard.get_text(
+            St.ClipboardType.CLIPBOARD,
+            (_clipboard, text) => {
+                if (generation !== this._readGeneration)
+                    return;
+
+                if (this._readTimeoutId > 0)
+                    GLib.source_remove(this._readTimeoutId);
+                this._readTimeoutId = 0;
+                this._reading = false;
+
+                const safeText = text !== null &&
+                    new TextEncoder().encode(text).length <= MAX_TEXT_BYTES
+                    ? text
+                    : '';
+                invocation.return_value(new GLib.Variant('(s)', [safeText]));
+            }
+        );
+    }
+
+    SetText(text) {
+        if (typeof text !== 'string' || text.length === 0 ||
+            new TextEncoder().encode(text).length > MAX_TEXT_BYTES)
+            return false;
+
+        this._clipboard.set_text(St.ClipboardType.CLIPBOARD, text);
+        return true;
     }
 
     GetActivityState() {
@@ -300,6 +365,7 @@ class ClipboardBridge {
     }
 
     destroy() {
+        this._readGeneration++;
         if (this._selection && this._ownerChangedId > 0)
             this._selection.disconnect(this._ownerChangedId);
         this._ownerChangedId = 0;

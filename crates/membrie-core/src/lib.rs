@@ -4,7 +4,9 @@ pub mod model;
 pub mod policy;
 pub mod repository;
 
-pub use config::{backup_dir, data_dir, database_path, screen_spool_dir, socket_path};
+pub use config::{
+    backup_dir, data_dir, database_path, mobile_token_path, screen_spool_dir, socket_path,
+};
 pub use ipc::{DaemonClient, Request, Response};
 pub use model::{
     ActivityRecordResult, ActivitySnapshot, BackupInfo, BrieAnswer, BrieCitation,

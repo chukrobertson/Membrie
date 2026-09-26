@@ -5,6 +5,7 @@ members = [
     "crates/membrie-capture",
     "crates/membrie-a11y",
     "crates/membrie-app",
+    "crates/membrie-mobile",
 ]
 resolver = "2"
 

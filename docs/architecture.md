@@ -13,10 +13,25 @@
 
 `membried` is the only process that opens the canonical database. Clients use a
 user-private Unix-domain socket and a length-limited, one-request-per-connection JSON
-protocol. There is deliberately no TCP listener in the MVP.
+protocol. The database daemon never exposes TCP.
 
 The desktop app is a client. Capture adapters will also be clients, which prevents
 Wayland- or application-specific capture code from gaining direct database access.
+
+The optional Mobile Companion is a narrow gateway rather than a second database owner. It talks to
+the daemon through the same private Unix socket and initially accepts HTTP only on
+`127.0.0.1:47381`. Its static interface has no external scripts, fonts, trackers, or service
+workers. Every API request requires a 256-bit token stored in Membrie's private data directory;
+tailnet membership does not replace that application-level pairing.
+
+The gateway checks GNOME's lock state before every reading operation and fails closed when that
+state cannot be read. A paired device may still submit a deliberate note while the PC is locked,
+but Recall, Brie, and clipboard reads or writes return a locked response unless the user separately
+enables locked-session access. Response previews are bounded, likely secrets are blocked from
+clipboard transfer, request bodies have hard limits, and private API responses are never cached.
+The first-stage service accepts only a local Host and Origin. Later Tailscale Serve support must add
+the exact tailnet hostname as an explicit trusted origin; it must not change the database daemon's
+Unix-socket boundary or bind the companion directly to a public interface.
 
 Quick Brie is a second, compact GTK application window in the same single-instance desktop client.
 The GNOME bridge owns only its global shortcut and launches the app through GNOME's normal

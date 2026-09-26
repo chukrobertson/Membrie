@@ -1,7 +1,7 @@
 use crate::model::{
     ActivityRecordResult, ActivitySnapshot, BackupInfo, BrieAnswer, CalendarSyncResult,
     CaptureCandidate, CaptureDecision, CaptureRule, CaptureStatus, IntelligenceSettings,
-    IntelligenceStatus, NewRemembrie, PauseMode, Remembrie, ScreenCaptureCandidate,
+    IntelligenceStatus, NewRemembrie, PauseMode, RecallSnapshot, Remembrie, ScreenCaptureCandidate,
     ScreenCaptureResult, SearchHit, SemanticCaptureCandidate, SemanticCaptureResult, TimelineEntry,
     TimelineHistorySpan, TimelineMapSlice,
 };
@@ -26,6 +26,10 @@ pub enum Request {
     },
     ListRecent {
         limit: u32,
+    },
+    RecallSnapshot {
+        recent_limit: u32,
+        upcoming_limit: u32,
     },
     GetRemembrie {
         id: String,
@@ -76,6 +80,12 @@ pub enum Request {
     SetCalendarEnabled {
         enabled: bool,
     },
+    SetMobileEnabled {
+        enabled: bool,
+    },
+    SetMobileAllowWhileLocked {
+        allowed: bool,
+    },
     SyncCalendarNow,
     RecordActivity {
         snapshot: ActivitySnapshot,
@@ -121,6 +131,7 @@ pub enum Response {
     Created { remembrie: Remembrie },
     CaptureResult { decision: CaptureDecision },
     Remembries { remembries: Vec<Remembrie> },
+    RecallSnapshot { snapshot: RecallSnapshot },
     Remembrie { remembrie: Option<Remembrie> },
     TimelineHistory { spans: Vec<TimelineHistorySpan> },
     TimelineDay { entries: Vec<TimelineEntry> },
@@ -246,6 +257,22 @@ impl DaemonClient {
     pub fn list_recent(&self, limit: u32) -> Result<Vec<Remembrie>, ClientError> {
         match self.request(&Request::ListRecent { limit })? {
             Response::Remembries { remembries } => Ok(remembries),
+            other => Err(ClientError::Rejected(format!(
+                "unexpected response: {other:?}"
+            ))),
+        }
+    }
+
+    pub fn recall_snapshot(
+        &self,
+        recent_limit: u32,
+        upcoming_limit: u32,
+    ) -> Result<RecallSnapshot, ClientError> {
+        match self.request(&Request::RecallSnapshot {
+            recent_limit,
+            upcoming_limit,
+        })? {
+            Response::RecallSnapshot { snapshot } => Ok(snapshot),
             other => Err(ClientError::Rejected(format!(
                 "unexpected response: {other:?}"
             ))),
@@ -413,6 +440,27 @@ impl DaemonClient {
 
     pub fn set_calendar_enabled(&self, enabled: bool) -> Result<CaptureStatus, ClientError> {
         match self.request(&Request::SetCalendarEnabled { enabled })? {
+            Response::CaptureSourceUpdated { status } => Ok(status),
+            other => Err(ClientError::Rejected(format!(
+                "unexpected response: {other:?}"
+            ))),
+        }
+    }
+
+    pub fn set_mobile_enabled(&self, enabled: bool) -> Result<CaptureStatus, ClientError> {
+        match self.request(&Request::SetMobileEnabled { enabled })? {
+            Response::CaptureSourceUpdated { status } => Ok(status),
+            other => Err(ClientError::Rejected(format!(
+                "unexpected response: {other:?}"
+            ))),
+        }
+    }
+
+    pub fn set_mobile_allow_while_locked(
+        &self,
+        allowed: bool,
+    ) -> Result<CaptureStatus, ClientError> {
+        match self.request(&Request::SetMobileAllowWhileLocked { allowed })? {
             Response::CaptureSourceUpdated { status } => Ok(status),
             other => Err(ClientError::Rejected(format!(
                 "unexpected response: {other:?}"
