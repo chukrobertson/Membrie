@@ -398,16 +398,12 @@ fn toggle_quick_brie(application: &adw::Application) {
     content.set_margin_start(18);
     content.set_margin_end(18);
 
-    let heading = gtk::Box::new(Orientation::Horizontal, 8);
     let titles = gtk::Box::new(Orientation::Vertical, 1);
-    titles.set_hexpand(true);
     let title = gtk::Label::new(Some("Quick Brie"));
     title.add_css_class("page-title");
-    title.set_xalign(0.0);
     let privacy = gtk::Label::new(Some("Private · Ollama on this PC"));
     privacy.add_css_class("caption");
     privacy.add_css_class("dim-label");
-    privacy.set_xalign(0.0);
     titles.append(&title);
     titles.append(&privacy);
     let open_membrie = gtk::Button::builder()
@@ -420,12 +416,12 @@ fn toggle_quick_brie(application: &adw::Application) {
         .tooltip_text("Close Quick Brie")
         .build();
     close_button.add_css_class("flat");
-    heading.append(&titles);
-    heading.append(&open_membrie);
-    heading.append(&close_button);
-    let window_handle = gtk::WindowHandle::new();
-    window_handle.set_child(Some(&heading));
-    content.append(&window_handle);
+    let header = adw::HeaderBar::new();
+    header.set_show_start_title_buttons(false);
+    header.set_show_end_title_buttons(false);
+    header.set_title_widget(Some(&titles));
+    header.pack_end(&close_button);
+    header.pack_end(&open_membrie);
 
     let context = gtk::Label::new(Some(&quick_context_description(desktop_target.as_ref())));
     context.add_css_class("quick-context");
@@ -481,13 +477,17 @@ fn toggle_quick_brie(application: &adw::Application) {
     actions.append(&hint);
     content.append(&actions);
 
+    let toolbar_view = adw::ToolbarView::new();
+    toolbar_view.add_top_bar(&header);
+    toolbar_view.set_content(Some(&content));
+
     let window = adw::ApplicationWindow::builder()
         .application(application)
         .title("Quick Brie")
         .default_width(680)
         .default_height(520)
         .resizable(true)
-        .content(&content)
+        .content(&toolbar_view)
         .build();
     window.set_widget_name("membrie-quick-window");
 
