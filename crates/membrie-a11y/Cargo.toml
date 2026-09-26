@@ -15,3 +15,4 @@ path = "src/main.rs"
 anyhow.workspace = true
 async-io = "2.6.0"
 atspi = { version = "0.30.0", default-features = false, features = ["connection", "proxies", "zbus"] }
+futures-lite = "2.6.1"

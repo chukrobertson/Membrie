@@ -40,8 +40,11 @@ struct UiState {
     activity_idle_combo: gtk::ComboBoxText,
     activity_settings_updating: Cell<bool>,
     semantic_status: gtk::Label,
+    semantic_capture_button: gtk::Button,
     semantic_button: gtk::Button,
     semantic_probe_busy: Cell<bool>,
+    semantic_interval_combo: gtk::ComboBoxText,
+    semantic_settings_updating: Cell<bool>,
     screen_status: gtk::Label,
     screen_button: gtk::Button,
     screen_capture_now_button: gtk::Button,
@@ -107,6 +110,18 @@ fn build_ui(application: &adw::Application) {
     semantic_status.set_wrap(true);
     let semantic_button = gtk::Button::with_label("Enable and test semantic context");
     semantic_button.set_halign(Align::Start);
+    let semantic_capture_button = gtk::Button::with_label("Enable automatic semantic context");
+    semantic_capture_button.set_halign(Align::Start);
+    let semantic_interval_combo = gtk::ComboBoxText::new();
+    for (id, label) in [
+        ("30000", "30 seconds"),
+        ("60000", "1 minute"),
+        ("120000", "2 minutes"),
+        ("300000", "5 minutes"),
+    ] {
+        semantic_interval_combo.append(Some(id), label);
+    }
+    semantic_interval_combo.set_active_id(Some("60000"));
     let screen_status = gtk::Label::new(Some("Screen memory · Checking…"));
     screen_status.set_xalign(0.0);
     screen_status.set_wrap(true);
@@ -174,8 +189,11 @@ fn build_ui(application: &adw::Application) {
         activity_idle_combo,
         activity_settings_updating: Cell::new(false),
         semantic_status,
+        semantic_capture_button,
         semantic_button,
         semantic_probe_busy: Cell::new(false),
+        semantic_interval_combo,
+        semantic_settings_updating: Cell::new(false),
         screen_status,
         screen_button,
         screen_capture_now_button,
@@ -850,17 +868,34 @@ fn build_privacy_page(state: &Rc<UiState>) -> gtk::Widget {
     let semantic_card = gtk::Box::new(Orientation::Vertical, 8);
     semantic_card.add_css_class("card");
     semantic_card.add_css_class("capture-card");
-    let semantic_heading = gtk::Label::new(Some("Semantic Context · Compatibility preview"));
+    let semantic_heading = gtk::Label::new(Some("Semantic Context · Early access"));
     semantic_heading.add_css_class("heading");
     semantic_heading.set_xalign(0.0);
     let semantic_detail = gtk::Label::new(Some(
-        "This read-only preview asks the active application for the names, labels, and text structure it already provides to GNOME accessibility tools. It performs no actions, skips password fields, and stores nothing. Automatic Semantic Context is not enabled by this test.",
+        "Off by default. When enabled, Membrie reads bounded names, labels, and visible text supplied by the active application to GNOME accessibility tools. Password fields are skipped, no application actions are performed, and exclusions, secret filtering, and duplicate filtering apply before anything is stored.",
     ));
     semantic_detail.add_css_class("dim-label");
     semantic_detail.set_xalign(0.0);
     semantic_detail.set_wrap(true);
+    let semantic_interval_row = gtk::Box::new(Orientation::Horizontal, 10);
+    let semantic_interval_label =
+        gtk::Label::new(Some("Check changed application context at most every"));
+    semantic_interval_label.set_xalign(0.0);
+    semantic_interval_label.set_hexpand(true);
+    semantic_interval_row.append(&semantic_interval_label);
+    semantic_interval_row.append(&state.semantic_interval_combo);
+    let semantic_fallback = gtk::Label::new(Some(
+        "Rich semantic context avoids local vision work. Partial or unavailable context falls back to Screen Memory when Screen Memory is enabled.",
+    ));
+    semantic_fallback.add_css_class("dim-label");
+    semantic_fallback.set_xalign(0.0);
+    semantic_fallback.set_wrap(true);
+    let semantic_test_heading = gtk::Label::new(Some("Compatibility test"));
+    semantic_test_heading.add_css_class("heading");
+    semantic_test_heading.set_xalign(0.0);
+    semantic_test_heading.set_margin_top(8);
     let semantic_hint = gtk::Label::new(Some(
-        "After a five-second countdown, Membrie inspects only the window you switch to. Some applications may need to be restarted after GNOME accessibility is enabled.",
+        "The five-second test stores nothing. It lets you check a window before enabling automatic capture; some applications may need to be restarted after GNOME accessibility is enabled.",
     ));
     semantic_hint.add_css_class("dim-label");
     semantic_hint.set_xalign(0.0);
@@ -868,8 +903,49 @@ fn build_privacy_page(state: &Rc<UiState>) -> gtk::Widget {
     semantic_card.append(&semantic_heading);
     semantic_card.append(&state.semantic_status);
     semantic_card.append(&semantic_detail);
+    semantic_card.append(&semantic_interval_row);
+    semantic_card.append(&state.semantic_capture_button);
+    semantic_card.append(&semantic_fallback);
+    semantic_card.append(&semantic_test_heading);
     semantic_card.append(&semantic_hint);
     semantic_card.append(&state.semantic_button);
+    let state_for_semantic_capture = Rc::clone(state);
+    state
+        .semantic_capture_button
+        .connect_clicked(move |button| {
+            request_semantic_capture_toggle(button, &state_for_semantic_capture)
+        });
+    let state_for_semantic_interval = Rc::clone(state);
+    state.semantic_interval_combo.connect_changed(move |combo| {
+        if state_for_semantic_interval.semantic_settings_updating.get() {
+            return;
+        }
+        let Some(value) = combo
+            .active_id()
+            .and_then(|value| value.parse::<u64>().ok())
+        else {
+            return;
+        };
+        match state_for_semantic_interval
+            .client
+            .set_semantic_sample_interval(value)
+        {
+            Ok(status) => {
+                apply_status_ui(&state_for_semantic_interval, &status);
+                toast(
+                    &state_for_semantic_interval,
+                    "Semantic Context timing updated",
+                );
+            }
+            Err(error) => {
+                toast(
+                    &state_for_semantic_interval,
+                    &format!("Could not update Semantic Context timing: {error}"),
+                );
+                refresh_status(&state_for_semantic_interval);
+            }
+        }
+    });
     let state_for_semantic = Rc::clone(state);
     state.semantic_button.connect_clicked(move |button| {
         request_semantic_probe(button, &state_for_semantic);
@@ -1432,21 +1508,82 @@ fn refresh_semantic_status(state: &Rc<UiState>) {
     }
     let settings = gtk::gio::Settings::new("org.gnome.desktop.interface");
     if settings.boolean("toolkit-accessibility") {
-        state.semantic_status.set_text(
-            "GNOME accessibility is available for testing · automatic Semantic Context remains off",
-        );
         state
             .semantic_button
             .set_label("Test a window in 5 seconds");
     } else {
         state
-            .semantic_status
-            .set_text("Off · GNOME is not currently exposing accessibility context to Membrie");
-        state
             .semantic_button
             .set_label("Enable and test semantic context");
     }
     state.semantic_button.set_sensitive(true);
+}
+
+fn request_semantic_capture_toggle(parent: &gtk::Button, state: &Rc<UiState>) {
+    let status = match state.client.status() {
+        Ok(status) => status,
+        Err(error) => {
+            toast(state, &format!("Could not read capture settings: {error}"));
+            return;
+        }
+    };
+    if status.semantic_enabled {
+        set_semantic_capture_enabled(state, false);
+        return;
+    }
+    if !status.activity_enabled {
+        toast(state, "Enable Activity Context before Semantic Context");
+        return;
+    }
+
+    let settings = gtk::gio::Settings::new("org.gnome.desktop.interface");
+    if settings.boolean("toolkit-accessibility") {
+        set_semantic_capture_enabled(state, true);
+        return;
+    }
+    let dialog = adw::AlertDialog::builder()
+        .heading("Enable GNOME accessibility and Semantic Context?")
+        .body(
+            "This allows Membrie—and other local accessibility tools—to receive UI structure that applications provide to GNOME. Membrie reads only the focused matching window, skips password fields, performs no actions, and applies its local privacy rules before storage.",
+        )
+        .build();
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("enable", "Enable Semantic Context");
+    dialog.set_close_response("cancel");
+    dialog.set_default_response(Some("enable"));
+    dialog.set_response_appearance("enable", adw::ResponseAppearance::Suggested);
+    let state_for_enable = Rc::clone(state);
+    dialog.connect_response(Some("enable"), move |_, _| {
+        if settings.set_boolean("toolkit-accessibility", true).is_err() {
+            toast(
+                &state_for_enable,
+                "GNOME accessibility could not be enabled",
+            );
+            return;
+        }
+        set_semantic_capture_enabled(&state_for_enable, true);
+    });
+    dialog.present(Some(parent));
+}
+
+fn set_semantic_capture_enabled(state: &Rc<UiState>, enabled: bool) {
+    match state.client.set_semantic_enabled(enabled) {
+        Ok(status) => {
+            apply_status_ui(state, &status);
+            toast(
+                state,
+                if enabled {
+                    "Semantic Context enabled—application-provided evidence stays local"
+                } else {
+                    "Semantic Context disabled"
+                },
+            );
+        }
+        Err(error) => toast(
+            state,
+            &format!("Could not update Semantic Context: {error}"),
+        ),
+    }
 }
 
 fn request_semantic_probe(parent: &gtk::Button, state: &Rc<UiState>) {
@@ -1697,6 +1834,8 @@ fn refresh_status(state: &Rc<UiState>) {
             state.activity_button.set_sensitive(false);
             state.activity_finish_button.set_sensitive(false);
             state.activity_idle_combo.set_sensitive(false);
+            state.semantic_capture_button.set_sensitive(false);
+            state.semantic_interval_combo.set_sensitive(false);
             state.screen_button.set_sensitive(false);
             state.screen_capture_now_button.set_sensitive(false);
             state.screen_interval_combo.set_sensitive(false);
@@ -1712,6 +1851,9 @@ fn refresh_status(state: &Rc<UiState>) {
             state
                 .activity_status
                 .set_text("Activity context · Daemon offline");
+            state
+                .semantic_status
+                .set_text("Semantic Context · Daemon offline");
             state
                 .screen_status
                 .set_text("Screen Memory · Daemon offline");
@@ -2072,6 +2214,13 @@ fn apply_status_ui(state: &UiState, status: &CaptureStatus) {
     state
         .activity_finish_button
         .set_sensitive(status.activity_active_since_ms.is_some());
+    state.semantic_capture_button.set_sensitive(
+        status.activity_enabled
+            && (state.clipboard_bridge_available.get() || status.semantic_enabled),
+    );
+    state
+        .semantic_interval_combo
+        .set_sensitive(status.semantic_enabled);
     state.screen_button.set_sensitive(
         (state.clipboard_bridge_available.get() || status.screen_enabled)
             && status.activity_enabled,
@@ -2129,6 +2278,13 @@ fn apply_status_ui(state: &UiState, status: &CaptureStatus) {
     } else {
         "Enable activity context"
     });
+    state
+        .semantic_capture_button
+        .set_label(if status.semantic_enabled {
+            "Disable automatic semantic context"
+        } else {
+            "Enable automatic semantic context"
+        });
     state.screen_button.set_label(if status.screen_enabled {
         "Disable screen memory"
     } else {
@@ -2139,6 +2295,11 @@ fn apply_status_ui(state: &UiState, status: &CaptureStatus) {
         .activity_idle_combo
         .set_active_id(Some(&status.activity_idle_threshold_ms.to_string()));
     state.activity_settings_updating.set(false);
+    state.semantic_settings_updating.set(true);
+    state
+        .semantic_interval_combo
+        .set_active_id(Some(&status.semantic_sample_interval_ms.to_string()));
+    state.semantic_settings_updating.set(false);
     state.screen_settings_updating.set(true);
     state
         .screen_interval_combo
@@ -2198,6 +2359,46 @@ fn apply_status_ui(state: &UiState, status: &CaptureStatus) {
         )
     };
     state.activity_status.set_text(&activity_text);
+    let semantic_text = if !status.semantic_enabled {
+        format!(
+            "Off · {} application-provided observations stored",
+            status.semantic_observation_count
+        )
+    } else if !gtk::gio::Settings::new("org.gnome.desktop.interface")
+        .boolean("toolkit-accessibility")
+    {
+        "Enabled, but GNOME accessibility is off · no semantic content is being read".to_owned()
+    } else if !capture_agent_running {
+        "Enabled, but the desktop capture service is not responding".to_owned()
+    } else if !status.activity_enabled {
+        "Waiting for Activity Context to be enabled".to_owned()
+    } else {
+        let seconds = status.semantic_sample_interval_ms / 1000;
+        let interval = if seconds == 60 {
+            "1 minute".to_owned()
+        } else if seconds.is_multiple_of(60) {
+            format!("{} minutes", seconds / 60)
+        } else {
+            format!("{seconds} seconds")
+        };
+        let last_remembered = match (
+            status.semantic_last_observed_at_ms,
+            status.semantic_last_app.as_deref(),
+        ) {
+            (Some(timestamp), Some(app)) if !app.trim().is_empty() => {
+                format!("\nLast remembered: {} · {app}", format_timestamp(timestamp))
+            }
+            (Some(timestamp), _) => format!("\nLast remembered: {}", format_timestamp(timestamp)),
+            _ => String::new(),
+        };
+        format!(
+            "On · focused matching window only · up to once per {interval}\n{} observations stored{last_remembered}",
+            status.semantic_observation_count
+        )
+    };
+    if !state.semantic_probe_busy.get() {
+        state.semantic_status.set_text(&semantic_text);
+    }
     let screen_text = if !status.screen_enabled {
         format!(
             "Off · {} local screen observations stored · no screenshots retained",

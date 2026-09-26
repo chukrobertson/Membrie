@@ -170,6 +170,16 @@ fn dispatch_database(request: Request, repository: &Mutex<Repository>) -> Result
                 ),
             })
         }
+        Request::SetSemanticEnabled { enabled } => Ok(Response::CaptureSourceUpdated {
+            status: with_capture_health(repository.set_semantic_enabled(enabled)?),
+        }),
+        Request::SetSemanticSampleInterval { sample_interval_ms } => {
+            Ok(Response::CaptureSourceUpdated {
+                status: with_capture_health(
+                    repository.set_semantic_sample_interval(sample_interval_ms)?,
+                ),
+            })
+        }
         Request::SetScreenEnabled { enabled } => Ok(Response::CaptureSourceUpdated {
             status: with_capture_health(repository.set_screen_enabled(enabled)?),
         }),
@@ -185,6 +195,9 @@ fn dispatch_database(request: Request, repository: &Mutex<Repository>) -> Result
         }),
         Request::RecordActivity { snapshot } => Ok(Response::ActivityRecorded {
             result: repository.record_activity_snapshot(snapshot)?,
+        }),
+        Request::RecordSemantic { candidate } => Ok(Response::SemanticRecorded {
+            result: repository.record_semantic_observation(&candidate)?,
         }),
         Request::EndActivitySession { reason } => {
             repository.end_activity_session(&reason)?;

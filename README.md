@@ -22,7 +22,10 @@ The project is intentionally local-only:
 - Persistent pause state
 - Safe, explicitly enabled clipboard capture through a local GNOME Shell bridge
 - Optional focused-application and window-title activity sessions with idle boundaries
-- Consent-gated Semantic Context compatibility preview using GNOME's accessibility interface
+- Opt-in Semantic Context capture using bounded, read-only GNOME accessibility data
+- Adaptive semantic-first capture: rich application context avoids redundant screenshots,
+  while sparse or unavailable context falls back to Screen Memory when it is enabled
+- A consent-gated, store-nothing Semantic Context compatibility test
 - Opt-in active-window Screen Memory with local visual-change filtering
 - A five-second “Remember this screen” control for deliberate one-off capture
 - Temporary PNGs removed from disk before their pixels are analyzed in memory by a selected loopback Ollama vision model
@@ -41,9 +44,8 @@ The project is intentionally local-only:
 - Brie answers powered by local `gemma4:12b`, with exact Remembrie citations
 - Local model selection and visible indexing health
 
-Persistent Semantic Context capture, dedicated OCR, optional retained evidence controls,
-richer citation navigation, and the interactive constellation are the next implementation
-milestones.
+Dedicated OCR, optional retained evidence controls, richer citation navigation, and the
+interactive constellation are the next implementation milestones.
 
 ## Install on Ubuntu
 
@@ -101,12 +103,15 @@ Membrie is in the background:
 ```
 
 The extension exports only a local session-bus interface and has no network code.
-Activity context and Screen Memory stay off until enabled in Membrie's Privacy & Capture
-screen. Screen Memory takes one-shot samples of the active window, filters unchanged
-frames locally, removes each PNG from disk before local Ollama analysis, and never
-records keyboard or pointer input. GNOME may require one log out and back in before it
-can load a newly installed local extension; the installer queues it to enable on that
-next login. After the bridge is enabled, start Membrie:
+Activity Context, Semantic Context, and Screen Memory stay off until enabled in Membrie's
+Privacy & Capture screen. Semantic Context reads bounded, visible application labels and
+text through GNOME's accessibility interface. Rich semantic observations replace a
+redundant screenshot; partial or unavailable observations allow Screen Memory to fill the
+gap when that separate source is enabled. Screen Memory takes one-shot samples of the
+active window, filters unchanged frames locally, removes each PNG from disk before local
+Ollama analysis, and never records keyboard or pointer input. GNOME may require one log
+out and back in before it can load a newly installed local extension; the installer queues
+it to enable on that next login. After the bridge is enabled, start Membrie:
 
 ```bash
 ./scripts/dev.sh
@@ -139,7 +144,7 @@ MEMBRIE_DATA_DIR=/tmp/membrie-dev ./scripts/dev.sh
 crates/membrie-core    Canonical model, SQLite repository, paths, and IPC client
 crates/membrie-daemon  Database owner, policy engine, and Unix-socket service
 crates/membrie-capture Local D-Bus client for the GNOME desktop bridge
-crates/membrie-a11y    Bounded, read-only AT-SPI compatibility probe
+crates/membrie-a11y    Bounded, read-only AT-SPI semantic-context reader
 crates/membrie-app     Native GTK 4/libadwaita application
 gnome-shell-extension  Local clipboard and desktop-context bridge for GNOME Wayland
 docs/                  Product and architecture decisions

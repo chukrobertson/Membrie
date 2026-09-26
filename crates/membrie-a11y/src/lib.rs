@@ -4,7 +4,9 @@ use anyhow::{Context, Result};
 use atspi::connection::set_session_accessibility;
 use atspi::proxy::accessible::ObjectRefExt;
 use atspi::{AccessibilityConnection, Interface, Role, State};
+use futures_lite::future;
 use std::collections::HashSet;
+use std::time::Duration;
 
 const MAX_NODES: usize = 500;
 const MAX_DEPTH: usize = 14;
@@ -30,9 +32,11 @@ pub struct ProbeSummary {
 
 impl ProbeSummary {
     pub fn quality(&self) -> &'static str {
-        if self.text_nodes >= 8 || self.document_nodes > 0 || self.preview.len() >= 8 {
+        if self.preview.len() >= 8 && (self.text_nodes >= 3 || self.document_nodes > 0) {
             "rich"
-        } else if self.text_nodes > 0 || self.preview.len() >= 3 {
+        } else if self.preview.len() >= 3
+            || (!self.preview.is_empty() && (self.text_nodes > 0 || self.document_nodes > 0))
+        {
             "partial"
         } else {
             "sparse"
@@ -45,7 +49,7 @@ impl ProbeSummary {
 /// This is deliberately read-only: it queries `Accessible` metadata and never
 /// constructs or invokes an `Action` or `EditableText` proxy. Nothing is stored.
 pub fn inspect_active_window(show_text: bool) -> Result<ProbeSummary> {
-    async_io::block_on(inspect_window_async(None, show_text)).context(
+    run_bounded_probe(None, show_text).context(
         "GNOME's accessibility interface could not be inspected; make sure Accessibility Context is enabled",
     )
 }
@@ -62,9 +66,21 @@ pub fn inspect_target_window(target: WindowTarget, show_text: bool) -> Result<Pr
     {
         anyhow::bail!("GNOME did not report a focused application or window");
     }
-    async_io::block_on(inspect_window_async(Some(target), show_text)).context(
+    run_bounded_probe(Some(target), show_text).context(
         "GNOME's focused window could not be matched to an accessibility tree; the application may need to be restarted",
     )
+}
+
+fn run_bounded_probe(target: Option<WindowTarget>, show_text: bool) -> Result<ProbeSummary> {
+    async_io::block_on(future::race(
+        inspect_window_async(target, show_text),
+        async {
+            async_io::Timer::after(Duration::from_secs(20)).await;
+            Err(anyhow::anyhow!(
+                "the accessibility inspection exceeded its 20-second safety limit"
+            ))
+        },
+    ))
 }
 
 #[derive(Debug)]
@@ -344,6 +360,7 @@ mod tests {
         assert_eq!(
             ProbeSummary {
                 text_nodes: 1,
+                preview: vec!["text: Inbox".to_owned()],
                 ..ProbeSummary::default()
             }
             .quality(),
@@ -352,6 +369,7 @@ mod tests {
         assert_eq!(
             ProbeSummary {
                 document_nodes: 1,
+                preview: (0..8).map(|index| format!("item: {index}")).collect(),
                 ..ProbeSummary::default()
             }
             .quality(),

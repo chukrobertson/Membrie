@@ -13,8 +13,14 @@ not an individual key press or low-level operating-system event.
 - `capture_events`: content-free decisions for stored or skipped automatic events
 - `activity_sessions`: bounded active-use periods and their closing reason
 - `activity_observations`: deduplicated focused application and window-title changes
+- `semantic_observations`: bounded, policy-approved visible labels and text supplied by
+  application accessibility interfaces, tied to activity sessions and quality-labeled
 - `screen_observations`: explicitly labeled local vision descriptions tied to activity sessions;
   processing state survives session boundaries and temporary source images are not retained
+
+Semantic observations and completed screen descriptions become labeled sections of the same
+Activity Remembrie when its session closes. They are supporting context rather than independent
+claims that an action occurred. Disabling Activity Context also disables both dependent sources.
 
 ## Derived records
 

@@ -1,9 +1,11 @@
 use anyhow::{Context, Result, bail};
 use gdk_pixbuf::prelude::*;
+use membrie_a11y::{WindowTarget, inspect_target_window};
 use membrie_core::{
-    ActivitySnapshot, CaptureCandidate, CaptureDecision, DaemonClient, ScreenCaptureCandidate,
-    screen_spool_dir, socket_path,
+    ActivitySnapshot, CaptureCandidate, CaptureDecision, CaptureStatus, DaemonClient,
+    ScreenCaptureCandidate, SemanticCaptureCandidate, screen_spool_dir, socket_path,
 };
+use std::collections::HashMap;
 use std::fs;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -32,6 +34,29 @@ struct ScreenSampler {
     last_kept_fingerprint: Option<Vec<u8>>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SemanticCapability {
+    Pending,
+    Rich,
+    Partial,
+    Unavailable,
+    Blocked,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SemanticTargetState {
+    capability: SemanticCapability,
+    attempted_at: Instant,
+}
+
+#[derive(Default)]
+struct SemanticSampler {
+    targets: HashMap<String, SemanticTargetState>,
+    unavailable_apps: HashMap<String, Instant>,
+}
+
+const SEMANTIC_UNAVAILABLE_RETRY: Duration = Duration::from_secs(15 * 60);
+
 fn main() -> Result<()> {
     clean_screen_spool();
     let proxy = gio::DBusProxy::for_bus_sync(
@@ -53,9 +78,13 @@ fn main() -> Result<()> {
     let client = DaemonClient::new(socket_path());
     let screen_sampler = Arc::new(Mutex::new(ScreenSampler::default()));
     let screen_analysis_busy = Arc::new(AtomicBool::new(false));
+    let semantic_sampler = Arc::new(Mutex::new(SemanticSampler::default()));
+    let semantic_probe_busy = Arc::new(AtomicBool::new(false));
     let client_for_signals = client.clone();
     let sampler_for_signals = Arc::clone(&screen_sampler);
     let busy_for_signals = Arc::clone(&screen_analysis_busy);
+    let semantic_sampler_for_signals = Arc::clone(&semantic_sampler);
+    let semantic_busy_for_signals = Arc::clone(&semantic_probe_busy);
     proxy.connect_g_signal(
         None,
         move |proxy, _, signal_name, parameters| match signal_name {
@@ -66,6 +95,8 @@ fn main() -> Result<()> {
                 &client_for_signals,
                 &sampler_for_signals,
                 &busy_for_signals,
+                &semantic_sampler_for_signals,
+                &semantic_busy_for_signals,
             ),
             _ => {}
         },
@@ -73,6 +104,8 @@ fn main() -> Result<()> {
     let client_for_owner = client.clone();
     let sampler_for_owner = Arc::clone(&screen_sampler);
     let busy_for_owner = Arc::clone(&screen_analysis_busy);
+    let semantic_sampler_for_owner = Arc::clone(&semantic_sampler);
+    let semantic_busy_for_owner = Arc::clone(&semantic_probe_busy);
     proxy.connect_g_name_owner_notify(move |proxy| {
         if proxy.name_owner().is_none() {
             if let Err(error) = client_for_owner.end_activity_session("desktop_bridge_unavailable")
@@ -85,10 +118,19 @@ fn main() -> Result<()> {
                 &client_for_owner,
                 &sampler_for_owner,
                 &busy_for_owner,
+                &semantic_sampler_for_owner,
+                &semantic_busy_for_owner,
             );
         }
     });
-    poll_desktop(&proxy, &client, &screen_sampler, &screen_analysis_busy);
+    poll_desktop(
+        &proxy,
+        &client,
+        &screen_sampler,
+        &screen_analysis_busy,
+        &semantic_sampler,
+        &semantic_probe_busy,
+    );
     let proxy_for_timer = proxy.clone();
     glib::timeout_add_seconds_local(10, move || {
         poll_desktop(
@@ -96,6 +138,8 @@ fn main() -> Result<()> {
             &client,
             &screen_sampler,
             &screen_analysis_busy,
+            &semantic_sampler,
+            &semantic_probe_busy,
         );
         glib::ControlFlow::Continue
     });
@@ -110,6 +154,8 @@ fn poll_desktop(
     client: &DaemonClient,
     screen_sampler: &Arc<Mutex<ScreenSampler>>,
     screen_analysis_busy: &Arc<AtomicBool>,
+    semantic_sampler: &Arc<Mutex<SemanticSampler>>,
+    semantic_probe_busy: &Arc<AtomicBool>,
 ) {
     match client.record_clipboard_agent_heartbeat() {
         Ok(status) if status.activity_enabled && !status.paused => {
@@ -118,7 +164,9 @@ fn poll_desktop(
                 client,
                 screen_sampler,
                 screen_analysis_busy,
-                status.screen_sample_interval_ms,
+                semantic_sampler,
+                semantic_probe_busy,
+                &status,
             );
         }
         Ok(_) => {}
@@ -131,6 +179,8 @@ fn poll_activity_state(
     client: &DaemonClient,
     screen_sampler: &Arc<Mutex<ScreenSampler>>,
     screen_analysis_busy: &Arc<AtomicBool>,
+    semantic_sampler: &Arc<Mutex<SemanticSampler>>,
+    semantic_probe_busy: &Arc<AtomicBool>,
 ) {
     if let Ok(status) = client.status()
         && status.activity_enabled
@@ -141,7 +191,9 @@ fn poll_activity_state(
             client,
             screen_sampler,
             screen_analysis_busy,
-            status.screen_sample_interval_ms,
+            semantic_sampler,
+            semantic_probe_busy,
+            &status,
         );
     }
 }
@@ -151,7 +203,9 @@ fn request_activity_state(
     client: &DaemonClient,
     screen_sampler: &Arc<Mutex<ScreenSampler>>,
     screen_analysis_busy: &Arc<AtomicBool>,
-    sample_interval_ms: u64,
+    semantic_sampler: &Arc<Mutex<SemanticSampler>>,
+    semantic_probe_busy: &Arc<AtomicBool>,
+    status: &CaptureStatus,
 ) {
     let response = proxy.call_sync(
         "GetActivityState",
@@ -175,6 +229,11 @@ fn request_activity_state(
         }
     };
 
+    let semantic_target = WindowTarget {
+        app_id: state.0.clone(),
+        app_name: state.1.clone(),
+        window_title: state.2.clone(),
+    };
     let snapshot = ActivitySnapshot {
         app_id: state.0,
         app_name: state.1,
@@ -190,13 +249,28 @@ fn request_activity_state(
             return;
         }
     };
-    if !activity.screen_capture_allowed || screen_analysis_busy.load(Ordering::Relaxed) {
-        return;
-    }
     let Some(session_id) = activity.session_id else {
         return;
     };
-    let interval = Duration::from_millis(sample_interval_ms.clamp(30_000, 300_000));
+    let accessibility_available =
+        gio::Settings::new("org.gnome.desktop.interface").boolean("toolkit-accessibility");
+    if activity.semantic_capture_allowed
+        && accessibility_available
+        && semantic_context_supersedes_screen(
+            client,
+            semantic_sampler,
+            semantic_probe_busy,
+            &session_id,
+            semantic_target,
+            status.semantic_sample_interval_ms,
+        )
+    {
+        return;
+    }
+    if !activity.screen_capture_allowed || screen_analysis_busy.load(Ordering::Relaxed) {
+        return;
+    }
+    let interval = Duration::from_millis(status.screen_sample_interval_ms.clamp(30_000, 300_000));
     let due = {
         let Ok(sampler) = screen_sampler.lock() else {
             eprintln!("Screen-change state became unavailable");
@@ -221,6 +295,170 @@ fn request_activity_state(
         screen_analysis_busy,
         session_id,
     );
+}
+
+fn semantic_context_supersedes_screen(
+    client: &DaemonClient,
+    semantic_sampler: &Arc<Mutex<SemanticSampler>>,
+    semantic_probe_busy: &Arc<AtomicBool>,
+    session_id: &str,
+    target: WindowTarget,
+    sample_interval_ms: u64,
+) -> bool {
+    let app_key = semantic_app_key(&target);
+    let target_key = semantic_target_key(&target);
+    let interval = Duration::from_millis(sample_interval_ms.clamp(30_000, 300_000));
+    let now = Instant::now();
+    {
+        let Ok(mut sampler) = semantic_sampler.lock() else {
+            eprintln!("Semantic capability state became unavailable");
+            return false;
+        };
+        sampler
+            .unavailable_apps
+            .retain(|_, checked_at| checked_at.elapsed() < SEMANTIC_UNAVAILABLE_RETRY);
+        if sampler.unavailable_apps.contains_key(&app_key) {
+            return false;
+        }
+        if let Some(previous) = sampler.targets.get(&target_key)
+            && previous.attempted_at.elapsed() < interval
+        {
+            return matches!(
+                previous.capability,
+                SemanticCapability::Pending
+                    | SemanticCapability::Rich
+                    | SemanticCapability::Blocked
+            );
+        }
+        if semantic_probe_busy.swap(true, Ordering::AcqRel) {
+            return false;
+        }
+        if sampler.targets.len() >= 512 {
+            sampler.targets.clear();
+        }
+        sampler.targets.insert(
+            target_key.clone(),
+            SemanticTargetState {
+                capability: SemanticCapability::Pending,
+                attempted_at: now,
+            },
+        );
+    }
+
+    let client = client.clone();
+    let sampler = Arc::clone(semantic_sampler);
+    let busy = Arc::clone(semantic_probe_busy);
+    let session_id = session_id.to_owned();
+    let observed_at_ms = current_time_ms();
+    std::thread::spawn(move || {
+        let result = inspect_target_window(target.clone(), true);
+        let capability = match result {
+            Ok(summary) if summary.quality() != "sparse" && !summary.preview.is_empty() => {
+                let quality = summary.quality().to_owned();
+                let candidate = SemanticCaptureCandidate {
+                    session_id,
+                    app_id: target.app_id,
+                    app_name: target.app_name,
+                    window_title: target.window_title,
+                    observed_at_ms: Some(observed_at_ms),
+                    quality: quality.clone(),
+                    visible_nodes: summary.visible_nodes as u32,
+                    text_nodes: summary.text_nodes as u32,
+                    document_nodes: summary.document_nodes as u32,
+                    text_content: bounded_semantic_text(&summary.preview),
+                };
+                match client.record_semantic(candidate) {
+                    Ok(recorded) if recorded.outcome == "stored" => {
+                        println!("Remembered application-provided semantic context");
+                        semantic_capability_for_quality(&quality)
+                    }
+                    Ok(recorded)
+                        if recorded
+                            .reason
+                            .as_deref()
+                            .is_some_and(|reason| reason.contains("not materially changed")) =>
+                    {
+                        semantic_capability_for_quality(&quality)
+                    }
+                    Ok(recorded) => {
+                        println!(
+                            "Skipped semantic context: {}",
+                            recorded
+                                .reason
+                                .as_deref()
+                                .unwrap_or("blocked by local policy")
+                        );
+                        SemanticCapability::Blocked
+                    }
+                    Err(error) => {
+                        eprintln!("Semantic context could not be recorded: {error}");
+                        SemanticCapability::Unavailable
+                    }
+                }
+            }
+            Ok(_) => SemanticCapability::Unavailable,
+            Err(error) => {
+                println!("Semantic context unavailable; Screen Memory remains available: {error}");
+                if let Ok(mut sampler) = sampler.lock() {
+                    sampler.unavailable_apps.insert(app_key.clone(), now);
+                }
+                SemanticCapability::Unavailable
+            }
+        };
+        if let Ok(mut sampler) = sampler.lock() {
+            sampler.targets.insert(
+                target_key,
+                SemanticTargetState {
+                    capability,
+                    attempted_at: now,
+                },
+            );
+        }
+        busy.store(false, Ordering::Release);
+    });
+    true
+}
+
+fn semantic_capability_for_quality(quality: &str) -> SemanticCapability {
+    if quality == "rich" {
+        SemanticCapability::Rich
+    } else {
+        SemanticCapability::Partial
+    }
+}
+
+fn semantic_app_key(target: &WindowTarget) -> String {
+    let identity = if target.app_id.trim().is_empty() {
+        &target.app_name
+    } else {
+        &target.app_id
+    };
+    identity.trim().to_ascii_lowercase()
+}
+
+fn semantic_target_key(target: &WindowTarget) -> String {
+    format!(
+        "{}\n{}",
+        semantic_app_key(target),
+        target.window_title.trim().to_ascii_lowercase()
+    )
+}
+
+fn bounded_semantic_text(lines: &[String]) -> String {
+    const MAX_BYTES: usize = 7_500;
+    let mut result = String::new();
+    for line in lines {
+        if !result.is_empty() && result.len() < MAX_BYTES {
+            result.push('\n');
+        }
+        for character in line.chars() {
+            if result.len() + character.len_utf8() > MAX_BYTES {
+                return result;
+            }
+            result.push(character);
+        }
+    }
+    result
 }
 
 fn capture_changed_screen(
@@ -494,5 +732,25 @@ mod tests {
             *value = 220;
         }
         assert!(materially_changed(&previous, &current));
+    }
+
+    #[test]
+    fn semantic_text_is_bounded_without_breaking_utf8() {
+        let lines = vec!["é".repeat(5_000)];
+        let text = bounded_semantic_text(&lines);
+        assert!(text.len() <= 7_500);
+        assert!(text.is_char_boundary(text.len()));
+    }
+
+    #[test]
+    fn rich_semantic_context_suppresses_screen_fallback() {
+        assert_eq!(
+            semantic_capability_for_quality("rich"),
+            SemanticCapability::Rich
+        );
+        assert_eq!(
+            semantic_capability_for_quality("partial"),
+            SemanticCapability::Partial
+        );
     }
 }

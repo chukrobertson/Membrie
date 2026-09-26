@@ -2,7 +2,7 @@ use crate::model::{
     ActivityRecordResult, ActivitySnapshot, CaptureCandidate, CaptureDecision, CaptureRule,
     CaptureStatus, EmbeddedChunk, IntelligenceSettings, IntelligenceStatus, LocalModel,
     NewRemembrie, PauseMode, ProcessingJob, Remembrie, ScreenAnalysis, ScreenCaptureCandidate,
-    ScreenCaptureResult, SearchHit,
+    ScreenCaptureResult, SearchHit, SemanticCaptureCandidate, SemanticCaptureResult,
 };
 use crate::policy::{MAX_AUTOMATIC_CONTENT_BYTES, exclusion_reason, sensitive_reason};
 use rusqlite::{Connection, DatabaseName, OptionalExtension, Row, params};
@@ -13,7 +13,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use uuid::Uuid;
 
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 const DUPLICATE_WINDOW_MS: i64 = 24 * 60 * 60 * 1000;
 const MIN_SEMANTIC_SIMILARITY: f64 = 0.25;
 const SEMANTIC_SCORE_WINDOW: f64 = 0.20;
@@ -286,6 +286,33 @@ CREATE INDEX IF NOT EXISTS idx_screen_observations_state
     ON screen_observations(state, observed_at_ms DESC);
 "#;
 
+const MIGRATION_6: &str = r#"
+ALTER TABLE capture_state ADD COLUMN semantic_enabled INTEGER NOT NULL DEFAULT 0
+    CHECK(semantic_enabled IN (0, 1));
+ALTER TABLE capture_state ADD COLUMN semantic_sample_interval_ms INTEGER NOT NULL DEFAULT 60000
+    CHECK(semantic_sample_interval_ms BETWEEN 30000 AND 300000);
+
+CREATE TABLE IF NOT EXISTS semantic_observations (
+    id                  TEXT PRIMARY KEY NOT NULL,
+    session_id          TEXT NOT NULL REFERENCES activity_sessions(id) ON DELETE CASCADE,
+    observed_at_ms      INTEGER NOT NULL,
+    app_id              TEXT NOT NULL,
+    app_name            TEXT NOT NULL,
+    window_title        TEXT NOT NULL,
+    quality             TEXT NOT NULL CHECK(quality IN ('partial', 'rich')),
+    visible_nodes       INTEGER NOT NULL CHECK(visible_nodes BETWEEN 0 AND 10000),
+    text_nodes          INTEGER NOT NULL CHECK(text_nodes BETWEEN 0 AND 10000),
+    document_nodes      INTEGER NOT NULL CHECK(document_nodes BETWEEN 0 AND 10000),
+    text_content        TEXT NOT NULL,
+    created_at_ms       INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_semantic_observations_session
+    ON semantic_observations(session_id, observed_at_ms);
+CREATE INDEX IF NOT EXISTS idx_semantic_observations_app
+    ON semantic_observations(app_id, observed_at_ms DESC);
+"#;
+
 #[derive(Debug, Error)]
 pub enum RepositoryError {
     #[error("database error: {0}")]
@@ -363,6 +390,13 @@ impl Repository {
         if version < 5 {
             let transaction = connection.unchecked_transaction()?;
             transaction.execute_batch(MIGRATION_5)?;
+            transaction.pragma_update(None, "user_version", 5)?;
+            transaction.commit()?;
+            version = 5;
+        }
+        if version < 6 {
+            let transaction = connection.unchecked_transaction()?;
+            transaction.execute_batch(MIGRATION_6)?;
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             transaction.commit()?;
         }
@@ -1053,11 +1087,14 @@ impl Repository {
             clipboard_enabled,
             activity_enabled,
             activity_idle_threshold_ms,
+            semantic_enabled,
+            semantic_sample_interval_ms,
             screen_enabled,
             screen_sample_interval_ms,
             screen_model,
         ) = self.connection.query_row(
             "SELECT clipboard_enabled, activity_enabled, activity_idle_threshold_ms,
+                        semantic_enabled, semantic_sample_interval_ms,
                         screen_enabled, screen_sample_interval_ms, screen_model
                  FROM capture_state WHERE singleton = 1",
             [],
@@ -1069,6 +1106,8 @@ impl Repository {
                     row.get(3)?,
                     row.get(4)?,
                     row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
                 ))
             },
         )?;
@@ -1141,6 +1180,22 @@ impl Repository {
                 |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
             )
             .optional()?;
+        let semantic_observation_count =
+            self.connection
+                .query_row("SELECT COUNT(*) FROM semantic_observations", [], |row| {
+                    row.get::<_, u64>(0)
+                })?;
+        let last_semantic_observation = self
+            .connection
+            .query_row(
+                "SELECT observed_at_ms, app_name
+                 FROM semantic_observations
+                 ORDER BY observed_at_ms DESC, created_at_ms DESC
+                 LIMIT 1",
+                [],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
         Ok(CaptureStatus {
             paused,
             paused_until_ms,
@@ -1158,6 +1213,13 @@ impl Repository {
                 .as_ref()
                 .and_then(|activity| activity.1.clone()),
             activity_current_window: current_activity.and_then(|activity| activity.2),
+            semantic_enabled,
+            semantic_sample_interval_ms,
+            semantic_observation_count,
+            semantic_last_observed_at_ms: last_semantic_observation
+                .as_ref()
+                .map(|observation| observation.0),
+            semantic_last_app: last_semantic_observation.map(|observation| observation.1),
             screen_enabled,
             screen_sample_interval_ms,
             screen_model,
@@ -1219,6 +1281,7 @@ impl Repository {
         self.connection.execute(
             "UPDATE capture_state
              SET activity_enabled = ?1,
+                 semantic_enabled = CASE WHEN ?1 THEN semantic_enabled ELSE 0 END,
                  screen_enabled = CASE WHEN ?1 THEN screen_enabled ELSE 0 END,
                  updated_at_ms = ?2
              WHERE singleton = 1",
@@ -1227,6 +1290,47 @@ impl Repository {
         if !activity_enabled {
             self.finish_active_activity_session(now, "activity_disabled")?;
         }
+        self.status()
+    }
+
+    pub fn set_semantic_enabled(
+        &self,
+        semantic_enabled: bool,
+    ) -> Result<CaptureStatus, RepositoryError> {
+        let activity_enabled = self.connection.query_row(
+            "SELECT activity_enabled FROM capture_state WHERE singleton = 1",
+            [],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if semantic_enabled && !activity_enabled {
+            return Err(RepositoryError::Validation(
+                "enable activity context before enabling semantic context".to_owned(),
+            ));
+        }
+        self.connection.execute(
+            "UPDATE capture_state
+             SET semantic_enabled = ?1, updated_at_ms = ?2
+             WHERE singleton = 1",
+            params![semantic_enabled, now_ms()?],
+        )?;
+        self.status()
+    }
+
+    pub fn set_semantic_sample_interval(
+        &self,
+        sample_interval_ms: u64,
+    ) -> Result<CaptureStatus, RepositoryError> {
+        if !(30_000..=300_000).contains(&sample_interval_ms) {
+            return Err(RepositoryError::Validation(
+                "the semantic-context interval must be between 30 seconds and 5 minutes".to_owned(),
+            ));
+        }
+        self.connection.execute(
+            "UPDATE capture_state
+             SET semantic_sample_interval_ms = ?1, updated_at_ms = ?2
+             WHERE singleton = 1",
+            params![sample_interval_ms, now_ms()?],
+        )?;
         self.status()
     }
 
@@ -1315,18 +1419,21 @@ impl Repository {
         }
 
         let (paused, _) = self.effective_pause(now)?;
-        let (activity_enabled, idle_threshold_ms, screen_enabled) = self.connection.query_row(
-            "SELECT activity_enabled, activity_idle_threshold_ms, screen_enabled
+        let (activity_enabled, idle_threshold_ms, semantic_enabled, screen_enabled) =
+            self.connection.query_row(
+                "SELECT activity_enabled, activity_idle_threshold_ms,
+                    semantic_enabled, screen_enabled
              FROM capture_state WHERE singleton = 1",
-            [],
-            |row| {
-                Ok((
-                    row.get::<_, bool>(0)?,
-                    row.get::<_, u64>(1)?,
-                    row.get::<_, bool>(2)?,
-                ))
-            },
-        )?;
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, bool>(0)?,
+                        row.get::<_, u64>(1)?,
+                        row.get::<_, bool>(2)?,
+                        row.get::<_, bool>(3)?,
+                    ))
+                },
+            )?;
         if !activity_enabled {
             return Ok(activity_result(
                 "ignored",
@@ -1479,6 +1586,7 @@ impl Repository {
         }
 
         let mut result = activity_result("recorded", None, Some(&session_id));
+        result.semantic_capture_allowed = semantic_enabled;
         result.screen_capture_allowed = screen_enabled;
         Ok(result)
     }
@@ -1499,6 +1607,162 @@ impl Repository {
     pub fn reset_interrupted_activity(&mut self) -> Result<(), RepositoryError> {
         self.finish_active_activity_session(now_ms()?, "daemon_restart")?;
         Ok(())
+    }
+
+    pub fn record_semantic_observation(
+        &mut self,
+        candidate: &SemanticCaptureCandidate,
+    ) -> Result<SemanticCaptureResult, RepositoryError> {
+        validate_semantic_candidate(candidate)?;
+        let wall_now = now_ms()?;
+        let observed_at_ms = candidate.observed_at_ms.unwrap_or(wall_now);
+        let (paused, _) = self.effective_pause(observed_at_ms)?;
+        let (activity_enabled, semantic_enabled) = self.connection.query_row(
+            "SELECT activity_enabled, semantic_enabled
+             FROM capture_state WHERE singleton = 1",
+            [],
+            |row| Ok((row.get::<_, bool>(0)?, row.get::<_, bool>(1)?)),
+        )?;
+        if paused || !activity_enabled || !semantic_enabled {
+            return self.skip_semantic_observation(
+                "disabled",
+                "Semantic Context is paused or disabled",
+                observed_at_ms,
+            );
+        }
+
+        let session_started_at_ms = self
+            .connection
+            .query_row(
+                "SELECT started_at_ms FROM activity_sessions
+                 WHERE id = ?1 AND ended_at_ms IS NULL",
+                [&candidate.session_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        let Some(session_started_at_ms) = session_started_at_ms else {
+            return self.skip_semantic_observation(
+                "session_ended",
+                "the activity session ended before semantic context arrived",
+                observed_at_ms,
+            );
+        };
+
+        let snapshot = CaptureCandidate {
+            kind: "semantic".to_owned(),
+            title: "Semantic context".to_owned(),
+            body: candidate.text_content.clone(),
+            source_app: Some(activity_source_app(&candidate.app_id, &candidate.app_name)),
+            window_title: (!candidate.window_title.trim().is_empty())
+                .then(|| candidate.window_title.clone()),
+            source_uri: None,
+            occurred_at_ms: candidate.observed_at_ms,
+        };
+        let rules = self.list_capture_rules()?;
+        if let Some(rule) = exclusion_reason(&snapshot, &rules) {
+            let label = rule.label.as_deref().unwrap_or("a privacy rule");
+            return self.skip_semantic_observation(
+                "excluded",
+                &format!("semantic context is excluded by {label}"),
+                observed_at_ms,
+            );
+        }
+        if sensitive_reason(&candidate.window_title).is_some()
+            || sensitive_reason(&candidate.text_content).is_some()
+        {
+            return self.skip_semantic_observation(
+                "sensitive",
+                "semantic context looked sensitive",
+                observed_at_ms,
+            );
+        }
+        if observed_at_ms < session_started_at_ms || observed_at_ms > wall_now + 60_000 {
+            return Err(RepositoryError::Validation(
+                "semantic timestamp is outside the active session".to_owned(),
+            ));
+        }
+
+        let text_content = normalize_semantic_text(&candidate.text_content);
+        let duplicate = self.connection.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM semantic_observations
+                WHERE session_id = ?1 AND app_id = ?2 AND app_name = ?3
+                  AND window_title = ?4 AND text_content = ?5
+             )",
+            params![
+                candidate.session_id,
+                candidate.app_id.trim(),
+                candidate.app_name.trim(),
+                candidate.window_title.trim(),
+                text_content,
+            ],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if duplicate {
+            return self.skip_semantic_observation(
+                "duplicate",
+                "semantic context has not materially changed",
+                observed_at_ms,
+            );
+        }
+        let observation_count = self.connection.query_row(
+            "SELECT COUNT(*) FROM semantic_observations WHERE session_id = ?1",
+            [&candidate.session_id],
+            |row| row.get::<_, u64>(0),
+        )?;
+        if observation_count >= 1000 {
+            return self.skip_semantic_observation(
+                "limit",
+                "the activity session reached its semantic observation limit",
+                observed_at_ms,
+            );
+        }
+
+        let observation_id = Uuid::now_v7().to_string();
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "INSERT INTO semantic_observations(
+                id, session_id, observed_at_ms, app_id, app_name, window_title,
+                quality, visible_nodes, text_nodes, document_nodes,
+                text_content, created_at_ms
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                observation_id,
+                candidate.session_id,
+                observed_at_ms,
+                candidate.app_id.trim(),
+                candidate.app_name.trim(),
+                candidate.window_title.trim(),
+                candidate.quality,
+                candidate.visible_nodes,
+                candidate.text_nodes,
+                candidate.document_nodes,
+                text_content,
+                wall_now,
+            ],
+        )?;
+        transaction.execute(
+            "INSERT INTO capture_events(
+                id, occurred_at_ms, source_kind, outcome, reason, remembrie_id
+             ) VALUES(?1, ?2, 'semantic', 'stored', NULL, NULL)",
+            params![Uuid::now_v7().to_string(), observed_at_ms],
+        )?;
+        transaction.commit()?;
+        Ok(semantic_capture_result(
+            "stored",
+            None,
+            Some(&observation_id),
+        ))
+    }
+
+    fn skip_semantic_observation(
+        &self,
+        outcome: &str,
+        reason: &str,
+        observed_at_ms: i64,
+    ) -> Result<SemanticCaptureResult, RepositoryError> {
+        self.record_capture_event("semantic", outcome, Some(reason), None, observed_at_ms)?;
+        Ok(semantic_capture_result("skipped", Some(reason), None))
     }
 
     fn authorize_screen_candidate(
@@ -2136,6 +2400,67 @@ impl Repository {
             ));
         }
 
+        let semantic_observations = {
+            let mut statement = self.connection.prepare(
+                "SELECT observed_at_ms, app_name, window_title, quality,
+                        visible_nodes, text_nodes, document_nodes, text_content
+                 FROM semantic_observations
+                 WHERE session_id = ?1
+                 ORDER BY observed_at_ms, created_at_ms",
+            )?;
+            let rows = statement.query_map([&session_id], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, u32>(4)?,
+                    row.get::<_, u32>(5)?,
+                    row.get::<_, u32>(6)?,
+                    row.get::<_, String>(7)?,
+                ))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        if !semantic_observations.is_empty() {
+            body.push_str(semantic_context_intro());
+            let mut included_semantic = 0_usize;
+            for (
+                observed_at_ms,
+                app_name,
+                window_title,
+                quality,
+                visible_nodes,
+                text_nodes,
+                document_nodes,
+                text_content,
+            ) in &semantic_observations
+            {
+                let line = semantic_context_line(
+                    started_at_ms,
+                    *observed_at_ms,
+                    app_name,
+                    window_title,
+                    quality,
+                    *visible_nodes,
+                    *text_nodes,
+                    *document_nodes,
+                    text_content,
+                );
+                if body.chars().count() + line.chars().count() > 20_000 {
+                    break;
+                }
+                body.push_str(&line);
+                included_semantic += 1;
+            }
+            if included_semantic < semantic_observations.len() {
+                body.push_str(&format!(
+                    "- {} additional application-provided semantic observations remain in the local ledger.\n",
+                    semantic_observations.len() - included_semantic
+                ));
+            }
+        }
+
         let screen_observations = {
             let mut statement = self.connection.prepare(
                 "SELECT observed_at_ms, app_name, window_title, description,
@@ -2416,6 +2741,48 @@ fn validate_screen_candidate(candidate: &ScreenCaptureCandidate) -> Result<(), R
     Ok(())
 }
 
+fn validate_semantic_candidate(
+    candidate: &SemanticCaptureCandidate,
+) -> Result<(), RepositoryError> {
+    validate_activity_text("activity session identifier", &candidate.session_id, 128)?;
+    validate_activity_text("application identifier", &candidate.app_id, 512)?;
+    validate_activity_text("application name", &candidate.app_name, 512)?;
+    validate_activity_text("window title", &candidate.window_title, 4096)?;
+    validate_activity_text("semantic context", &candidate.text_content, 8_000)?;
+    if candidate.session_id.trim().is_empty() {
+        return Err(RepositoryError::Validation(
+            "semantic context needs an activity session".to_owned(),
+        ));
+    }
+    if !matches!(candidate.quality.as_str(), "partial" | "rich") {
+        return Err(RepositoryError::Validation(
+            "semantic quality must be partial or rich".to_owned(),
+        ));
+    }
+    if candidate.text_content.trim().is_empty() {
+        return Err(RepositoryError::Validation(
+            "semantic context needs visible application-provided text".to_owned(),
+        ));
+    }
+    if candidate.visible_nodes > 10_000
+        || candidate.text_nodes > 10_000
+        || candidate.document_nodes > 10_000
+    {
+        return Err(RepositoryError::Validation(
+            "semantic node counts are outside the supported range".to_owned(),
+        ));
+    }
+    if candidate
+        .observed_at_ms
+        .is_some_and(|timestamp| timestamp < 0)
+    {
+        return Err(RepositoryError::Validation(
+            "semantic timestamps cannot be negative".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_screen_analysis(analysis: &ScreenAnalysis) -> Result<(), RepositoryError> {
     validate_activity_text("screen description", &analysis.description, 2_000)?;
     validate_activity_text("visible screen text", &analysis.visible_text, 8_000)?;
@@ -2443,6 +2810,46 @@ fn activity_source_app(app_id: &str, app_name: &str) -> String {
 
 fn normalize_screen_text(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn normalize_semantic_text(text: &str) -> String {
+    text.lines()
+        .map(normalize_screen_text)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
+fn semantic_context_intro() -> &'static str {
+    "\nApplication-provided semantic context:\n\
+     These labels and visible text were supplied directly by application accessibility \
+     interfaces. They are strong evidence of what was visible—not confirmation that an \
+     action was completed.\n"
+}
+
+#[allow(clippy::too_many_arguments)]
+fn semantic_context_line(
+    started_at_ms: i64,
+    observed_at_ms: i64,
+    app_name: &str,
+    window_title: &str,
+    quality: &str,
+    visible_nodes: u32,
+    text_nodes: u32,
+    document_nodes: u32,
+    text_content: &str,
+) -> String {
+    let offset_minutes = (observed_at_ms - started_at_ms).max(0) / 60_000;
+    let window = if window_title.trim().is_empty() {
+        String::new()
+    } else {
+        format!(" — {}", window_title.trim())
+    };
+    format!(
+        "- +{offset_minutes}m: {}{window} [{quality}; {visible_nodes} visible, {text_nodes} text, {document_nodes} document] {}\n",
+        app_name.trim(),
+        normalize_semantic_text(text_content),
+    )
 }
 
 fn screen_context_intro() -> &'static str {
@@ -2491,6 +2898,19 @@ fn activity_result(
         reason: reason.map(str::to_owned),
         session_id: session_id.map(str::to_owned),
         screen_capture_allowed: false,
+        semantic_capture_allowed: false,
+    }
+}
+
+fn semantic_capture_result(
+    outcome: &str,
+    reason: Option<&str>,
+    observation_id: Option<&str>,
+) -> SemanticCaptureResult {
+    SemanticCaptureResult {
+        outcome: outcome.to_owned(),
+        reason: reason.map(str::to_owned),
+        observation_id: observation_id.map(str::to_owned),
     }
 }
 
@@ -2741,6 +3161,8 @@ mod tests {
         let status = repository.status().unwrap();
         assert!(!status.activity_enabled);
         assert_eq!(status.activity_idle_threshold_ms, 15 * 60 * 1000);
+        assert!(!status.semantic_enabled);
+        assert_eq!(status.semantic_sample_interval_ms, 60 * 1000);
         assert!(!status.screen_enabled);
         assert_eq!(status.screen_sample_interval_ms, 2 * 60 * 1000);
         assert_eq!(status.screen_model, "gemma4:e2b");
@@ -2751,6 +3173,181 @@ mod tests {
                 .iter()
                 .any(|rule| rule.label.as_deref() == Some("Membrie itself"))
         );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn upgrades_a_version_five_database_with_semantic_context_off() {
+        let path = temporary_database("migration-v5");
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch(MIGRATION_1).unwrap();
+        connection.execute_batch(MIGRATION_2).unwrap();
+        connection.execute_batch(MIGRATION_3).unwrap();
+        connection.execute_batch(MIGRATION_4).unwrap();
+        connection.execute_batch(MIGRATION_5).unwrap();
+        connection.pragma_update(None, "user_version", 5).unwrap();
+        drop(connection);
+
+        let repository = Repository::open(&path).unwrap();
+        let status = repository.status().unwrap();
+        assert!(!status.semantic_enabled);
+        assert_eq!(status.semantic_sample_interval_ms, 60_000);
+        assert_eq!(status.semantic_observation_count, 0);
+        let version: i64 = repository
+            .connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn semantic_context_is_opt_in_deduplicated_and_materialized() {
+        let path = temporary_database("semantic-context");
+        let mut repository = Repository::open(&path).unwrap();
+        repository.set_activity_enabled(true).unwrap();
+        repository.set_semantic_enabled(true).unwrap();
+        let start = 1_700_000_000_000_i64;
+        let activity = repository
+            .record_activity_snapshot(activity_snapshot(
+                start,
+                "thunderbird_thunderbird.desktop",
+                "Thunderbird",
+                "Inbox",
+                0,
+            ))
+            .unwrap();
+        assert!(activity.semantic_capture_allowed);
+        let session_id = activity.session_id.unwrap();
+        let candidate = SemanticCaptureCandidate {
+            session_id,
+            app_id: "thunderbird_thunderbird.desktop".to_owned(),
+            app_name: "Thunderbird".to_owned(),
+            window_title: "Inbox".to_owned(),
+            observed_at_ms: Some(start),
+            quality: "rich".to_owned(),
+            visible_nodes: 42,
+            text_nodes: 12,
+            document_nodes: 1,
+            text_content: "heading: Inbox\nlist item: Message from Duke Jones".to_owned(),
+        };
+        let stored = repository.record_semantic_observation(&candidate).unwrap();
+        assert_eq!(stored.outcome, "stored");
+        let duplicate = repository.record_semantic_observation(&candidate).unwrap();
+        assert_eq!(duplicate.outcome, "skipped");
+        repository.end_activity_session("manual").unwrap();
+
+        let remembries = repository.list_recent(10).unwrap();
+        assert_eq!(remembries.len(), 1);
+        assert!(
+            remembries[0]
+                .body
+                .contains("Application-provided semantic context")
+        );
+        assert!(remembries[0].body.contains("Message from Duke Jones"));
+        assert!(remembries[0].body.contains("not confirmation"));
+        assert_eq!(repository.search("Duke Jones", 10).unwrap().len(), 1);
+        assert_eq!(repository.status().unwrap().semantic_observation_count, 1);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn semantic_context_rejects_sensitive_text_without_storing_it() {
+        let path = temporary_database("semantic-sensitive");
+        let mut repository = Repository::open(&path).unwrap();
+        repository.set_activity_enabled(true).unwrap();
+        repository.set_semantic_enabled(true).unwrap();
+        let start = 1_700_000_000_000_i64;
+        let activity = repository
+            .record_activity_snapshot(activity_snapshot(
+                start,
+                "org.gnome.TextEditor",
+                "Text Editor",
+                "Private notes",
+                0,
+            ))
+            .unwrap();
+        let candidate = SemanticCaptureCandidate {
+            session_id: activity.session_id.unwrap(),
+            app_id: "org.gnome.TextEditor".to_owned(),
+            app_name: "Text Editor".to_owned(),
+            window_title: "Private notes".to_owned(),
+            observed_at_ms: Some(start),
+            quality: "rich".to_owned(),
+            visible_nodes: 12,
+            text_nodes: 4,
+            document_nodes: 1,
+            text_content: "text: password=definitely-secret".to_owned(),
+        };
+
+        let result = repository.record_semantic_observation(&candidate).unwrap();
+        assert_eq!(result.outcome, "skipped");
+        assert!(result.reason.unwrap().contains("sensitive"));
+        let stored: u64 = repository
+            .connection
+            .query_row("SELECT COUNT(*) FROM semantic_observations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(stored, 0);
+        assert_eq!(repository.status().unwrap().skipped_sensitive, 1);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn semantic_context_honors_content_exclusions() {
+        let path = temporary_database("semantic-content-exclusion");
+        let mut repository = Repository::open(&path).unwrap();
+        repository.set_activity_enabled(true).unwrap();
+        repository.set_semantic_enabled(true).unwrap();
+        repository
+            .add_capture_rule("content", "*Duke Jones*", Some("Duke research"))
+            .unwrap();
+        let start = 1_700_000_000_000_i64;
+        let activity = repository
+            .record_activity_snapshot(activity_snapshot(
+                start,
+                "thunderbird_thunderbird.desktop",
+                "Thunderbird",
+                "Inbox",
+                0,
+            ))
+            .unwrap();
+        let candidate = SemanticCaptureCandidate {
+            session_id: activity.session_id.unwrap(),
+            app_id: "thunderbird_thunderbird.desktop".to_owned(),
+            app_name: "Thunderbird".to_owned(),
+            window_title: "Inbox".to_owned(),
+            observed_at_ms: Some(start),
+            quality: "rich".to_owned(),
+            visible_nodes: 30,
+            text_nodes: 10,
+            document_nodes: 1,
+            text_content: "list item: Message from Duke Jones".to_owned(),
+        };
+
+        let result = repository.record_semantic_observation(&candidate).unwrap();
+        assert_eq!(result.outcome, "skipped");
+        assert!(result.reason.unwrap().contains("Duke research"));
+        assert_eq!(repository.status().unwrap().semantic_observation_count, 0);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn disabling_activity_also_disables_semantic_context() {
+        let path = temporary_database("semantic-activity-dependency");
+        let mut repository = Repository::open(&path).unwrap();
+        repository.set_activity_enabled(true).unwrap();
+        assert!(
+            repository
+                .set_semantic_enabled(true)
+                .unwrap()
+                .semantic_enabled
+        );
+
+        let status = repository.set_activity_enabled(false).unwrap();
+        assert!(!status.activity_enabled);
+        assert!(!status.semantic_enabled);
         let _ = fs::remove_file(path);
     }
 

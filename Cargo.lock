@@ -864,6 +864,7 @@ dependencies = [
  "anyhow",
  "async-io",
  "atspi",
+ "futures-lite",
 ]
 
 [[package]]
@@ -884,6 +885,7 @@ dependencies = [
  "gdk-pixbuf",
  "gio",
  "glib",
+ "membrie-a11y",
  "membrie-core",
 ]
 

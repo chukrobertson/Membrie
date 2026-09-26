@@ -133,6 +133,16 @@ pub struct CaptureStatus {
     #[serde(default)]
     pub activity_current_window: Option<String>,
     #[serde(default)]
+    pub semantic_enabled: bool,
+    #[serde(default = "default_semantic_sample_interval_ms")]
+    pub semantic_sample_interval_ms: u64,
+    #[serde(default)]
+    pub semantic_observation_count: u64,
+    #[serde(default)]
+    pub semantic_last_observed_at_ms: Option<i64>,
+    #[serde(default)]
+    pub semantic_last_app: Option<String>,
+    #[serde(default)]
     pub screen_enabled: bool,
     #[serde(default = "default_screen_sample_interval_ms")]
     pub screen_sample_interval_ms: u64,
@@ -159,6 +169,10 @@ pub const fn default_screen_sample_interval_ms() -> u64 {
     2 * 60 * 1000
 }
 
+pub const fn default_semantic_sample_interval_ms() -> u64 {
+    60 * 1000
+}
+
 pub fn default_screen_model() -> String {
     "gemma4:e2b".to_owned()
 }
@@ -180,6 +194,29 @@ pub struct ActivityRecordResult {
     pub session_id: Option<String>,
     #[serde(default)]
     pub screen_capture_allowed: bool,
+    #[serde(default)]
+    pub semantic_capture_allowed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SemanticCaptureCandidate {
+    pub session_id: String,
+    pub app_id: String,
+    pub app_name: String,
+    pub window_title: String,
+    pub observed_at_ms: Option<i64>,
+    pub quality: String,
+    pub visible_nodes: u32,
+    pub text_nodes: u32,
+    pub document_nodes: u32,
+    pub text_content: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SemanticCaptureResult {
+    pub outcome: String,
+    pub reason: Option<String>,
+    pub observation_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

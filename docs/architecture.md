@@ -87,19 +87,32 @@ begins. If its activity session closes while Ollama is still working, session en
 held until that observation completes or fails. Successful late context is appended to the
 canonical Remembrie and its replaceable search artifacts are rebuilt.
 
-Semantic Context begins as a compatibility preview rather than an automatic capture source.
-After explicit consent, the desktop app can enable GNOME's accessibility interface and gives
-the user five seconds to focus a chosen window. At the end of that countdown it reads the
-focused application identity and window title from the GNOME bridge, then scores only matching
-AT-SPI windows. Accessibility active/focused state is supporting evidence rather than the
-selector because applications can retain stale state after losing focus. An absent or tied
-match fails closed instead of inspecting a substitute window. The selected probe visits at
-most 500 nodes to a maximum depth of 14, collects only visible and showing nodes, and skips
-password-text nodes. It reads Accessible names, descriptions, roles, states, and
-supported-interface metadata; it never constructs or invokes Action or EditableText interfaces.
-Preview results remain in memory, are shown only in the app, and are not sent to the daemon or
-written to SQLite. This isolates real-world application testing from the later design of
-persistent semantic observations and their capture policy.
+Semantic Context is another separate opt-in layered on Activity Context. Enabling it requires
+explicit consent because GNOME's accessibility setting makes application-provided UI structure
+available to Membrie and other local accessibility tools. The capture helper checks that setting
+before every probe, reads the focused application identity and window title from the trusted GNOME
+bridge, then scores only matching AT-SPI windows. Accessibility active/focused state is supporting
+evidence rather than the selector because applications can retain stale state after losing focus.
+An absent or tied match fails closed instead of inspecting a substitute window.
+
+The selected probe has a 20-second deadline, visits at most 500 nodes to a maximum depth of 14,
+collects only visible and showing nodes, and skips password-text nodes. It reads Accessible names,
+descriptions, roles, states, and supported-interface metadata; it never constructs or invokes
+Action or EditableText interfaces. The daemon applies the same pause, source, exclusion, private-
+window, password-manager, secret, timestamp, and duplicate checks before a semantic observation
+can enter SQLite. Rejected content produces only a content-free ledger decision.
+
+Semantic and Screen Memory cooperate rather than blindly duplicating work. Rich semantic context
+suppresses Screen Memory until the next semantic interval. Partial context is stored but permits
+a visual fallback on the next desktop sample. Applications that do not expose usable AT-SPI data
+are remembered only in capture-helper memory for 15 minutes, during which Screen Memory may fill
+the gap. A policy-blocked semantic candidate never triggers a visual workaround. Semantic labels
+are explicitly described in the finished Activity Remembrie as evidence of what was visible, not
+proof that an action was completed.
+
+The five-second compatibility test remains available as a store-nothing diagnostic. Its result
+stays in app memory and is never sent to the daemon. Neither automatic Semantic Context nor the
+compatibility test invokes Ollama or any network service.
 
 ## Storage
 

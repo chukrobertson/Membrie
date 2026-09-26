@@ -16,4 +16,5 @@ anyhow.workspace = true
 gio = { version = "0.20.12", features = ["v2_80"] }
 glib = { version = "0.20.12", features = ["v2_80"] }
 gdk-pixbuf = "0.20.10"
+membrie-a11y = { path = "../membrie-a11y" }
 membrie-core = { path = "../membrie-core" }

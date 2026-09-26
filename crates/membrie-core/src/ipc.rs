@@ -2,6 +2,7 @@ use crate::model::{
     ActivityRecordResult, ActivitySnapshot, BackupInfo, BrieAnswer, CaptureCandidate,
     CaptureDecision, CaptureRule, CaptureStatus, IntelligenceSettings, IntelligenceStatus,
     NewRemembrie, PauseMode, Remembrie, ScreenCaptureCandidate, ScreenCaptureResult, SearchHit,
+    SemanticCaptureCandidate, SemanticCaptureResult,
 };
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -41,6 +42,12 @@ pub enum Request {
     SetActivityIdleThreshold {
         idle_threshold_ms: u64,
     },
+    SetSemanticEnabled {
+        enabled: bool,
+    },
+    SetSemanticSampleInterval {
+        sample_interval_ms: u64,
+    },
     SetScreenEnabled {
         enabled: bool,
     },
@@ -52,6 +59,9 @@ pub enum Request {
     },
     RecordActivity {
         snapshot: ActivitySnapshot,
+    },
+    RecordSemantic {
+        candidate: SemanticCaptureCandidate,
     },
     AnalyzeScreen {
         candidate: ScreenCaptureCandidate,
@@ -95,6 +105,7 @@ pub enum Response {
     PauseUpdated { status: CaptureStatus },
     CaptureSourceUpdated { status: CaptureStatus },
     ActivityRecorded { result: ActivityRecordResult },
+    SemanticRecorded { result: SemanticCaptureResult },
     ScreenAnalyzed { result: ScreenCaptureResult },
     ActivitySessionEnded,
     CaptureRules { rules: Vec<CaptureRule> },
@@ -274,6 +285,27 @@ impl DaemonClient {
         }
     }
 
+    pub fn set_semantic_enabled(&self, enabled: bool) -> Result<CaptureStatus, ClientError> {
+        match self.request(&Request::SetSemanticEnabled { enabled })? {
+            Response::CaptureSourceUpdated { status } => Ok(status),
+            other => Err(ClientError::Rejected(format!(
+                "unexpected response: {other:?}"
+            ))),
+        }
+    }
+
+    pub fn set_semantic_sample_interval(
+        &self,
+        sample_interval_ms: u64,
+    ) -> Result<CaptureStatus, ClientError> {
+        match self.request(&Request::SetSemanticSampleInterval { sample_interval_ms })? {
+            Response::CaptureSourceUpdated { status } => Ok(status),
+            other => Err(ClientError::Rejected(format!(
+                "unexpected response: {other:?}"
+            ))),
+        }
+    }
+
     pub fn set_screen_enabled(&self, enabled: bool) -> Result<CaptureStatus, ClientError> {
         match self.request(&Request::SetScreenEnabled { enabled })? {
             Response::CaptureSourceUpdated { status } => Ok(status),
@@ -312,6 +344,18 @@ impl DaemonClient {
     ) -> Result<ActivityRecordResult, ClientError> {
         match self.request(&Request::RecordActivity { snapshot })? {
             Response::ActivityRecorded { result } => Ok(result),
+            other => Err(ClientError::Rejected(format!(
+                "unexpected response: {other:?}"
+            ))),
+        }
+    }
+
+    pub fn record_semantic(
+        &self,
+        candidate: SemanticCaptureCandidate,
+    ) -> Result<SemanticCaptureResult, ClientError> {
+        match self.request(&Request::RecordSemantic { candidate })? {
+            Response::SemanticRecorded { result } => Ok(result),
             other => Err(ClientError::Rejected(format!(
                 "unexpected response: {other:?}"
             ))),
