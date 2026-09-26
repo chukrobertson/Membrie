@@ -25,6 +25,16 @@ enum TimelineMapMode {
     Month,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TimelineFilter {
+    All,
+    Observed,
+    Scheduled,
+    Notes,
+}
+
+const TIMELINE_FUTURE_DAYS: i32 = 366;
+
 fn main() -> gtk::glib::ExitCode {
     let application = adw::Application::builder()
         .application_id(APP_ID)
@@ -78,6 +88,8 @@ struct UiState {
     timeline_insight_label: gtk::Label,
     timeline_day_start_ms: Cell<i64>,
     timeline_map_mode: Cell<TimelineMapMode>,
+    timeline_filter: Cell<TimelineFilter>,
+    timeline_filter_summary: gtk::Label,
     timeline_target_id: RefCell<Option<String>>,
     search_results: gtk::ListBox,
     capture_rules: gtk::ListBox,
@@ -152,7 +164,7 @@ fn build_ui(application: &adw::Application) {
     timeline_day_label.set_hexpand(true);
     let timeline_next_button = gtk::Button::builder()
         .icon_name("go-next-symbolic")
-        .tooltip_text("Next day")
+        .tooltip_text("Next period, including upcoming scheduled events")
         .build();
     let timeline_today_button = gtk::Button::with_label("Today");
     let timeline_insight = gtk::Box::new(Orientation::Vertical, 5);
@@ -163,6 +175,11 @@ fn build_ui(application: &adw::Application) {
     timeline_insight_label.set_xalign(0.0);
     timeline_insight_label.set_wrap(true);
     let timeline_day_start_ms = local_today_start_ms();
+    let timeline_filter_summary = gtk::Label::new(None);
+    timeline_filter_summary.add_css_class("caption");
+    timeline_filter_summary.add_css_class("dim-label");
+    timeline_filter_summary.set_xalign(0.0);
+    timeline_filter_summary.set_hexpand(true);
     let search_results = memory_list();
     let capture_rules = memory_list();
     let privacy_stats = gtk::Label::new(None);
@@ -284,6 +301,8 @@ fn build_ui(application: &adw::Application) {
         timeline_insight_label,
         timeline_day_start_ms: Cell::new(timeline_day_start_ms),
         timeline_map_mode: Cell::new(TimelineMapMode::Week),
+        timeline_filter: Cell::new(TimelineFilter::All),
+        timeline_filter_summary,
         timeline_target_id: RefCell::new(None),
         search_results,
         capture_rules,
@@ -827,7 +846,7 @@ fn build_timeline_page(state: &Rc<UiState>) -> gtk::Widget {
     day_navigation.add_css_class("timeline-day-navigation");
     let previous = gtk::Button::builder()
         .icon_name("go-previous-symbolic")
-        .tooltip_text("Previous day")
+        .tooltip_text("Previous period")
         .build();
     let state_for_previous = Rc::clone(state);
     previous.connect_clicked(move |_| {
@@ -845,11 +864,12 @@ fn build_timeline_page(state: &Rc<UiState>) -> gtk::Widget {
     state.timeline_next_button.connect_clicked(move |_| {
         let selected = state_for_next.timeline_day_start_ms.get();
         let today = local_today_start_ms();
-        if selected < today {
+        let last_upcoming_day = add_local_days(today, TIMELINE_FUTURE_DAYS);
+        if selected < last_upcoming_day {
             state_for_next.timeline_target_id.borrow_mut().take();
             state_for_next.timeline_day_start_ms.set(
                 shift_timeline_period(selected, state_for_next.timeline_map_mode.get(), 1)
-                    .min(today),
+                    .min(last_upcoming_day),
             );
             *state_for_next.timeline_render_key.borrow_mut() = None;
             refresh_timeline(&state_for_next);
@@ -1004,10 +1024,46 @@ fn build_timeline_page(state: &Rc<UiState>) -> gtk::Widget {
     manual_capture.add_css_class("manual-capture");
     page.append(&manual_capture);
 
+    let chronology_top = gtk::Box::new(Orientation::Horizontal, 8);
     let recent = gtk::Label::new(Some("Chronology"));
     recent.add_css_class("heading");
     recent.set_xalign(0.0);
-    page.append(&recent);
+    recent.set_hexpand(true);
+    let filters = gtk::Box::new(Orientation::Horizontal, 0);
+    filters.add_css_class("linked");
+    let all_filter = gtk::ToggleButton::with_label("All");
+    let observed_filter = gtk::ToggleButton::with_label("Observed");
+    let scheduled_filter = gtk::ToggleButton::with_label("Scheduled");
+    let notes_filter = gtk::ToggleButton::with_label("Notes");
+    observed_filter.set_group(Some(&all_filter));
+    scheduled_filter.set_group(Some(&all_filter));
+    notes_filter.set_group(Some(&all_filter));
+    all_filter.set_active(true);
+    for (button, filter) in [
+        (all_filter.clone(), TimelineFilter::All),
+        (observed_filter.clone(), TimelineFilter::Observed),
+        (scheduled_filter.clone(), TimelineFilter::Scheduled),
+        (notes_filter.clone(), TimelineFilter::Notes),
+    ] {
+        let state_for_filter = Rc::clone(state);
+        button.connect_toggled(move |button| {
+            if !button.is_active() || state_for_filter.timeline_filter.get() == filter {
+                return;
+            }
+            state_for_filter.timeline_filter.set(filter);
+            state_for_filter.timeline_target_id.borrow_mut().take();
+            *state_for_filter.timeline_render_key.borrow_mut() = None;
+            refresh_timeline(&state_for_filter);
+        });
+    }
+    filters.append(&all_filter);
+    filters.append(&observed_filter);
+    filters.append(&scheduled_filter);
+    filters.append(&notes_filter);
+    chronology_top.append(&recent);
+    chronology_top.append(&filters);
+    page.append(&chronology_top);
+    page.append(&state.timeline_filter_summary);
     page.append(&state.timeline);
 
     gtk::ScrolledWindow::builder()
@@ -1888,7 +1944,8 @@ fn memory_list() -> gtk::ListBox {
 
 fn refresh_timeline(state: &Rc<UiState>) {
     let today = local_today_start_ms();
-    let day_start = state.timeline_day_start_ms.get().min(today);
+    let last_upcoming_day = add_local_days(today, TIMELINE_FUTURE_DAYS);
+    let day_start = state.timeline_day_start_ms.get().min(last_upcoming_day);
     state.timeline_day_start_ms.set(day_start);
     let day_end = add_local_days(day_start, 1);
     let map_mode = state.timeline_map_mode.get();
@@ -1904,18 +1961,39 @@ fn refresh_timeline(state: &Rc<UiState>) {
         });
     match result {
         Ok((slices, entries)) => {
-            let key = timeline_render_key(day_start, map_mode, &slices, &entries);
+            let filter = state.timeline_filter.get();
+            let key = timeline_render_key(day_start, map_mode, filter, &slices, &entries);
             if state.timeline_render_key.borrow().as_deref() == Some(&key) {
                 return;
             }
+            let visible_entries: Vec<TimelineEntry> = entries
+                .iter()
+                .filter(|entry| timeline_filter_matches(filter, &entry.kind))
+                .cloned()
+                .collect();
             render_timeline_map(state, &slices, day_start, map_mode, map_start, map_end);
             render_timeline_ribbon(state, &entries, day_start, day_end);
-            render_timeline_entries(&state.timeline, state, &entries);
+            render_timeline_entries(
+                &state.timeline,
+                state,
+                &visible_entries,
+                filter,
+                entries.len(),
+            );
             render_timeline_insight(state, &entries);
+            state
+                .timeline_filter_summary
+                .set_text(&timeline_filter_summary(
+                    filter,
+                    visible_entries.len(),
+                    entries.len(),
+                ));
             state
                 .timeline_day_label
                 .set_text(&format_timeline_day(day_start, today));
-            state.timeline_next_button.set_sensitive(day_start < today);
+            state
+                .timeline_next_button
+                .set_sensitive(day_start < last_upcoming_day);
             state
                 .timeline_today_button
                 .set_sensitive(day_start != today);
@@ -1935,11 +2013,12 @@ fn refresh_timeline(state: &Rc<UiState>) {
 fn timeline_render_key(
     day_start: i64,
     map_mode: TimelineMapMode,
+    filter: TimelineFilter,
     slices: &[TimelineMapSlice],
     entries: &[TimelineEntry],
 ) -> String {
     let mut key = format!(
-        "{day_start}:{map_mode:?}:{}:{}",
+        "{day_start}:{map_mode:?}:{filter:?}:{}:{}",
         slices.len(),
         entries.len()
     );
@@ -3745,14 +3824,58 @@ fn render_capture_rules(list: &gtk::ListBox, state: &Rc<UiState>, rules: &[Captu
     }
 }
 
-fn render_timeline_entries(list: &gtk::ListBox, state: &Rc<UiState>, entries: &[TimelineEntry]) {
+fn timeline_filter_matches(filter: TimelineFilter, kind: &str) -> bool {
+    match filter {
+        TimelineFilter::All => true,
+        TimelineFilter::Observed => !matches!(kind, "calendar" | "note"),
+        TimelineFilter::Scheduled => kind == "calendar",
+        TimelineFilter::Notes => kind == "note",
+    }
+}
+
+fn timeline_filter_summary(filter: TimelineFilter, visible: usize, total: usize) -> String {
+    if total == 0 {
+        return "No Remembries stored on this day".to_owned();
+    }
+    if filter == TimelineFilter::All {
+        return format!("{total} Remembries · exact evidence is available on every entry");
+    }
+    format!(
+        "{visible} of {total} Remembries shown · {}",
+        match filter {
+            TimelineFilter::Observed => "captured evidence from computer activity",
+            TimelineFilter::Scheduled => "planned calendar evidence, not proof of attendance",
+            TimelineFilter::Notes => "Remembries written manually",
+            TimelineFilter::All => unreachable!(),
+        }
+    )
+}
+
+fn render_timeline_entries(
+    list: &gtk::ListBox,
+    state: &Rc<UiState>,
+    entries: &[TimelineEntry],
+    filter: TimelineFilter,
+    unfiltered_count: usize,
+) {
     clear_list(list);
     if entries.is_empty() {
-        render_error(
-            list,
-            "Nothing remembered on this day",
-            "Choose another day, or create a manual Remembrie above.",
-        );
+        if unfiltered_count == 0 {
+            render_error(
+                list,
+                "Nothing remembered on this day",
+                "Choose another day, look ahead for scheduled events, or create a manual Remembrie above.",
+            );
+        } else {
+            render_error(
+                list,
+                "Nothing in this view",
+                &format!(
+                    "This day has other Remembries. Choose All or another filter instead of {}.",
+                    timeline_filter_name(filter)
+                ),
+            );
+        }
         return;
     }
     let target_id = state.timeline_target_id.borrow().clone();
@@ -3772,9 +3895,21 @@ fn render_timeline_entries(list: &gtk::ListBox, state: &Rc<UiState>, entries: &[
     }
 }
 
+fn timeline_filter_name(filter: TimelineFilter) -> &'static str {
+    match filter {
+        TimelineFilter::All => "All",
+        TimelineFilter::Observed => "Observed",
+        TimelineFilter::Scheduled => "Scheduled",
+        TimelineFilter::Notes => "Notes",
+    }
+}
+
 fn timeline_entry_row(state: &Rc<UiState>, entry: &TimelineEntry) -> gtk::ListBoxRow {
     let row = gtk::ListBoxRow::new();
     row.set_activatable(false);
+    if entry.kind == "calendar" {
+        row.add_css_class("timeline-scheduled-entry");
+    }
     let outer = gtk::Box::new(Orientation::Horizontal, 0);
     let primary_app = entry
         .activity
@@ -3797,6 +3932,29 @@ fn timeline_entry_row(state: &Rc<UiState>, entry: &TimelineEntry) -> gtk::ListBo
     content.set_margin_bottom(14);
     content.set_margin_start(14);
     content.set_margin_end(14);
+
+    let provenance = gtk::Box::new(Orientation::Horizontal, 7);
+    let kind = gtk::Label::new(Some(timeline_evidence_type(&entry.kind)));
+    kind.add_css_class("timeline-evidence-badge");
+    kind.add_css_class(if entry.kind == "calendar" {
+        "timeline-evidence-scheduled"
+    } else {
+        "timeline-evidence-observed"
+    });
+    let source = gtk::Label::new(Some(
+        entry
+            .source_app
+            .as_deref()
+            .unwrap_or("Unknown local source"),
+    ));
+    source.add_css_class("caption");
+    source.add_css_class("dim-label");
+    source.set_xalign(0.0);
+    source.set_hexpand(true);
+    source.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    provenance.append(&kind);
+    provenance.append(&source);
+    content.append(&provenance);
 
     let top = gtk::Box::new(Orientation::Horizontal, 8);
     let title = gtk::Label::new(Some(&entry.title));
@@ -3884,6 +4042,15 @@ fn timeline_entry_row(state: &Rc<UiState>, entry: &TimelineEntry) -> gtk::ListBo
         content.append(&detail);
     }
 
+    if matches!(entry.kind.as_str(), "calendar" | "screen" | "semantic") {
+        let caution = gtk::Label::new(Some(timeline_evidence_caution(&entry.kind)));
+        caution.add_css_class("caption");
+        caution.add_css_class("timeline-evidence-caution");
+        caution.set_xalign(0.0);
+        caution.set_wrap(true);
+        content.append(&caution);
+    }
+
     let evidence_button = gtk::Button::with_label("Show exact evidence");
     evidence_button.add_css_class("flat");
     evidence_button.set_halign(Align::Start);
@@ -3896,6 +4063,34 @@ fn timeline_entry_row(state: &Rc<UiState>, entry: &TimelineEntry) -> gtk::ListBo
     outer.append(&content);
     row.set_child(Some(&outer));
     row
+}
+
+fn timeline_evidence_type(kind: &str) -> &'static str {
+    match kind {
+        "activity" => "OBSERVED SESSION",
+        "calendar" => "SCHEDULED",
+        "clipboard" => "CAPTURED CLIPBOARD",
+        "screen" => "MACHINE-DESCRIBED SCREEN",
+        "semantic" => "APPLICATION CONTEXT",
+        "note" => "MANUAL NOTE",
+        _ => "REMEMBRIE",
+    }
+}
+
+fn timeline_evidence_caution(kind: &str) -> &'static str {
+    match kind {
+        "calendar" => "Scheduled locally—not evidence that the event happened or was attended.",
+        "screen" => "Machine-described visible context may be incomplete or mistaken.",
+        "semantic" => {
+            "Application-provided visible context—not proof that an action was completed."
+        }
+        "activity" => {
+            "Observed window focus and duration—not proof of intent, productivity, or completion."
+        }
+        "clipboard" => "Captured text shows what was copied, not how it was used.",
+        "note" => "Written manually rather than observed automatically.",
+        _ => "Stored local evidence; inspect the exact source before drawing a conclusion.",
+    }
 }
 
 fn show_remembrance_evidence(
@@ -3911,6 +4106,50 @@ fn show_remembrance_evidence(
             } else {
                 remembrie.body.clone()
             };
+            let content = gtk::Box::new(Orientation::Vertical, 10);
+            content.set_size_request(680, -1);
+            let metadata = gtk::Box::new(Orientation::Vertical, 5);
+            metadata.add_css_class("evidence-metadata");
+            metadata.append(&evidence_metadata_row(
+                "Evidence type",
+                timeline_evidence_type(&remembrie.kind),
+            ));
+            metadata.append(&evidence_metadata_row("Local source", source));
+            metadata.append(&evidence_metadata_row(
+                "Evidence time",
+                &format_evidence_time(&remembrie),
+            ));
+            metadata.append(&evidence_metadata_row(
+                "Stored locally",
+                &format_timestamp(remembrie.created_at_ms),
+            ));
+            content.append(&metadata);
+
+            let caution = gtk::Label::new(Some(timeline_evidence_caution(&remembrie.kind)));
+            caution.add_css_class("evidence-interpretation");
+            caution.set_xalign(0.0);
+            caution.set_wrap(true);
+            content.append(&caution);
+
+            if let Some(summary) = remembrie
+                .summary
+                .as_deref()
+                .filter(|summary| !summary.trim().is_empty())
+            {
+                let summary_heading = gtk::Label::new(Some("Local summary"));
+                summary_heading.add_css_class("heading");
+                summary_heading.set_xalign(0.0);
+                let summary = gtk::Label::new(Some(summary));
+                summary.set_xalign(0.0);
+                summary.set_wrap(true);
+                content.append(&summary_heading);
+                content.append(&summary);
+            }
+
+            let exact_heading = gtk::Label::new(Some("Exact stored evidence"));
+            exact_heading.add_css_class("heading");
+            exact_heading.set_xalign(0.0);
+            content.append(&exact_heading);
             let evidence = gtk::Label::new(Some(&body));
             evidence.set_xalign(0.0);
             evidence.set_yalign(0.0);
@@ -3920,16 +4159,14 @@ fn show_remembrance_evidence(
             let scroll = gtk::ScrolledWindow::builder()
                 .hscrollbar_policy(gtk::PolicyType::Never)
                 .min_content_width(680)
-                .min_content_height(420)
+                .min_content_height(320)
                 .child(&evidence)
                 .build();
+            content.append(&scroll);
             let dialog = adw::AlertDialog::builder()
                 .heading(&remembrie.title)
-                .body(format!(
-                    "{} · {source}",
-                    format_timestamp(remembrie.occurred_at_ms)
-                ))
-                .extra_child(&scroll)
+                .body("Evidence and interpretation stay on this PC")
+                .extra_child(&content)
                 .build();
             dialog.add_response("close", "Close");
             dialog.set_default_response(Some("close"));
@@ -3951,6 +4188,34 @@ fn show_remembrance_evidence(
             dialog.add_response("close", "Close");
             dialog.present(Some(parent));
         }
+    }
+}
+
+fn evidence_metadata_row(label: &str, value: &str) -> gtk::Box {
+    let row = gtk::Box::new(Orientation::Horizontal, 8);
+    let label = gtk::Label::new(Some(label));
+    label.add_css_class("caption");
+    label.add_css_class("dim-label");
+    label.set_xalign(0.0);
+    label.set_size_request(120, -1);
+    let value = gtk::Label::new(Some(value));
+    value.set_xalign(0.0);
+    value.set_wrap(true);
+    value.set_selectable(true);
+    value.set_hexpand(true);
+    row.append(&label);
+    row.append(&value);
+    row
+}
+
+fn format_evidence_time(remembrie: &Remembrie) -> String {
+    match remembrie.ended_at_ms {
+        Some(ended_at_ms) if ended_at_ms > remembrie.occurred_at_ms => format!(
+            "{} to {}",
+            format_timestamp(remembrie.occurred_at_ms),
+            format_timestamp(ended_at_ms)
+        ),
+        _ => format_timestamp(remembrie.occurred_at_ms),
     }
 }
 
@@ -4281,7 +4546,15 @@ fn display_map_app_name(app_id: &str, app_name: &str) -> String {
 }
 
 fn format_timeline_day(day_start: i64, today: i64) -> String {
-    let prefix = if day_start == today { "Today · " } else { "" };
+    let prefix = if day_start == today {
+        "Today · "
+    } else if day_start == add_local_days(today, 1) {
+        "Tomorrow · "
+    } else if day_start > today {
+        "Upcoming · "
+    } else {
+        ""
+    };
     gtk::glib::DateTime::from_unix_local(day_start / 1000)
         .and_then(|date| date.format("%A, %B %-d"))
         .map(|date| format!("{prefix}{date}"))
@@ -4408,6 +4681,26 @@ fn install_css() {
          .timeline-app-dot { min-width: 10px; min-height: 10px; border-radius: 999px; }
          .timeline-app-chip { padding: 4px 8px; border-radius: 999px; }
          .timeline-entry-accent { min-width: 5px; }
+         .timeline-scheduled-entry {
+             background: color-mix(in srgb, @view_bg_color 90%, #e5a50a 10%);
+         }
+         .timeline-evidence-badge {
+             padding: 3px 7px;
+             border-radius: 999px;
+             font-size: 0.78em;
+             font-weight: 700;
+         }
+         .timeline-evidence-observed {
+             background: alpha(@accent_bg_color, 0.14);
+             color: @accent_color;
+         }
+         .timeline-evidence-scheduled {
+             background: alpha(#e5a50a, 0.20);
+             color: color-mix(in srgb, @window_fg_color 68%, #e5a50a 32%);
+         }
+         .timeline-evidence-caution {
+             color: color-mix(in srgb, @window_fg_color 72%, #e5a50a 28%);
+         }
          .timeline-entry-target {
              background: alpha(@accent_bg_color, 0.13);
              border: 2px solid @accent_bg_color;
@@ -4420,6 +4713,16 @@ fn install_css() {
          }
          .manual-capture { padding: 10px 14px; }
          .manual-capture-content { padding: 12px 2px 2px 2px; }
+         .evidence-metadata {
+             padding: 10px 12px;
+             border-radius: 9px;
+             background: alpha(@window_fg_color, 0.06);
+         }
+         .evidence-interpretation {
+             padding: 10px 12px;
+             border-left: 4px solid #e5a50a;
+             background: alpha(#e5a50a, 0.12);
+         }
          .app-fill-0 { background: alpha(#7459c7, 0.22); border-color: #7459c7; }
          .app-fill-1 { background: alpha(#3584e4, 0.22); border-color: #3584e4; }
          .app-fill-2 { background: alpha(#2ec27e, 0.22); border-color: #2ec27e; }
@@ -4442,4 +4745,41 @@ fn install_css() {
         &provider,
         gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn timeline_filters_keep_evidence_categories_distinct() {
+        assert!(timeline_filter_matches(TimelineFilter::All, "calendar"));
+        assert!(timeline_filter_matches(
+            TimelineFilter::Observed,
+            "activity"
+        ));
+        assert!(timeline_filter_matches(
+            TimelineFilter::Observed,
+            "clipboard"
+        ));
+        assert!(!timeline_filter_matches(
+            TimelineFilter::Observed,
+            "calendar"
+        ));
+        assert!(timeline_filter_matches(
+            TimelineFilter::Scheduled,
+            "calendar"
+        ));
+        assert!(timeline_filter_matches(TimelineFilter::Notes, "note"));
+    }
+
+    #[test]
+    fn scheduled_evidence_never_claims_attendance() {
+        assert_eq!(timeline_evidence_type("calendar"), "SCHEDULED");
+        assert!(timeline_evidence_caution("calendar").contains("not evidence"));
+        assert!(
+            timeline_filter_summary(TimelineFilter::Scheduled, 2, 5)
+                .contains("not proof of attendance")
+        );
+    }
 }

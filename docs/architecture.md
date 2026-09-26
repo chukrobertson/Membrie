@@ -173,6 +173,12 @@ inside retrieved content, and its structured response must identify supporting s
 numbers. Membrie validates those numbers and withholds unsupported answers rather than
 displaying uncited model output.
 
+Brie's retrieval context includes the canonical kind and local source for every record. Her system
+boundary treats calendar records as plans, activity records as focus/time evidence, clipboard
+records as copied text, manual notes as user-authored recollection, and visual descriptions as
+fallible machine output. Claims of sending, attending, or completing something require explicit
+support from observed evidence rather than inference from a schedule or open window.
+
 ## Retrieval
 
 The hybrid retrieval pipeline is:
@@ -202,6 +208,12 @@ on demand from the daemon, keeping the normal Timeline response compact. Lightwe
 context observations are deterministic and evidence-linked; they are phrased as patterns worth
 noticing rather than claims about intent or task completion. Relationship data remains available
 to Search and Brie without requiring a separate constellation interface.
+
+The chronology can separate observed records, scheduled calendar records, and manually authored
+notes, and it permits bounded navigation into the same one-year future window used by the calendar
+adapter. Every exact-evidence view names the local source, evidence type, event time, storage time,
+and an interpretation warning. A scheduled event is never presented as proof of attendance or
+completion.
 
 Brie's citations use the same Remembrie identity as the Timeline. Opening a citation selects the
 source's local calendar day, highlights and scrolls to that entry, and loads its exact evidence

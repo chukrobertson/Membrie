@@ -761,7 +761,10 @@ impl Repository {
                  FROM remembries
                  WHERE deleted_at_ms IS NULL
                    AND occurred_at_ms < ?2
-                   AND MAX(occurred_at_ms, COALESCE(ended_at_ms, occurred_at_ms)) >= ?1
+                   AND (
+                       occurred_at_ms >= ?1
+                       OR MAX(occurred_at_ms, COALESCE(ended_at_ms, occurred_at_ms)) > ?1
+                   )
                  ORDER BY occurred_at_ms
                  LIMIT 500",
             )?;
@@ -3944,6 +3947,29 @@ mod tests {
         assert_eq!(result.skipped_private, 1);
         assert_eq!(result.event_count, 0);
         assert!(repository.list_recent(10).unwrap().is_empty());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn timeline_does_not_repeat_an_event_that_ended_at_midnight() {
+        let path = temporary_database("timeline-boundary");
+        let mut repository = Repository::open(&path).unwrap();
+        repository.set_calendar_enabled(true).unwrap();
+        let generated = 1_800_000_000_000_i64;
+        let day_start = generated + 86_400_000;
+        let mut previous = calendar_event(day_start - 3_600_000, "Previous day", "Ends here");
+        previous.ends_at_ms = day_start;
+        let mut current = calendar_event(day_start, "Current day", "Starts here");
+        current.event_uid = "event-2".to_owned();
+        repository
+            .sync_calendar_snapshot(&calendar_snapshot(generated, vec![previous, current]))
+            .unwrap();
+
+        let entries = repository
+            .timeline_day(day_start, day_start + 86_400_000)
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].title, "Current day");
         let _ = fs::remove_file(path);
     }
 

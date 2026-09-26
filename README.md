@@ -19,6 +19,8 @@ The project is intentionally local-only:
 - Manual Remembrie capture
 - Day, week, and month activity maps with stable application colors and day-by-day chronology
 - Color-grouped application time ribbon with idle gaps, stable app colors, and exact evidence
+- Timeline filters for observed activity, scheduled events, and manual notes, including upcoming days
+- Evidence inspection that states each source's provenance and what it can—and cannot—prove
 - Evidence-backed repeated-context observations without productivity scoring
 - Exact full-text search powered by SQLite FTS5/BM25
 - Persistent pause state
@@ -44,6 +46,7 @@ The project is intentionally local-only:
 - Restart-safe local summary and embedding jobs
 - Hybrid exact-text and semantic search with `embeddinggemma`
 - Brie answers powered by local `gemma4:12b`, with exact Remembrie citations
+- Evidence-aware Brie reasoning that separates scheduled plans, observed activity, copied text, and notes
 - Brie citations open the matching Timeline day, highlight the source, and show its exact evidence
 - Quick Brie compact window for local recall and note capture without leaving the current workflow
 - Opt-in read-only GNOME Calendar integration with recurring-event expansion and local reconciliation
