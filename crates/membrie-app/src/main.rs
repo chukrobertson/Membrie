@@ -42,7 +42,7 @@ fn main() -> gtk::glib::ExitCode {
     application.connect_activate(activate_main_ui);
     application.connect_command_line(|application, command_line| {
         if command_line.options_dict().contains("quick") {
-            show_quick_brie(application);
+            toggle_quick_brie(application);
         } else {
             application.activate();
         }
@@ -375,13 +375,17 @@ fn build_ui(application: &adw::Application) {
     window.present();
 }
 
-fn show_quick_brie(application: &adw::Application) {
+fn toggle_quick_brie(application: &adw::Application) {
     if let Some(window) = application
         .windows()
         .into_iter()
         .find(|window| window.widget_name() == "membrie-quick-window")
     {
-        window.present();
+        if window.is_active() {
+            window.close();
+        } else {
+            window.present();
+        }
         return;
     }
 
@@ -411,9 +415,17 @@ fn show_quick_brie(application: &adw::Application) {
         .icon_name("go-next-symbolic")
         .build();
     open_membrie.add_css_class("flat");
+    let close_button = gtk::Button::builder()
+        .icon_name("window-close-symbolic")
+        .tooltip_text("Close Quick Brie")
+        .build();
+    close_button.add_css_class("flat");
     heading.append(&titles);
     heading.append(&open_membrie);
-    content.append(&heading);
+    heading.append(&close_button);
+    let window_handle = gtk::WindowHandle::new();
+    window_handle.set_child(Some(&heading));
+    content.append(&window_handle);
 
     let context = gtk::Label::new(Some(&quick_context_description(desktop_target.as_ref())));
     context.add_css_class("quick-context");
@@ -478,6 +490,9 @@ fn show_quick_brie(application: &adw::Application) {
         .content(&content)
         .build();
     window.set_widget_name("membrie-quick-window");
+
+    let window_for_close = window.clone();
+    close_button.connect_clicked(move |_| window_for_close.close());
 
     let key_controller = gtk::EventControllerKey::new();
     let window_for_escape = window.clone();

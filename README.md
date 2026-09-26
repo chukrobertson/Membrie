@@ -70,7 +70,8 @@ user, adds it to the Ubuntu app grid, installs the GNOME desktop bridge, and sta
 the local daemon and capture helper automatically at login. A new GNOME extension may
 need one log out and back in before desktop context and clipboard capture become available.
 The same bridge registers `Super+Shift+B` for Quick Brie. The compact window receives only the
-previous application's name and window title as optional search context; press `Esc` to close it.
+previous application's name and window title as optional search context. Drag its header to move
+it; press `Esc`, its close button, or the shortcut again while it has focus to close it.
 
 Brie requires a local Ollama installation and two downloaded models. The recommended
 defaults are:

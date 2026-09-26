@@ -20,8 +20,9 @@ grid and its local background services will start at login.
 
 After the GNOME bridge has loaded, press `Super+Shift+B` to open Quick Brie over the current
 workflow. GNOME launches a normal compact GTK window with a valid activation token rather than an
-unsupported always-on-top surface. Press `Esc` to close it. Quick Brie can also be opened from the
-Membrie launcher's context menu.
+unsupported always-on-top surface. Its header is draggable. Press `Esc`, its close button, or the
+shortcut again while Quick Brie has focus to close it; when another window covers it, the shortcut
+brings it forward. Quick Brie can also be opened from the Membrie launcher's context menu.
 
 The installer places files in:
 
