@@ -26,10 +26,41 @@ enum TimelineMapMode {
 }
 
 fn main() -> gtk::glib::ExitCode {
-    let application = adw::Application::builder().application_id(APP_ID).build();
+    let application = adw::Application::builder()
+        .application_id(APP_ID)
+        .flags(gtk::gio::ApplicationFlags::HANDLES_COMMAND_LINE)
+        .build();
+    application.add_main_option(
+        "quick",
+        b'\0'.into(),
+        gtk::glib::OptionFlags::NONE,
+        gtk::glib::OptionArg::None,
+        "Open Quick Brie",
+        None,
+    );
     application.connect_startup(|_| install_css());
-    application.connect_activate(build_ui);
+    application.connect_activate(activate_main_ui);
+    application.connect_command_line(|application, command_line| {
+        if command_line.options_dict().contains("quick") {
+            show_quick_brie(application);
+        } else {
+            application.activate();
+        }
+        0
+    });
     application.run()
+}
+
+fn activate_main_ui(application: &adw::Application) {
+    if let Some(window) = application
+        .windows()
+        .into_iter()
+        .find(|window| window.widget_name() == "membrie-main-window")
+    {
+        window.present();
+        return;
+    }
+    build_ui(application);
 }
 
 #[derive(Clone)]
@@ -313,6 +344,7 @@ fn build_ui(application: &adw::Application) {
         .default_height(760)
         .content(&toast_overlay)
         .build();
+    window.set_widget_name("membrie-main-window");
 
     refresh_clipboard_bridge(&state);
     refresh_semantic_status(&state);
@@ -341,6 +373,298 @@ fn build_ui(application: &adw::Application) {
         gtk::glib::ControlFlow::Continue
     });
     window.present();
+}
+
+fn show_quick_brie(application: &adw::Application) {
+    if let Some(window) = application
+        .windows()
+        .into_iter()
+        .find(|window| window.widget_name() == "membrie-quick-window")
+    {
+        window.present();
+        return;
+    }
+
+    let client = DaemonClient::new(socket_path());
+    let desktop_target = focused_semantic_target().ok();
+    let content = gtk::Box::new(Orientation::Vertical, 10);
+    content.add_css_class("quick-brie");
+    content.set_margin_top(16);
+    content.set_margin_bottom(16);
+    content.set_margin_start(18);
+    content.set_margin_end(18);
+
+    let heading = gtk::Box::new(Orientation::Horizontal, 8);
+    let titles = gtk::Box::new(Orientation::Vertical, 1);
+    titles.set_hexpand(true);
+    let title = gtk::Label::new(Some("Quick Brie"));
+    title.add_css_class("page-title");
+    title.set_xalign(0.0);
+    let privacy = gtk::Label::new(Some("Private · Ollama on this PC"));
+    privacy.add_css_class("caption");
+    privacy.add_css_class("dim-label");
+    privacy.set_xalign(0.0);
+    titles.append(&title);
+    titles.append(&privacy);
+    let open_membrie = gtk::Button::builder()
+        .label("Open Membrie")
+        .icon_name("go-next-symbolic")
+        .build();
+    open_membrie.add_css_class("flat");
+    heading.append(&titles);
+    heading.append(&open_membrie);
+    content.append(&heading);
+
+    let context = gtk::Label::new(Some(&quick_context_description(desktop_target.as_ref())));
+    context.add_css_class("quick-context");
+    context.set_xalign(0.0);
+    context.set_wrap(true);
+    content.append(&context);
+
+    let messages = memory_list();
+    append_brie_message(
+        &messages,
+        "Brie",
+        "Ask me without leaving your work. I will still cite the Remembries behind my answer.",
+        &[],
+        None,
+    );
+    let conversation = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vexpand(true)
+        .min_content_height(220)
+        .max_content_height(420)
+        .child(&messages)
+        .build();
+    conversation.add_css_class("quick-conversation");
+    content.append(&conversation);
+
+    let status = gtk::Label::new(Some("Checking local intelligence…"));
+    status.add_css_class("caption");
+    status.add_css_class("dim-label");
+    status.set_xalign(0.0);
+    status.set_wrap(true);
+    content.append(&status);
+
+    let input_row = gtk::Box::new(Orientation::Horizontal, 8);
+    let entry = gtk::Entry::builder()
+        .placeholder_text("Ask Brie or write something to remember…")
+        .hexpand(true)
+        .build();
+    let ask_button = gtk::Button::with_label("Ask Brie");
+    ask_button.add_css_class("suggested-action");
+    input_row.append(&entry);
+    input_row.append(&ask_button);
+    content.append(&input_row);
+
+    let actions = gtk::Box::new(Orientation::Horizontal, 8);
+    let remember_button = gtk::Button::with_label("Remember as a note");
+    remember_button.add_css_class("flat");
+    let hint = gtk::Label::new(Some("Esc closes Quick Brie"));
+    hint.add_css_class("caption");
+    hint.add_css_class("dim-label");
+    hint.set_hexpand(true);
+    hint.set_xalign(1.0);
+    actions.append(&remember_button);
+    actions.append(&hint);
+    content.append(&actions);
+
+    let window = adw::ApplicationWindow::builder()
+        .application(application)
+        .title("Quick Brie")
+        .default_width(680)
+        .default_height(520)
+        .resizable(true)
+        .content(&content)
+        .build();
+    window.set_widget_name("membrie-quick-window");
+
+    let key_controller = gtk::EventControllerKey::new();
+    let window_for_escape = window.clone();
+    key_controller.connect_key_pressed(move |_, key, _, _| {
+        if key == gtk::gdk::Key::Escape {
+            window_for_escape.close();
+            gtk::glib::Propagation::Stop
+        } else {
+            gtk::glib::Propagation::Proceed
+        }
+    });
+    window.add_controller(key_controller);
+
+    let application_for_open = application.clone();
+    let window_for_open = window.clone();
+    open_membrie.connect_clicked(move |_| {
+        application_for_open.activate();
+        window_for_open.close();
+    });
+
+    let ready = client
+        .intelligence_status()
+        .map(|intelligence| intelligence.ollama_available && intelligence.total_remembries > 0)
+        .unwrap_or(false);
+    ask_button.set_sensitive(ready);
+    if ready {
+        status.set_text("Brie is ready · answers and evidence stay on this PC");
+    } else {
+        status.set_text("Brie is not ready yet · open Membrie to check local intelligence");
+    }
+
+    let busy = Rc::new(Cell::new(false));
+    let ask: Rc<dyn Fn()> = {
+        let client = client.clone();
+        let desktop_target = desktop_target.clone();
+        let messages = messages.clone();
+        let conversation = conversation.clone();
+        let entry = entry.clone();
+        let ask_button = ask_button.clone();
+        let remember_button = remember_button.clone();
+        let status = status.clone();
+        let busy = Rc::clone(&busy);
+        Rc::new(move || {
+            let question = entry.text().trim().to_owned();
+            if question.is_empty() || !ask_button.is_sensitive() || busy.replace(true) {
+                return;
+            }
+            entry.set_text("");
+            entry.set_sensitive(false);
+            ask_button.set_sensitive(false);
+            remember_button.set_sensitive(false);
+            ask_button.set_label("Thinking…");
+            status.set_text("Brie is checking your local Remembries…");
+            append_brie_message(&messages, "You", &question, &[], None);
+            scroll_list_to_bottom(&conversation);
+
+            let question = quick_contextual_question(&question, desktop_target.as_ref());
+            let client_for_worker = client.clone();
+            let (sender, receiver) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = sender.send(client_for_worker.ask_brie(question));
+            });
+
+            let messages = messages.clone();
+            let conversation = conversation.clone();
+            let entry = entry.clone();
+            let ask_button = ask_button.clone();
+            let remember_button = remember_button.clone();
+            let status = status.clone();
+            let busy = Rc::clone(&busy);
+            gtk::glib::timeout_add_local(Duration::from_millis(100), move || {
+                match receiver.try_recv() {
+                    Ok(Ok(answer)) => {
+                        append_brie_message(
+                            &messages,
+                            "Brie",
+                            &answer.answer,
+                            &answer.citations,
+                            None,
+                        );
+                        status.set_text("Answered locally · select a citation to inspect it");
+                        finish_quick_brie_request(&entry, &ask_button, &remember_button, &busy);
+                        scroll_list_to_bottom(&conversation);
+                        gtk::glib::ControlFlow::Break
+                    }
+                    Ok(Err(error)) => {
+                        append_brie_message(
+                            &messages,
+                            "Brie",
+                            &format!("I couldn't complete that locally: {error}"),
+                            &[],
+                            None,
+                        );
+                        status.set_text("The local request could not finish");
+                        finish_quick_brie_request(&entry, &ask_button, &remember_button, &busy);
+                        scroll_list_to_bottom(&conversation);
+                        gtk::glib::ControlFlow::Break
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        status.set_text("Brie's local worker stopped unexpectedly");
+                        finish_quick_brie_request(&entry, &ask_button, &remember_button, &busy);
+                        gtk::glib::ControlFlow::Break
+                    }
+                }
+            });
+        })
+    };
+    let ask_from_button = Rc::clone(&ask);
+    ask_button.connect_clicked(move |_| ask_from_button());
+    let ask_from_entry = Rc::clone(&ask);
+    entry.connect_activate(move |_| ask_from_entry());
+
+    let client_for_note = client.clone();
+    let entry_for_note = entry.clone();
+    let status_for_note = status.clone();
+    let desktop_target_for_note = desktop_target.clone();
+    remember_button.connect_clicked(move |_| {
+        let note = entry_for_note.text().trim().to_owned();
+        if note.is_empty() {
+            status_for_note.set_text("Write something first, then remember it as a note");
+            return;
+        }
+        let title = desktop_target_for_note
+            .as_ref()
+            .map(|target| format!("Quick note · {}", quick_app_name(target)))
+            .unwrap_or_else(|| "Quick note".to_owned());
+        match client_for_note.create(NewRemembrie::manual(&title, &note)) {
+            Ok(_) => {
+                entry_for_note.set_text("");
+                status_for_note.set_text("Quick Remembrie saved locally");
+            }
+            Err(error) => status_for_note.set_text(&format!("Could not save locally: {error}")),
+        }
+    });
+
+    window.present();
+    entry.grab_focus();
+}
+
+fn finish_quick_brie_request(
+    entry: &gtk::Entry,
+    ask_button: &gtk::Button,
+    remember_button: &gtk::Button,
+    busy: &Cell<bool>,
+) {
+    busy.set(false);
+    entry.set_sensitive(true);
+    ask_button.set_sensitive(true);
+    ask_button.set_label("Ask Brie");
+    remember_button.set_sensitive(true);
+    entry.grab_focus();
+}
+
+fn quick_app_name(target: &WindowTarget) -> &str {
+    if target.app_name.trim().is_empty() {
+        target.app_id.trim()
+    } else {
+        target.app_name.trim()
+    }
+}
+
+fn quick_context_description(target: Option<&WindowTarget>) -> String {
+    let Some(target) = target else {
+        return "No previous window context was available; Brie will search your Remembries normally."
+            .to_owned();
+    };
+    let app = quick_app_name(target);
+    if target.window_title.trim().is_empty() {
+        format!("Opened from {app} · only this application identity is added as search context")
+    } else {
+        format!(
+            "Opened from {app} · {} · only this title is added as search context",
+            target.window_title.trim()
+        )
+    }
+}
+
+fn quick_contextual_question(question: &str, target: Option<&WindowTarget>) -> String {
+    let Some(target) = target else {
+        return question.to_owned();
+    };
+    format!(
+        "{question}\n\nCurrent desktop context, use only when relevant: application '{}', window title '{}'.",
+        quick_app_name(target),
+        target.window_title.trim()
+    )
 }
 
 fn build_header(state: &Rc<UiState>) -> adw::HeaderBar {
@@ -3814,6 +4138,17 @@ fn install_css() {
     let provider = gtk::CssProvider::new();
     provider.load_from_data(
         ".content-root { background: @window_bg_color; }
+         .quick-brie { background: @window_bg_color; }
+         .quick-context {
+             padding: 8px 10px;
+             border-radius: 8px;
+             background: alpha(@accent_bg_color, 0.10);
+         }
+         .quick-conversation {
+             border: 1px solid @borders;
+             border-radius: 10px;
+             background: @view_bg_color;
+         }
          .sidebar {
              background: color-mix(in srgb, @headerbar_bg_color 92%, @accent_bg_color 8%);
              border-right: 1px solid @borders;

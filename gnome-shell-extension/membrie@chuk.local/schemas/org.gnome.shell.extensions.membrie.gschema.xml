@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist>
+  <schema id="org.gnome.shell.extensions.membrie" path="/org/gnome/shell/extensions/membrie/">
+    <key name="quick-brie" type="as">
+      <default>['&lt;Super&gt;&lt;Shift&gt;b']</default>
+      <summary>Open Quick Brie</summary>
+      <description>Global shortcut that opens Membrie's compact local assistant.</description>
+    </key>
+  </schema>
+</schemalist>

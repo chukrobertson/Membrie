@@ -45,6 +45,7 @@ The project is intentionally local-only:
 - Hybrid exact-text and semantic search with `embeddinggemma`
 - Brie answers powered by local `gemma4:12b`, with exact Remembrie citations
 - Brie citations open the matching Timeline day, highlight the source, and show its exact evidence
+- Quick Brie compact window for local recall and note capture without leaving the current workflow
 - Local model selection and visible indexing health
 
 Dedicated OCR, optional retained evidence controls, and deeper pattern detection are the next
@@ -68,6 +69,8 @@ The installer never uses `sudo`. It builds Membrie, installs it only for the cur
 user, adds it to the Ubuntu app grid, installs the GNOME desktop bridge, and starts
 the local daemon and capture helper automatically at login. A new GNOME extension may
 need one log out and back in before desktop context and clipboard capture become available.
+The same bridge registers `Super+Shift+B` for Quick Brie. The compact window receives only the
+previous application's name and window title as optional search context; press `Esc` to close it.
 
 Brie requires a local Ollama installation and two downloaded models. The recommended
 defaults are:

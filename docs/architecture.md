@@ -18,6 +18,14 @@ protocol. There is deliberately no TCP listener in the MVP.
 The desktop app is a client. Capture adapters will also be clients, which prevents
 Wayland- or application-specific capture code from gaining direct database access.
 
+Quick Brie is a second, compact GTK application window in the same single-instance desktop client.
+The GNOME bridge owns only its global shortcut and launches the app through GNOME's normal
+activation path; it does not render assistant UI inside Shell. Before presenting the compact
+window, the client may read the previously focused application's identity and title from the same
+local bridge and append that limited metadata to the user's retrieval question. No live window
+contents are read by Quick Brie. The compact client still reaches Brie exclusively through the
+daemon's private Unix socket and loopback-only Ollama pipeline.
+
 ## Safe capture boundary
 
 Automatic candidates are evaluated in daemon memory before persistence. The order is:

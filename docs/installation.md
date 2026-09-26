@@ -18,6 +18,11 @@ and installs Membrie for the current user. Log out and back in once if GNOME say
 desktop bridge is queued rather than active. Membrie will then appear in the app
 grid and its local background services will start at login.
 
+After the GNOME bridge has loaded, press `Super+Shift+B` to open Quick Brie over the current
+workflow. GNOME launches a normal compact GTK window with a valid activation token rather than an
+unsupported always-on-top surface. Press `Esc` to close it. Quick Brie can also be opened from the
+Membrie launcher's context menu.
+
 The installer places files in:
 
 - `~/.local/bin` and `~/.local/libexec/membrie` for the application programs;

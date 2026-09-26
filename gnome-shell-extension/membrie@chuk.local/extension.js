@@ -344,9 +344,41 @@ class ClipboardBridge {
 export default class MembrieClipboardExtension extends Extension {
     enable() {
         this._bridge = new ClipboardBridge();
+        this._settings = this.getSettings();
+        Main.wm.addKeybinding(
+            'quick-brie',
+            this._settings,
+            Meta.KeyBindingFlags.IGNORE_AUTOREPEAT,
+            Shell.ActionMode.NORMAL | Shell.ActionMode.OVERVIEW,
+            this._openQuickBrie.bind(this)
+        );
+    }
+
+    _openQuickBrie() {
+        try {
+            const executable = GLib.build_filenamev([
+                GLib.get_home_dir(),
+                '.local',
+                'bin',
+                'membrie',
+            ]);
+            const command = `${GLib.shell_quote(executable)} --quick`;
+            const appInfo = Gio.AppInfo.create_from_commandline(
+                command,
+                'Quick Brie',
+                Gio.AppInfoCreateFlags.SUPPORTS_STARTUP_NOTIFICATION
+            );
+            const context = global.create_app_launch_context(0, -1);
+            appInfo.launch([], context);
+        } catch (error) {
+            logError(error, 'Membrie could not open Quick Brie');
+            Main.notify('Membrie', 'Quick Brie could not be opened');
+        }
     }
 
     disable() {
+        Main.wm.removeKeybinding('quick-brie');
+        this._settings = null;
         this._bridge?.destroy();
         this._bridge = null;
     }

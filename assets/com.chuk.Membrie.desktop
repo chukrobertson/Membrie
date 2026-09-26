@@ -10,3 +10,8 @@ Terminal=false
 Categories=Utility;
 Keywords=memory;recall;notes;clipboard;local;
 StartupNotify=true
+Actions=QuickBrie;
+
+[Desktop Action QuickBrie]
+Name=Quick Brie
+Exec=@MEMBRIE_EXEC@ --quick

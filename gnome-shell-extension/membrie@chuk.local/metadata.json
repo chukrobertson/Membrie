@@ -1,6 +1,7 @@
 {
   "uuid": "membrie@chuk.local",
   "name": "Membrie Desktop Bridge",
-  "description": "Local-only GNOME Shell bridge for Membrie. It provides clipboard text and focused desktop context, and can provide one-shot active-window samples to Membrie's local capture service. It has no network code.",
+  "description": "Local-only GNOME Shell bridge for Membrie. It provides clipboard text, focused desktop context, one-shot active-window samples, and the Quick Brie shortcut. It has no network code.",
+  "settings-schema": "org.gnome.shell.extensions.membrie",
   "shell-version": ["50"]
 }
