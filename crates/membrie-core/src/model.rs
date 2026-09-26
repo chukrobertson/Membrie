@@ -18,6 +18,43 @@ pub struct Remembrie {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TimelineHistorySpan {
+    pub kind: String,
+    pub started_at_ms: i64,
+    pub ended_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TimelineActivityObservation {
+    pub observed_at_ms: i64,
+    pub app_id: String,
+    pub app_name: String,
+    pub window_title: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TimelineActivitySummary {
+    pub end_reason: String,
+    pub observation_count: u64,
+    pub observations: Vec<TimelineActivityObservation>,
+    pub semantic_observation_count: u64,
+    pub screen_observation_count: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TimelineEntry {
+    pub id: String,
+    pub kind: String,
+    pub started_at_ms: i64,
+    pub ended_at_ms: i64,
+    pub source_app: Option<String>,
+    pub window_title: Option<String>,
+    pub title: String,
+    pub summary: Option<String>,
+    pub activity: Option<TimelineActivitySummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct NewRemembrie {
     pub kind: String,
     pub title: String,

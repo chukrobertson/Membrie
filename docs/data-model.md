@@ -22,6 +22,11 @@ Semantic observations and completed screen descriptions become labeled sections 
 Activity Remembrie when its session closes. They are supporting context rather than independent
 claims that an action occurred. Disabling Activity Context also disables both dependent sources.
 
+The visual Timeline does not create another canonical table. History cells, per-application
+duration ribbons, and repeated-context observations are derived on demand from Remembries,
+activity sessions, and their observations. This keeps colors and presentation replaceable while
+the original evidence remains authoritative.
+
 ## Derived records
 
 - `remembrie_fts`: replaceable full-text projection

@@ -2,7 +2,7 @@ use crate::model::{
     ActivityRecordResult, ActivitySnapshot, BackupInfo, BrieAnswer, CaptureCandidate,
     CaptureDecision, CaptureRule, CaptureStatus, IntelligenceSettings, IntelligenceStatus,
     NewRemembrie, PauseMode, Remembrie, ScreenCaptureCandidate, ScreenCaptureResult, SearchHit,
-    SemanticCaptureCandidate, SemanticCaptureResult,
+    SemanticCaptureCandidate, SemanticCaptureResult, TimelineEntry, TimelineHistorySpan,
 };
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -25,6 +25,17 @@ pub enum Request {
     },
     ListRecent {
         limit: u32,
+    },
+    GetRemembrie {
+        id: String,
+    },
+    TimelineHistory {
+        since_ms: i64,
+        until_ms: i64,
+    },
+    TimelineDay {
+        start_ms: i64,
+        end_ms: i64,
     },
     Search {
         query: String,
@@ -101,6 +112,9 @@ pub enum Response {
     Created { remembrie: Remembrie },
     CaptureResult { decision: CaptureDecision },
     Remembries { remembries: Vec<Remembrie> },
+    Remembrie { remembrie: Option<Remembrie> },
+    TimelineHistory { spans: Vec<TimelineHistorySpan> },
+    TimelineDay { entries: Vec<TimelineEntry> },
     SearchResults { hits: Vec<SearchHit> },
     PauseUpdated { status: CaptureStatus },
     CaptureSourceUpdated { status: CaptureStatus },
@@ -221,6 +235,41 @@ impl DaemonClient {
     pub fn list_recent(&self, limit: u32) -> Result<Vec<Remembrie>, ClientError> {
         match self.request(&Request::ListRecent { limit })? {
             Response::Remembries { remembries } => Ok(remembries),
+            other => Err(ClientError::Rejected(format!(
+                "unexpected response: {other:?}"
+            ))),
+        }
+    }
+
+    pub fn get_remembrie(&self, id: impl Into<String>) -> Result<Option<Remembrie>, ClientError> {
+        match self.request(&Request::GetRemembrie { id: id.into() })? {
+            Response::Remembrie { remembrie } => Ok(remembrie),
+            other => Err(ClientError::Rejected(format!(
+                "unexpected response: {other:?}"
+            ))),
+        }
+    }
+
+    pub fn timeline_history(
+        &self,
+        since_ms: i64,
+        until_ms: i64,
+    ) -> Result<Vec<TimelineHistorySpan>, ClientError> {
+        match self.request(&Request::TimelineHistory { since_ms, until_ms })? {
+            Response::TimelineHistory { spans } => Ok(spans),
+            other => Err(ClientError::Rejected(format!(
+                "unexpected response: {other:?}"
+            ))),
+        }
+    }
+
+    pub fn timeline_day(
+        &self,
+        start_ms: i64,
+        end_ms: i64,
+    ) -> Result<Vec<TimelineEntry>, ClientError> {
+        match self.request(&Request::TimelineDay { start_ms, end_ms })? {
+            Response::TimelineDay { entries } => Ok(entries),
             other => Err(ClientError::Rejected(format!(
                 "unexpected response: {other:?}"
             ))),

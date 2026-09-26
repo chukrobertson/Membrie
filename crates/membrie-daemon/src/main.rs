@@ -154,6 +154,15 @@ fn dispatch_database(request: Request, repository: &Mutex<Repository>) -> Result
         Request::ListRecent { limit } => Ok(Response::Remembries {
             remembries: repository.list_recent(limit)?,
         }),
+        Request::GetRemembrie { id } => Ok(Response::Remembrie {
+            remembrie: repository.get(&id)?,
+        }),
+        Request::TimelineHistory { since_ms, until_ms } => Ok(Response::TimelineHistory {
+            spans: repository.timeline_history(since_ms, until_ms)?,
+        }),
+        Request::TimelineDay { start_ms, end_ms } => Ok(Response::TimelineDay {
+            entries: repository.timeline_day(start_ms, end_ms)?,
+        }),
         Request::SetPause { mode } => Ok(Response::PauseUpdated {
             status: with_capture_health(repository.set_pause(mode)?),
         }),

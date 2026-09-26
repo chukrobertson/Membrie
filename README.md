@@ -13,11 +13,13 @@ The project is intentionally local-only:
 
 ## What works today
 
-- Native GTK 4/libadwaita shell with Timeline, Search, Brie, and Constellation views
+- Native GTK 4/libadwaita shell with Timeline, Search, Brie, and Privacy views
 - Local daemon with a small typed JSON protocol over a Unix socket
 - SQLite schema for Remembries, content, relationships, embeddings, and processing jobs
 - Manual Remembrie capture
-- Recent timeline
+- Visual twelve-week history map and day-by-day chronology
+- Color-grouped application time ribbon with idle gaps, stable app colors, and exact evidence
+- Evidence-backed repeated-context observations without productivity scoring
 - Exact full-text search powered by SQLite FTS5/BM25
 - Persistent pause state
 - Safe, explicitly enabled clipboard capture through a local GNOME Shell bridge
@@ -30,7 +32,7 @@ The project is intentionally local-only:
 - A five-second “Remember this screen” control for deliberate one-off capture
 - Temporary PNGs removed from disk before their pixels are analyzed in memory by a selected loopback Ollama vision model
 - Machine-described screen context is explicitly labeled as fallible evidence for Brie
-- In-progress screen analysis survives an activity-session boundary and joins that Remembrance before local indexing
+- In-progress screen analysis survives an activity-session boundary and joins that Remembrie before local indexing
 - Activity sessions become searchable, cited Remembries without recording keyboard or pointer input
 - Pre-storage secret detection and duplicate suppression
 - Built-in password-manager and private-window exclusions
@@ -44,8 +46,8 @@ The project is intentionally local-only:
 - Brie answers powered by local `gemma4:12b`, with exact Remembrie citations
 - Local model selection and visible indexing health
 
-Dedicated OCR, optional retained evidence controls, richer citation navigation, and the
-interactive constellation are the next implementation milestones.
+Dedicated OCR, optional retained evidence controls, deeper pattern detection, and direct
+Brie citation navigation into exact Timeline evidence are the next implementation milestones.
 
 ## Install on Ubuntu
 

@@ -4,9 +4,11 @@ use membrie_a11y::{ProbeSummary, WindowTarget};
 use membrie_core::{
     ActivitySnapshot, BrieAnswer, BrieCitation, CaptureRule, CaptureStatus, DaemonClient,
     IntelligenceSettings, IntelligenceStatus, LocalModel, NewRemembrie, PauseMode, Remembrie,
-    ScreenCaptureCandidate, ScreenCaptureResult, SearchHit, socket_path,
+    ScreenCaptureCandidate, ScreenCaptureResult, SearchHit, TimelineActivityObservation,
+    TimelineEntry, TimelineHistorySpan, socket_path,
 };
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::fs;
 use std::rc::Rc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -27,6 +29,16 @@ fn main() -> gtk::glib::ExitCode {
 struct UiState {
     client: DaemonClient,
     timeline: gtk::ListBox,
+    timeline_history_grid: gtk::Grid,
+    timeline_ribbon_grid: gtk::Grid,
+    timeline_ribbon_axis: gtk::Box,
+    timeline_app_legend: gtk::FlowBox,
+    timeline_day_label: gtk::Label,
+    timeline_next_button: gtk::Button,
+    timeline_today_button: gtk::Button,
+    timeline_insight: gtk::Box,
+    timeline_insight_label: gtk::Label,
+    timeline_day_start_ms: Cell<i64>,
     search_results: gtk::ListBox,
     capture_rules: gtk::ListBox,
     privacy_stats: gtk::Label,
@@ -65,7 +77,7 @@ struct UiState {
     intelligence_refreshing: Cell<bool>,
     intelligence_settings: RefCell<Option<IntelligenceSettings>>,
     available_models: RefCell<Vec<LocalModel>>,
-    timeline_ids: RefCell<Option<Vec<String>>>,
+    timeline_render_key: RefCell<Option<String>>,
     status_label: gtk::Label,
     pause_button: gtk::MenuButton,
     toast_overlay: adw::ToastOverlay,
@@ -74,6 +86,39 @@ struct UiState {
 fn build_ui(application: &adw::Application) {
     let client = DaemonClient::new(socket_path());
     let timeline = memory_list();
+    let timeline_history_grid = gtk::Grid::builder()
+        .column_spacing(4)
+        .row_spacing(4)
+        .column_homogeneous(true)
+        .build();
+    timeline_history_grid.add_css_class("timeline-history-grid");
+    let timeline_ribbon_grid = gtk::Grid::builder().column_homogeneous(true).build();
+    timeline_ribbon_grid.add_css_class("timeline-ribbon-grid");
+    let timeline_ribbon_axis = gtk::Box::new(Orientation::Horizontal, 0);
+    timeline_ribbon_axis.set_homogeneous(true);
+    let timeline_app_legend = gtk::FlowBox::builder()
+        .selection_mode(gtk::SelectionMode::None)
+        .column_spacing(8)
+        .row_spacing(6)
+        .max_children_per_line(6)
+        .build();
+    let timeline_day_label = gtk::Label::new(None);
+    timeline_day_label.add_css_class("page-title");
+    timeline_day_label.set_xalign(0.0);
+    timeline_day_label.set_hexpand(true);
+    let timeline_next_button = gtk::Button::builder()
+        .icon_name("go-next-symbolic")
+        .tooltip_text("Next day")
+        .build();
+    let timeline_today_button = gtk::Button::with_label("Today");
+    let timeline_insight = gtk::Box::new(Orientation::Vertical, 5);
+    timeline_insight.add_css_class("card");
+    timeline_insight.add_css_class("timeline-insight");
+    timeline_insight.set_visible(false);
+    let timeline_insight_label = gtk::Label::new(None);
+    timeline_insight_label.set_xalign(0.0);
+    timeline_insight_label.set_wrap(true);
+    let timeline_day_start_ms = local_today_start_ms();
     let search_results = memory_list();
     let capture_rules = memory_list();
     let privacy_stats = gtk::Label::new(None);
@@ -176,6 +221,16 @@ fn build_ui(application: &adw::Application) {
     let state = Rc::new(UiState {
         client,
         timeline,
+        timeline_history_grid,
+        timeline_ribbon_grid,
+        timeline_ribbon_axis,
+        timeline_app_legend,
+        timeline_day_label,
+        timeline_next_button,
+        timeline_today_button,
+        timeline_insight,
+        timeline_insight_label,
+        timeline_day_start_ms: Cell::new(timeline_day_start_ms),
         search_results,
         capture_rules,
         privacy_stats,
@@ -214,7 +269,7 @@ fn build_ui(application: &adw::Application) {
         intelligence_refreshing: Cell::new(false),
         intelligence_settings: RefCell::new(None),
         available_models: RefCell::new(Vec::new()),
-        timeline_ids: RefCell::new(None),
+        timeline_render_key: RefCell::new(None),
         status_label,
         pause_button,
         toast_overlay: toast_overlay.clone(),
@@ -234,7 +289,6 @@ fn build_ui(application: &adw::Application) {
     stack.add_named(&build_timeline_page(&state), Some("timeline"));
     stack.add_named(&build_search_page(&state), Some("search"));
     stack.add_named(&build_brie_page(&state), Some("brie"));
-    stack.add_named(&build_constellation_page(), Some("constellation"));
     stack.add_named(&build_privacy_page(&state), Some("privacy"));
     content.append(&build_sidebar(&stack));
     content.append(&stack);
@@ -363,11 +417,6 @@ fn build_sidebar(stack: &gtk::Stack) -> gtk::Box {
         ("Timeline", "view-list-symbolic", "timeline"),
         ("Search", "system-search-symbolic", "search"),
         ("Brie", "avatar-default-symbolic", "brie"),
-        (
-            "Constellation",
-            "weather-clear-night-symbolic",
-            "constellation",
-        ),
     ] {
         let button = gtk::Button::builder()
             .label(label)
@@ -403,10 +452,93 @@ fn build_sidebar(stack: &gtk::Stack) -> gtk::Box {
 }
 
 fn build_timeline_page(state: &Rc<UiState>) -> gtk::Widget {
-    let page = page_shell("Timeline", "The moments Membrie has kept for you.");
+    let page = page_shell(
+        "Timeline",
+        "A chronological view of what Membrie observed, with exact evidence one step away.",
+    );
+
+    let day_navigation = gtk::Box::new(Orientation::Horizontal, 8);
+    day_navigation.add_css_class("timeline-day-navigation");
+    let previous = gtk::Button::builder()
+        .icon_name("go-previous-symbolic")
+        .tooltip_text("Previous day")
+        .build();
+    let state_for_previous = Rc::clone(state);
+    previous.connect_clicked(move |_| {
+        let day = add_local_days(state_for_previous.timeline_day_start_ms.get(), -1);
+        state_for_previous.timeline_day_start_ms.set(day);
+        *state_for_previous.timeline_render_key.borrow_mut() = None;
+        refresh_timeline(&state_for_previous);
+    });
+    let state_for_next = Rc::clone(state);
+    state.timeline_next_button.connect_clicked(move |_| {
+        let selected = state_for_next.timeline_day_start_ms.get();
+        let today = local_today_start_ms();
+        if selected < today {
+            state_for_next
+                .timeline_day_start_ms
+                .set(add_local_days(selected, 1).min(today));
+            *state_for_next.timeline_render_key.borrow_mut() = None;
+            refresh_timeline(&state_for_next);
+        }
+    });
+    let state_for_today = Rc::clone(state);
+    state.timeline_today_button.connect_clicked(move |_| {
+        state_for_today
+            .timeline_day_start_ms
+            .set(local_today_start_ms());
+        *state_for_today.timeline_render_key.borrow_mut() = None;
+        refresh_timeline(&state_for_today);
+    });
+    day_navigation.append(&previous);
+    day_navigation.append(&state.timeline_day_label);
+    day_navigation.append(&state.timeline_today_button);
+    day_navigation.append(&state.timeline_next_button);
+    page.append(&day_navigation);
+
+    let history_section = gtk::Box::new(Orientation::Vertical, 8);
+    history_section.add_css_class("timeline-section");
+    let history_heading = gtk::Label::new(Some("History map · 12 weeks"));
+    history_heading.add_css_class("heading");
+    history_heading.set_xalign(0.0);
+    let history_detail = gtk::Label::new(Some(
+        "Color intensity means remembered active time—not productivity, importance, or success.",
+    ));
+    history_detail.add_css_class("dim-label");
+    history_detail.set_xalign(0.0);
+    history_detail.set_wrap(true);
+    history_section.append(&history_heading);
+    history_section.append(&history_detail);
+    history_section.append(&state.timeline_history_grid);
+    page.append(&history_section);
+
+    let ribbon_section = gtk::Box::new(Orientation::Vertical, 7);
+    ribbon_section.add_css_class("timeline-section");
+    let ribbon_heading = gtk::Label::new(Some("Shape of the day"));
+    ribbon_heading.add_css_class("heading");
+    ribbon_heading.set_xalign(0.0);
+    let ribbon_detail = gtk::Label::new(Some(
+        "Application colors stay consistent. Durations are observed active time, with idle gaps left visible.",
+    ));
+    ribbon_detail.add_css_class("dim-label");
+    ribbon_detail.set_xalign(0.0);
+    ribbon_detail.set_wrap(true);
+    ribbon_section.append(&ribbon_heading);
+    ribbon_section.append(&ribbon_detail);
+    ribbon_section.append(&state.timeline_ribbon_axis);
+    ribbon_section.append(&state.timeline_ribbon_grid);
+    ribbon_section.append(&state.timeline_app_legend);
+    page.append(&ribbon_section);
+
+    let insight_heading = gtk::Label::new(Some("Pattern worth noticing"));
+    insight_heading.add_css_class("heading");
+    insight_heading.set_xalign(0.0);
+    state.timeline_insight.append(&insight_heading);
+    state.timeline_insight.append(&state.timeline_insight_label);
+    page.append(&state.timeline_insight);
+
     let capture = gtk::Box::new(Orientation::Vertical, 10);
-    capture.add_css_class("card");
-    capture.add_css_class("capture-card");
+    capture.add_css_class("manual-capture-content");
 
     let capture_heading = gtk::Label::new(Some("Create a Remembrie"));
     capture_heading.add_css_class("heading");
@@ -462,19 +594,27 @@ fn build_timeline_page(state: &Rc<UiState>) -> gtk::Widget {
     capture.append(&title_entry);
     capture.append(&body_frame);
     capture.append(&save);
-    page.append(&capture);
 
-    let recent = gtk::Label::new(Some("Recent Remembries"));
+    let manual_capture = gtk::Expander::builder()
+        .label("Create a Remembrie manually")
+        .child(&capture)
+        .build();
+    manual_capture.add_css_class("card");
+    manual_capture.add_css_class("manual-capture");
+    page.append(&manual_capture);
+
+    let recent = gtk::Label::new(Some("Chronology"));
     recent.add_css_class("heading");
     recent.set_xalign(0.0);
     page.append(&recent);
-    let scroll = gtk::ScrolledWindow::builder()
+    page.append(&state.timeline);
+
+    gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Never)
         .vexpand(true)
-        .child(&state.timeline)
-        .build();
-    page.append(&scroll);
-    page.upcast()
+        .child(&page)
+        .build()
+        .upcast()
 }
 
 fn build_search_page(state: &Rc<UiState>) -> gtk::Widget {
@@ -685,21 +825,6 @@ fn build_brie_page(state: &Rc<UiState>) -> gtk::Widget {
         .brie_models_button
         .connect_clicked(move |button| show_model_dialog(button, &state_for_models));
 
-    page.upcast()
-}
-
-fn build_constellation_page() -> gtk::Widget {
-    let page = page_shell(
-        "Constellation",
-        "Explore the people, topics, and moments connected through your memory.",
-    );
-    let empty = adw::StatusPage::builder()
-        .icon_name("weather-clear-night-symbolic")
-        .title("Your sky is still forming")
-        .description("Relationships and embeddings will turn Remembries into an explorable, evidence-linked constellation.")
-        .vexpand(true)
-        .build();
-    page.append(&empty);
     page.upcast()
 }
 
@@ -1301,25 +1426,330 @@ fn memory_list() -> gtk::ListBox {
 }
 
 fn refresh_timeline(state: &Rc<UiState>) {
-    match state.client.list_recent(100) {
-        Ok(remembries) => {
-            let ids: Vec<String> = remembries
-                .iter()
-                .map(|remembrie| remembrie.id.clone())
-                .collect();
-            if state.timeline_ids.borrow().as_ref() != Some(&ids) {
-                render_remembries(&state.timeline, &remembries);
-                *state.timeline_ids.borrow_mut() = Some(ids);
+    let today = local_today_start_ms();
+    let history_start = history_grid_start_ms(today);
+    let history_end = add_local_days(today, 1);
+    let day_start = state.timeline_day_start_ms.get().min(today);
+    state.timeline_day_start_ms.set(day_start);
+    let day_end = add_local_days(day_start, 1);
+    let result = state
+        .client
+        .timeline_history(history_start, history_end)
+        .and_then(|spans| {
+            state
+                .client
+                .timeline_day(day_start, day_end)
+                .map(|entries| (spans, entries))
+        });
+    match result {
+        Ok((spans, entries)) => {
+            let key = timeline_render_key(day_start, &spans, &entries);
+            if state.timeline_render_key.borrow().as_deref() == Some(&key) {
+                return;
             }
+            render_timeline_history(state, &spans, today, day_start);
+            render_timeline_ribbon(state, &entries, day_start, day_end);
+            render_timeline_entries(&state.timeline, state, &entries);
+            render_timeline_insight(state, &entries);
+            state
+                .timeline_day_label
+                .set_text(&format_timeline_day(day_start, today));
+            state.timeline_next_button.set_sensitive(day_start < today);
+            state
+                .timeline_today_button
+                .set_sensitive(day_start != today);
+            *state.timeline_render_key.borrow_mut() = Some(key);
         }
         Err(error) => {
-            *state.timeline_ids.borrow_mut() = None;
+            *state.timeline_render_key.borrow_mut() = None;
             render_error(
                 &state.timeline,
                 "Membrie daemon is not available",
                 &error.to_string(),
             );
         }
+    }
+}
+
+fn timeline_render_key(
+    day_start: i64,
+    spans: &[TimelineHistorySpan],
+    entries: &[TimelineEntry],
+) -> String {
+    let mut key = format!("{day_start}:{}:{}", spans.len(), entries.len());
+    for span in spans {
+        key.push_str(&format!(
+            ":{}:{}:{}",
+            span.kind, span.started_at_ms, span.ended_at_ms
+        ));
+    }
+    for entry in entries {
+        key.push_str(&format!(
+            ":{}:{}:{}",
+            entry.id, entry.started_at_ms, entry.ended_at_ms
+        ));
+        if let Some(activity) = &entry.activity {
+            key.push_str(&format!(
+                ":{}:{}:{}",
+                activity.observation_count,
+                activity.semantic_observation_count,
+                activity.screen_observation_count
+            ));
+        }
+    }
+    key
+}
+
+fn render_timeline_history(
+    state: &Rc<UiState>,
+    spans: &[TimelineHistorySpan],
+    today: i64,
+    selected_day: i64,
+) {
+    clear_grid(&state.timeline_history_grid);
+    for (row, label) in ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+        .iter()
+        .enumerate()
+    {
+        let label = gtk::Label::new(Some(label));
+        label.add_css_class("caption");
+        label.add_css_class("dim-label");
+        label.set_xalign(0.0);
+        state
+            .timeline_history_grid
+            .attach(&label, 0, row as i32, 1, 1);
+    }
+
+    let grid_start = history_grid_start_ms(today);
+    for offset in 0..84_i32 {
+        let day_start = add_local_days(grid_start, offset);
+        let day_end = add_local_days(day_start, 1);
+        let active_ms: i64 = spans
+            .iter()
+            .filter(|span| span.kind == "activity")
+            .map(|span| overlap_ms(span.started_at_ms, span.ended_at_ms, day_start, day_end))
+            .sum();
+        let level = match active_ms {
+            0 => 0,
+            1..1_800_000 => 1,
+            1_800_000..7_200_000 => 2,
+            7_200_000..14_400_000 => 3,
+            _ => 4,
+        };
+        let button = gtk::Button::new();
+        button.add_css_class("timeline-heat-cell");
+        button.add_css_class(&format!("timeline-heat-{level}"));
+        if day_start == selected_day {
+            button.add_css_class("timeline-heat-selected");
+        }
+        button.set_tooltip_text(Some(&format!(
+            "{} · {} observed active time",
+            format_day_short(day_start),
+            format_duration(active_ms)
+        )));
+        let state_for_day = Rc::clone(state);
+        button.connect_clicked(move |_| {
+            state_for_day.timeline_day_start_ms.set(day_start);
+            *state_for_day.timeline_render_key.borrow_mut() = None;
+            refresh_timeline(&state_for_day);
+        });
+        state
+            .timeline_history_grid
+            .attach(&button, 1 + offset / 7, offset % 7, 1, 1);
+    }
+}
+
+#[derive(Clone)]
+struct TimelineSlice {
+    started_at_ms: i64,
+    ended_at_ms: i64,
+    app_id: String,
+    app_name: String,
+    window_title: String,
+}
+
+fn timeline_slices(
+    entries: &[TimelineEntry],
+    range_start: i64,
+    range_end: i64,
+) -> Vec<TimelineSlice> {
+    let mut slices: Vec<TimelineSlice> = Vec::new();
+    for entry in entries {
+        let Some(activity) = &entry.activity else {
+            continue;
+        };
+        for (index, observation) in activity.observations.iter().enumerate() {
+            let next_at = activity
+                .observations
+                .get(index + 1)
+                .map(|next| next.observed_at_ms)
+                .unwrap_or(entry.ended_at_ms);
+            let started_at_ms = observation
+                .observed_at_ms
+                .max(entry.started_at_ms)
+                .max(range_start);
+            let ended_at_ms = next_at.min(entry.ended_at_ms).min(range_end);
+            if ended_at_ms <= started_at_ms {
+                continue;
+            }
+            let app_id = observation.app_id.trim().to_owned();
+            let app_name = if observation.app_name.trim().is_empty() {
+                if app_id.is_empty() {
+                    "Desktop".to_owned()
+                } else {
+                    app_id.clone()
+                }
+            } else {
+                observation.app_name.trim().to_owned()
+            };
+            if let Some(previous) = slices.last_mut()
+                && app_identity(&previous.app_id, &previous.app_name)
+                    == app_identity(&app_id, &app_name)
+                && previous.ended_at_ms >= started_at_ms
+            {
+                previous.ended_at_ms = previous.ended_at_ms.max(ended_at_ms);
+                previous.window_title = observation.window_title.clone();
+                continue;
+            }
+            slices.push(TimelineSlice {
+                started_at_ms,
+                ended_at_ms,
+                app_id,
+                app_name,
+                window_title: observation.window_title.clone(),
+            });
+        }
+    }
+    slices.sort_by_key(|slice| slice.started_at_ms);
+    slices
+}
+
+fn render_timeline_ribbon(
+    state: &UiState,
+    entries: &[TimelineEntry],
+    day_start: i64,
+    day_end: i64,
+) {
+    clear_grid(&state.timeline_ribbon_grid);
+    clear_box(&state.timeline_ribbon_axis);
+    clear_flow_box(&state.timeline_app_legend);
+
+    for label in ["12 AM", "6 AM", "Noon", "6 PM", "12 AM"] {
+        let label = gtk::Label::new(Some(label));
+        label.add_css_class("caption");
+        label.add_css_class("dim-label");
+        state.timeline_ribbon_axis.append(&label);
+    }
+
+    let track = gtk::Box::new(Orientation::Horizontal, 0);
+    track.add_css_class("timeline-ribbon-track");
+    track.set_size_request(-1, 42);
+    state.timeline_ribbon_grid.attach(&track, 0, 0, 96, 1);
+
+    let slices = timeline_slices(entries, day_start, day_end);
+    let mut app_totals: HashMap<String, (String, i64)> = HashMap::new();
+    for slice in &slices {
+        let day_duration = day_end - day_start;
+        let start = (((slice.started_at_ms - day_start) * 96) / day_duration).clamp(0, 95);
+        let end = ((((slice.ended_at_ms - day_start) * 96) + day_duration - 1) / day_duration)
+            .clamp(start + 1, 96);
+        let span = (end - start).max(1);
+        let color = app_color_index(&slice.app_id, &slice.app_name);
+        let segment = gtk::Box::new(Orientation::Horizontal, 0);
+        segment.add_css_class("timeline-ribbon-segment");
+        segment.add_css_class(&format!("app-fill-{color}"));
+        segment.set_tooltip_text(Some(&format!(
+            "{} · {}{}",
+            slice.app_name,
+            format_duration(slice.ended_at_ms - slice.started_at_ms),
+            if slice.window_title.trim().is_empty() {
+                String::new()
+            } else {
+                format!(" · {}", slice.window_title.trim())
+            }
+        )));
+        if span >= 10 {
+            let label = gtk::Label::new(Some(&slice.app_name));
+            label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+            label.set_margin_start(5);
+            label.set_margin_end(5);
+            segment.append(&label);
+        }
+        state
+            .timeline_ribbon_grid
+            .attach(&segment, start as i32, 0, span as i32, 1);
+        let identity = app_identity(&slice.app_id, &slice.app_name);
+        let total = app_totals
+            .entry(identity)
+            .or_insert_with(|| (slice.app_name.clone(), 0));
+        total.1 += slice.ended_at_ms - slice.started_at_ms;
+    }
+
+    if slices.is_empty() {
+        let empty = gtk::Label::new(Some("No completed activity sessions for this day"));
+        empty.add_css_class("dim-label");
+        empty.set_margin_top(10);
+        empty.set_margin_bottom(10);
+        state.timeline_ribbon_grid.attach(&empty, 0, 0, 96, 1);
+    }
+
+    let mut totals: Vec<(String, String, i64)> = app_totals
+        .into_iter()
+        .map(|(identity, (name, duration))| (identity, name, duration))
+        .collect();
+    totals.sort_by_key(|item| std::cmp::Reverse(item.2));
+    for (identity, name, duration) in totals.into_iter().take(12) {
+        let item = gtk::Box::new(Orientation::Horizontal, 6);
+        item.add_css_class("timeline-legend-item");
+        let dot = gtk::Box::new(Orientation::Horizontal, 0);
+        dot.add_css_class("timeline-app-dot");
+        dot.add_css_class(&format!("app-solid-{}", app_color_index(&identity, &name)));
+        let label = gtk::Label::new(Some(&format!("{name} · {}", format_duration(duration))));
+        label.add_css_class("caption");
+        item.append(&dot);
+        item.append(&label);
+        state.timeline_app_legend.insert(&item, -1);
+    }
+}
+
+fn render_timeline_insight(state: &UiState, entries: &[TimelineEntry]) {
+    let mut returns: HashMap<(String, String), (String, String, u32)> = HashMap::new();
+    for entry in entries {
+        let Some(activity) = &entry.activity else {
+            continue;
+        };
+        for observation in &activity.observations {
+            let title = observation.window_title.trim();
+            if title.is_empty() {
+                continue;
+            }
+            let app = if observation.app_name.trim().is_empty() {
+                observation.app_id.trim()
+            } else {
+                observation.app_name.trim()
+            };
+            let key = (app.to_ascii_lowercase(), title.to_ascii_lowercase());
+            let value = returns
+                .entry(key)
+                .or_insert_with(|| (app.to_owned(), title.to_owned(), 0));
+            value.2 += 1;
+        }
+    }
+    let insight = returns
+        .into_iter()
+        .filter(|(_, (_, _, count))| *count >= 3)
+        .max_by_key(|(_, (_, _, count))| *count)
+        .map(|(_, (app, title, count))| {
+            format!(
+                "You returned to “{}” {count} times in {app}. This is evidence of repeated context—not proof of an unfinished task. Brie can use the supporting Remembries if you ask.",
+                truncate_display_text(&title, 120)
+            )
+        });
+    if let Some(insight) = insight {
+        state.timeline_insight_label.set_text(&insight);
+        state.timeline_insight.set_visible(true);
+    } else {
+        state.timeline_insight.set_visible(false);
     }
 }
 
@@ -2545,18 +2975,196 @@ fn render_capture_rules(list: &gtk::ListBox, state: &Rc<UiState>, rules: &[Captu
     }
 }
 
-fn render_remembries(list: &gtk::ListBox, remembries: &[Remembrie]) {
+fn render_timeline_entries(list: &gtk::ListBox, state: &Rc<UiState>, entries: &[TimelineEntry]) {
     clear_list(list);
-    if remembries.is_empty() {
+    if entries.is_empty() {
         render_error(
             list,
-            "No Remembries yet",
-            "Create one above. It will stay entirely on this computer.",
+            "Nothing remembered on this day",
+            "Choose another day, or create a manual Remembrie above.",
         );
         return;
     }
-    for remembrie in remembries {
-        list.append(&remembrie_row(remembrie, None));
+    for entry in entries {
+        list.append(&timeline_entry_row(state, entry));
+    }
+}
+
+fn timeline_entry_row(state: &Rc<UiState>, entry: &TimelineEntry) -> gtk::ListBoxRow {
+    let row = gtk::ListBoxRow::new();
+    row.set_activatable(false);
+    let outer = gtk::Box::new(Orientation::Horizontal, 0);
+    let primary_app = entry
+        .activity
+        .as_ref()
+        .and_then(|activity| activity.observations.first())
+        .map(|observation| (observation.app_id.as_str(), observation.app_name.as_str()))
+        .unwrap_or_else(|| {
+            let source = entry.source_app.as_deref().unwrap_or("Membrie");
+            (source, source)
+        });
+    let color = app_color_index(primary_app.0, primary_app.1);
+    let accent = gtk::Box::new(Orientation::Vertical, 0);
+    accent.add_css_class("timeline-entry-accent");
+    accent.add_css_class(&format!("app-solid-{color}"));
+    outer.append(&accent);
+
+    let content = gtk::Box::new(Orientation::Vertical, 7);
+    content.set_hexpand(true);
+    content.set_margin_top(14);
+    content.set_margin_bottom(14);
+    content.set_margin_start(14);
+    content.set_margin_end(14);
+
+    let top = gtk::Box::new(Orientation::Horizontal, 8);
+    let title = gtk::Label::new(Some(&entry.title));
+    title.add_css_class("heading");
+    title.set_xalign(0.0);
+    title.set_hexpand(true);
+    title.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    let time = gtk::Label::new(Some(&format_entry_time(entry)));
+    time.add_css_class("caption");
+    time.add_css_class("dim-label");
+    top.append(&title);
+    top.append(&time);
+    content.append(&top);
+
+    if let Some(activity) = &entry.activity {
+        let durations = activity_app_durations(entry);
+        if !durations.is_empty() {
+            let apps = gtk::FlowBox::builder()
+                .selection_mode(gtk::SelectionMode::None)
+                .column_spacing(6)
+                .row_spacing(5)
+                .max_children_per_line(8)
+                .build();
+            for (identity, name, duration) in durations.into_iter().take(8) {
+                let chip = gtk::Box::new(Orientation::Horizontal, 5);
+                chip.add_css_class("timeline-app-chip");
+                chip.add_css_class(&format!("app-fill-{}", app_color_index(&identity, &name)));
+                let dot = gtk::Box::new(Orientation::Horizontal, 0);
+                dot.add_css_class("timeline-app-dot");
+                dot.add_css_class(&format!("app-solid-{}", app_color_index(&identity, &name)));
+                let label =
+                    gtk::Label::new(Some(&format!("{name} · {}", format_duration(duration))));
+                label.add_css_class("caption");
+                chip.append(&dot);
+                chip.append(&label);
+                apps.insert(&chip, -1);
+            }
+            content.append(&apps);
+        }
+
+        let description = entry.summary.clone().unwrap_or_else(|| {
+            let app_count = activity_app_durations(entry).len();
+            format!(
+                "{} application or window changes across {app_count} {}.",
+                activity.observation_count,
+                if app_count == 1 {
+                    "application"
+                } else {
+                    "applications"
+                }
+            )
+        });
+        if !description.trim().is_empty() {
+            let summary = gtk::Label::new(Some(&description));
+            summary.set_xalign(0.0);
+            summary.set_wrap(true);
+            summary.set_lines(3);
+            summary.set_ellipsize(gtk::pango::EllipsizeMode::End);
+            content.append(&summary);
+        }
+
+        let evidence = gtk::Label::new(Some(&format!(
+            "{} focus changes · {} semantic observations · {} screen observations · ended {}",
+            activity.observation_count,
+            activity.semantic_observation_count,
+            activity.screen_observation_count,
+            activity_end_label(&activity.end_reason)
+        )));
+        evidence.add_css_class("caption");
+        evidence.add_css_class("dim-label");
+        evidence.set_xalign(0.0);
+        evidence.set_wrap(true);
+        content.append(&evidence);
+    } else {
+        let context = entry
+            .summary
+            .as_deref()
+            .or(entry.window_title.as_deref())
+            .unwrap_or_else(|| entry.source_app.as_deref().unwrap_or("Manual Remembrie"));
+        let detail = gtk::Label::new(Some(context));
+        detail.set_xalign(0.0);
+        detail.set_wrap(true);
+        detail.set_lines(3);
+        detail.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        content.append(&detail);
+    }
+
+    let evidence_button = gtk::Button::with_label("Show exact evidence");
+    evidence_button.add_css_class("flat");
+    evidence_button.set_halign(Align::Start);
+    let client = state.client.clone();
+    let remembrie_id = entry.id.clone();
+    evidence_button
+        .connect_clicked(move |button| show_remembrance_evidence(button, &client, &remembrie_id));
+    content.append(&evidence_button);
+
+    outer.append(&content);
+    row.set_child(Some(&outer));
+    row
+}
+
+fn show_remembrance_evidence(parent: &gtk::Button, client: &DaemonClient, remembrie_id: &str) {
+    match client.get_remembrie(remembrie_id) {
+        Ok(Some(remembrie)) => {
+            let source = remembrie.source_app.as_deref().unwrap_or("Unknown source");
+            let body = if remembrie.body.trim().is_empty() {
+                "No captured text was stored for this Remembrie.".to_owned()
+            } else {
+                remembrie.body.clone()
+            };
+            let evidence = gtk::Label::new(Some(&body));
+            evidence.set_xalign(0.0);
+            evidence.set_yalign(0.0);
+            evidence.set_wrap(true);
+            evidence.set_selectable(true);
+            evidence.add_css_class("monospace");
+            let scroll = gtk::ScrolledWindow::builder()
+                .hscrollbar_policy(gtk::PolicyType::Never)
+                .min_content_width(680)
+                .min_content_height(420)
+                .child(&evidence)
+                .build();
+            let dialog = adw::AlertDialog::builder()
+                .heading(&remembrie.title)
+                .body(format!(
+                    "{} · {source}",
+                    format_timestamp(remembrie.occurred_at_ms)
+                ))
+                .extra_child(&scroll)
+                .build();
+            dialog.add_response("close", "Close");
+            dialog.set_default_response(Some("close"));
+            dialog.present(Some(parent));
+        }
+        Ok(None) => {
+            let dialog = adw::AlertDialog::builder()
+                .heading("Remembrie no longer available")
+                .body("It may have been deleted while the Timeline was open.")
+                .build();
+            dialog.add_response("close", "Close");
+            dialog.present(Some(parent));
+        }
+        Err(error) => {
+            let dialog = adw::AlertDialog::builder()
+                .heading("Exact evidence could not be opened")
+                .body(error.to_string())
+                .build();
+            dialog.add_response("close", "Close");
+            dialog.present(Some(parent));
+        }
     }
 }
 
@@ -2646,6 +3254,177 @@ fn clear_list(list: &gtk::ListBox) {
     }
 }
 
+fn clear_grid(grid: &gtk::Grid) {
+    while let Some(child) = grid.first_child() {
+        grid.remove(&child);
+    }
+}
+
+fn clear_box(container: &gtk::Box) {
+    while let Some(child) = container.first_child() {
+        container.remove(&child);
+    }
+}
+
+fn clear_flow_box(container: &gtk::FlowBox) {
+    while let Some(child) = container.first_child() {
+        container.remove(&child);
+    }
+}
+
+fn activity_app_durations(entry: &TimelineEntry) -> Vec<(String, String, i64)> {
+    let Some(activity) = &entry.activity else {
+        return Vec::new();
+    };
+    let mut totals: HashMap<String, (String, i64)> = HashMap::new();
+    for (index, observation) in activity.observations.iter().enumerate() {
+        let ended_at_ms = activity
+            .observations
+            .get(index + 1)
+            .map(|next| next.observed_at_ms)
+            .unwrap_or(entry.ended_at_ms)
+            .min(entry.ended_at_ms);
+        let started_at_ms = observation.observed_at_ms.max(entry.started_at_ms);
+        if ended_at_ms <= started_at_ms {
+            continue;
+        }
+        let app_name = timeline_observation_app_name(observation);
+        let identity = app_identity(&observation.app_id, &app_name);
+        let total = totals.entry(identity).or_insert((app_name, 0));
+        total.1 += ended_at_ms - started_at_ms;
+    }
+    let mut durations: Vec<(String, String, i64)> = totals
+        .into_iter()
+        .map(|(identity, (name, duration))| (identity, name, duration))
+        .collect();
+    durations.sort_by_key(|item| std::cmp::Reverse(item.2));
+    durations
+}
+
+fn timeline_observation_app_name(observation: &TimelineActivityObservation) -> String {
+    if !observation.app_name.trim().is_empty() {
+        observation.app_name.trim().to_owned()
+    } else if !observation.app_id.trim().is_empty() {
+        observation.app_id.trim().to_owned()
+    } else {
+        "Desktop".to_owned()
+    }
+}
+
+fn app_identity(app_id: &str, app_name: &str) -> String {
+    let identity = if app_id.trim().is_empty() {
+        app_name
+    } else {
+        app_id
+    };
+    identity.trim().to_ascii_lowercase()
+}
+
+fn app_color_index(app_id: &str, app_name: &str) -> u8 {
+    let mut hash = 2_166_136_261_u32;
+    for byte in app_identity(app_id, app_name).bytes() {
+        hash ^= u32::from(byte);
+        hash = hash.wrapping_mul(16_777_619);
+    }
+    (hash % 8) as u8
+}
+
+fn activity_end_label(reason: &str) -> &'static str {
+    match reason {
+        "idle" => "at an idle break",
+        "screen_locked" => "when the screen locked",
+        "manual" => "manually",
+        "capture_paused" => "when capture paused",
+        "excluded_context" => "at an excluded context",
+        "sensitive_context" => "at sensitive context",
+        "activity_disabled" => "when Activity Context was disabled",
+        "daemon_restart" => "at a service restart",
+        "desktop_bridge_unavailable" => "when the desktop bridge disconnected",
+        "service_stopped" => "when the capture service stopped",
+        _ => "at a session boundary",
+    }
+}
+
+fn format_entry_time(entry: &TimelineEntry) -> String {
+    if entry.ended_at_ms > entry.started_at_ms {
+        format!(
+            "{}–{} · {}",
+            format_clock(entry.started_at_ms),
+            format_clock(entry.ended_at_ms),
+            format_duration(entry.ended_at_ms - entry.started_at_ms)
+        )
+    } else {
+        format_clock(entry.started_at_ms)
+    }
+}
+
+fn format_duration(duration_ms: i64) -> String {
+    if duration_ms <= 0 {
+        return "0m".to_owned();
+    }
+    if duration_ms < 60_000 {
+        return "<1m".to_owned();
+    }
+    let minutes = (duration_ms + 30_000) / 60_000;
+    match minutes {
+        1..60 => format!("{minutes}m"),
+        _ => format!("{}h {:02}m", minutes / 60, minutes % 60),
+    }
+}
+
+fn format_clock(timestamp_ms: i64) -> String {
+    gtk::glib::DateTime::from_unix_local(timestamp_ms / 1000)
+        .and_then(|date| date.format("%-I:%M %p"))
+        .map(|text| text.to_string())
+        .unwrap_or_else(|_| "Unknown time".to_owned())
+}
+
+fn local_today_start_ms() -> i64 {
+    gtk::glib::DateTime::now_local()
+        .ok()
+        .and_then(|now| {
+            gtk::glib::DateTime::from_local(now.year(), now.month(), now.day_of_month(), 0, 0, 0.0)
+                .ok()
+        })
+        .map(|date| date.to_unix() * 1000)
+        .unwrap_or_else(|| current_time_ms() - current_time_ms().rem_euclid(86_400_000))
+}
+
+fn add_local_days(timestamp_ms: i64, days: i32) -> i64 {
+    gtk::glib::DateTime::from_unix_local(timestamp_ms / 1000)
+        .and_then(|date| date.add_days(days))
+        .map(|date| date.to_unix() * 1000)
+        .unwrap_or(timestamp_ms.saturating_add(i64::from(days) * 86_400_000))
+}
+
+fn history_grid_start_ms(today: i64) -> i64 {
+    let weekday = gtk::glib::DateTime::from_unix_local(today / 1000)
+        .map(|date| date.day_of_week())
+        .unwrap_or(1);
+    add_local_days(today, -(11 * 7 + weekday - 1))
+}
+
+fn format_timeline_day(day_start: i64, today: i64) -> String {
+    let prefix = if day_start == today { "Today · " } else { "" };
+    gtk::glib::DateTime::from_unix_local(day_start / 1000)
+        .and_then(|date| date.format("%A, %B %-d"))
+        .map(|date| format!("{prefix}{date}"))
+        .unwrap_or_else(|_| "Timeline day".to_owned())
+}
+
+fn format_day_short(day_start: i64) -> String {
+    gtk::glib::DateTime::from_unix_local(day_start / 1000)
+        .and_then(|date| date.format("%a, %b %-d"))
+        .map(|date| date.to_string())
+        .unwrap_or_else(|_| "Unknown day".to_owned())
+}
+
+fn overlap_ms(left_start: i64, left_end: i64, right_start: i64, right_end: i64) -> i64 {
+    left_end
+        .min(right_end)
+        .saturating_sub(left_start.max(right_start))
+}
+
 fn format_timestamp(timestamp_ms: i64) -> String {
     gtk::glib::DateTime::from_unix_local(timestamp_ms / 1000)
         .and_then(|date| date.format("%b %-d, %-I:%M %p"))
@@ -2694,7 +3473,67 @@ fn install_css() {
          .chat-user { border-left: 3px solid @accent_bg_color; padding-left: 10px; }
          .chat-assistant { border-left: 3px solid @success_color; padding-left: 10px; }
          .title { font-weight: 700; }
-         .heading { font-weight: 600; }",
+         .heading { font-weight: 600; }
+         .timeline-day-navigation { margin-bottom: 2px; }
+         .timeline-section {
+             background: color-mix(in srgb, @view_bg_color 88%, @accent_bg_color 12%);
+             border: 1px solid @borders;
+             border-radius: 12px;
+             padding: 16px;
+         }
+         .timeline-history-grid { margin-top: 6px; }
+         .timeline-heat-cell {
+             min-width: 14px;
+             min-height: 14px;
+             padding: 0;
+             border-radius: 4px;
+             border: 1px solid alpha(@window_fg_color, 0.08);
+             box-shadow: none;
+         }
+         .timeline-heat-0 { background: alpha(@window_fg_color, 0.08); }
+         .timeline-heat-1 { background: alpha(#7459c7, 0.28); }
+         .timeline-heat-2 { background: alpha(#7459c7, 0.48); }
+         .timeline-heat-3 { background: alpha(#7459c7, 0.72); }
+         .timeline-heat-4 { background: #7459c7; }
+         .timeline-heat-selected { border: 2px solid @window_fg_color; }
+         .timeline-ribbon-grid { margin-top: 2px; }
+         .timeline-ribbon-track {
+             background: alpha(@window_fg_color, 0.08);
+             border-radius: 8px;
+         }
+         .timeline-ribbon-segment {
+             min-height: 42px;
+             border-radius: 7px;
+             border-left-width: 3px;
+             border-left-style: solid;
+         }
+         .timeline-legend-item { padding: 3px 0; }
+         .timeline-app-dot { min-width: 10px; min-height: 10px; border-radius: 999px; }
+         .timeline-app-chip { padding: 4px 8px; border-radius: 999px; }
+         .timeline-entry-accent { min-width: 5px; }
+         .timeline-insight {
+             padding: 16px;
+             border-left: 4px solid #7459c7;
+             background: alpha(#7459c7, 0.12);
+         }
+         .manual-capture { padding: 10px 14px; }
+         .manual-capture-content { padding: 12px 2px 2px 2px; }
+         .app-fill-0 { background: alpha(#7459c7, 0.22); border-color: #7459c7; }
+         .app-fill-1 { background: alpha(#3584e4, 0.22); border-color: #3584e4; }
+         .app-fill-2 { background: alpha(#2ec27e, 0.22); border-color: #2ec27e; }
+         .app-fill-3 { background: alpha(#e66100, 0.22); border-color: #e66100; }
+         .app-fill-4 { background: alpha(#e01b24, 0.20); border-color: #e01b24; }
+         .app-fill-5 { background: alpha(#1c8c8c, 0.22); border-color: #1c8c8c; }
+         .app-fill-6 { background: alpha(#c061cb, 0.22); border-color: #c061cb; }
+         .app-fill-7 { background: alpha(#986a44, 0.24); border-color: #986a44; }
+         .app-solid-0 { background: #7459c7; }
+         .app-solid-1 { background: #3584e4; }
+         .app-solid-2 { background: #2ec27e; }
+         .app-solid-3 { background: #e66100; }
+         .app-solid-4 { background: #e01b24; }
+         .app-solid-5 { background: #1c8c8c; }
+         .app-solid-6 { background: #c061cb; }
+         .app-solid-7 { background: #986a44; }",
     );
     gtk::style_context_add_provider_for_display(
         &gtk::gdk::Display::default().expect("a graphical display is required"),

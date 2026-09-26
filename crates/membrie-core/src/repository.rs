@@ -3,6 +3,7 @@ use crate::model::{
     CaptureStatus, EmbeddedChunk, IntelligenceSettings, IntelligenceStatus, LocalModel,
     NewRemembrie, PauseMode, ProcessingJob, Remembrie, ScreenAnalysis, ScreenCaptureCandidate,
     ScreenCaptureResult, SearchHit, SemanticCaptureCandidate, SemanticCaptureResult,
+    TimelineActivityObservation, TimelineActivitySummary, TimelineEntry, TimelineHistorySpan,
 };
 use crate::policy::{MAX_AUTOMATIC_CONTENT_BYTES, exclusion_reason, sensitive_reason};
 use rusqlite::{Connection, DatabaseName, OptionalExtension, Row, params};
@@ -608,6 +609,135 @@ impl Repository {
         let mut statement = self.connection.prepare(&sql)?;
         let rows = statement.query_map([limit], map_remembrie)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn timeline_history(
+        &self,
+        since_ms: i64,
+        until_ms: i64,
+    ) -> Result<Vec<TimelineHistorySpan>, RepositoryError> {
+        validate_timeline_range(since_ms, until_ms, 400 * 24 * 60 * 60 * 1000)?;
+        let mut statement = self.connection.prepare(
+            "SELECT kind, occurred_at_ms,
+                    MAX(occurred_at_ms, COALESCE(ended_at_ms, occurred_at_ms))
+             FROM remembries
+             WHERE deleted_at_ms IS NULL
+               AND occurred_at_ms < ?2
+               AND MAX(occurred_at_ms, COALESCE(ended_at_ms, occurred_at_ms)) >= ?1
+             ORDER BY occurred_at_ms
+             LIMIT 10000",
+        )?;
+        let rows = statement.query_map(params![since_ms, until_ms], |row| {
+            Ok(TimelineHistorySpan {
+                kind: row.get(0)?,
+                started_at_ms: row.get(1)?,
+                ended_at_ms: row.get(2)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn timeline_day(
+        &self,
+        start_ms: i64,
+        end_ms: i64,
+    ) -> Result<Vec<TimelineEntry>, RepositoryError> {
+        validate_timeline_range(start_ms, end_ms, 48 * 60 * 60 * 1000)?;
+        let records = {
+            let mut statement = self.connection.prepare(
+                "SELECT id, kind, occurred_at_ms,
+                        MAX(occurred_at_ms, COALESCE(ended_at_ms, occurred_at_ms)),
+                        source_app, window_title, title, summary
+                 FROM remembries
+                 WHERE deleted_at_ms IS NULL
+                   AND occurred_at_ms < ?2
+                   AND MAX(occurred_at_ms, COALESCE(ended_at_ms, occurred_at_ms)) >= ?1
+                 ORDER BY occurred_at_ms
+                 LIMIT 500",
+            )?;
+            let rows = statement.query_map(params![start_ms, end_ms], |row| {
+                Ok(TimelineEntry {
+                    id: row.get(0)?,
+                    kind: row.get(1)?,
+                    started_at_ms: row.get(2)?,
+                    ended_at_ms: row.get(3)?,
+                    source_app: row.get(4)?,
+                    window_title: row.get(5)?,
+                    title: row.get(6)?,
+                    summary: row.get(7)?,
+                    activity: None,
+                })
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+
+        let mut entries = Vec::with_capacity(records.len());
+        for mut entry in records {
+            if entry.kind == "activity" {
+                entry.activity = self.timeline_activity_summary(&entry.id)?;
+            }
+            entries.push(entry);
+        }
+        Ok(entries)
+    }
+
+    fn timeline_activity_summary(
+        &self,
+        remembrie_id: &str,
+    ) -> Result<Option<TimelineActivitySummary>, RepositoryError> {
+        let session = self
+            .connection
+            .query_row(
+                "SELECT id, COALESCE(end_reason, 'unknown')
+                 FROM activity_sessions WHERE remembrie_id = ?1 LIMIT 1",
+                [remembrie_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        let Some((session_id, end_reason)) = session else {
+            return Ok(None);
+        };
+        let observation_count = self.connection.query_row(
+            "SELECT COUNT(*) FROM activity_observations WHERE session_id = ?1",
+            [&session_id],
+            |row| row.get::<_, u64>(0),
+        )?;
+        let observations = {
+            let mut statement = self.connection.prepare(
+                "SELECT observed_at_ms, app_id, app_name, window_title
+                 FROM activity_observations
+                 WHERE session_id = ?1
+                 ORDER BY observed_at_ms, created_at_ms
+                 LIMIT 1000",
+            )?;
+            let rows = statement.query_map([&session_id], |row| {
+                Ok(TimelineActivityObservation {
+                    observed_at_ms: row.get(0)?,
+                    app_id: row.get(1)?,
+                    app_name: row.get(2)?,
+                    window_title: row.get(3)?,
+                })
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let semantic_observation_count = self.connection.query_row(
+            "SELECT COUNT(*) FROM semantic_observations WHERE session_id = ?1",
+            [&session_id],
+            |row| row.get::<_, u64>(0),
+        )?;
+        let screen_observation_count = self.connection.query_row(
+            "SELECT COUNT(*) FROM screen_observations
+             WHERE session_id = ?1 AND state = 'complete'",
+            [&session_id],
+            |row| row.get::<_, u64>(0),
+        )?;
+        Ok(Some(TimelineActivitySummary {
+            end_reason,
+            observation_count,
+            observations,
+            semantic_observation_count,
+            screen_observation_count,
+        }))
     }
 
     pub fn search(&self, query: &str, limit: u32) -> Result<Vec<SearchHit>, RepositoryError> {
@@ -2795,6 +2925,19 @@ fn validate_screen_analysis(analysis: &ScreenAnalysis) -> Result<(), RepositoryE
     Ok(())
 }
 
+fn validate_timeline_range(
+    start_ms: i64,
+    end_ms: i64,
+    maximum_duration_ms: i64,
+) -> Result<(), RepositoryError> {
+    if start_ms < 0 || end_ms <= start_ms || end_ms - start_ms > maximum_duration_ms {
+        return Err(RepositoryError::Validation(
+            "timeline range is outside the supported bounds".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 fn activity_source_app(app_id: &str, app_name: &str) -> String {
     let app_id = app_id.trim();
     let app_name = app_name.trim();
@@ -3396,6 +3539,22 @@ mod tests {
         assert!(remembries[0].body.contains("Duke Jones"));
         assert_eq!(remembries[0].ended_at_ms, Some(start + 60_000));
         assert_eq!(repository.search("Duke Jones", 10).unwrap().len(), 1);
+        let history = repository
+            .timeline_history(start - 1, start + 60 * 60_000)
+            .unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].kind, "activity");
+        assert_eq!(history[0].started_at_ms, start);
+        assert_eq!(history[0].ended_at_ms, start + 60_000);
+        let timeline = repository
+            .timeline_day(start - 1, start + 60 * 60_000)
+            .unwrap();
+        assert_eq!(timeline.len(), 1);
+        let activity = timeline[0].activity.as_ref().unwrap();
+        assert_eq!(activity.end_reason, "idle");
+        assert_eq!(activity.observation_count, 2);
+        assert_eq!(activity.observations[0].app_name, "Text Editor");
+        assert_eq!(activity.observations[1].app_name, "Google Chrome");
         let status = repository.status().unwrap();
         assert_eq!(status.activity_session_count, 1);
         assert!(status.activity_active_since_ms.is_none());
