@@ -179,3 +179,7 @@ on demand from the daemon, keeping the normal Timeline response compact. Lightwe
 context observations are deterministic and evidence-linked; they are phrased as patterns worth
 noticing rather than claims about intent or task completion. Relationship data remains available
 to Search and Brie without requiring a separate constellation interface.
+
+Brie's citations use the same Remembrie identity as the Timeline. Opening a citation selects the
+source's local calendar day, highlights and scrolls to that entry, and loads its exact evidence
+from the daemon rather than relying on the answer's abbreviated excerpt.

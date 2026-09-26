@@ -44,10 +44,11 @@ The project is intentionally local-only:
 - Restart-safe local summary and embedding jobs
 - Hybrid exact-text and semantic search with `embeddinggemma`
 - Brie answers powered by local `gemma4:12b`, with exact Remembrie citations
+- Brie citations open the matching Timeline day, highlight the source, and show its exact evidence
 - Local model selection and visible indexing health
 
-Dedicated OCR, optional retained evidence controls, deeper pattern detection, and direct
-Brie citation navigation into exact Timeline evidence are the next implementation milestones.
+Dedicated OCR, optional retained evidence controls, and deeper pattern detection are the next
+implementation milestones.
 
 ## Install on Ubuntu
 

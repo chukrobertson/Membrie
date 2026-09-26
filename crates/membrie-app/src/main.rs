@@ -47,6 +47,7 @@ struct UiState {
     timeline_insight_label: gtk::Label,
     timeline_day_start_ms: Cell<i64>,
     timeline_map_mode: Cell<TimelineMapMode>,
+    timeline_target_id: RefCell<Option<String>>,
     search_results: gtk::ListBox,
     capture_rules: gtk::ListBox,
     privacy_stats: gtk::Label,
@@ -240,6 +241,7 @@ fn build_ui(application: &adw::Application) {
         timeline_insight_label,
         timeline_day_start_ms: Cell::new(timeline_day_start_ms),
         timeline_map_mode: Cell::new(TimelineMapMode::Week),
+        timeline_target_id: RefCell::new(None),
         search_results,
         capture_rules,
         privacy_stats,
@@ -297,7 +299,7 @@ fn build_ui(application: &adw::Application) {
         .build();
     stack.add_named(&build_timeline_page(&state), Some("timeline"));
     stack.add_named(&build_search_page(&state), Some("search"));
-    stack.add_named(&build_brie_page(&state), Some("brie"));
+    stack.add_named(&build_brie_page(&state, &stack), Some("brie"));
     stack.add_named(&build_privacy_page(&state), Some("privacy"));
     content.append(&build_sidebar(&stack));
     content.append(&stack);
@@ -474,6 +476,7 @@ fn build_timeline_page(state: &Rc<UiState>) -> gtk::Widget {
         .build();
     let state_for_previous = Rc::clone(state);
     previous.connect_clicked(move |_| {
+        state_for_previous.timeline_target_id.borrow_mut().take();
         let day = shift_timeline_period(
             state_for_previous.timeline_day_start_ms.get(),
             state_for_previous.timeline_map_mode.get(),
@@ -488,6 +491,7 @@ fn build_timeline_page(state: &Rc<UiState>) -> gtk::Widget {
         let selected = state_for_next.timeline_day_start_ms.get();
         let today = local_today_start_ms();
         if selected < today {
+            state_for_next.timeline_target_id.borrow_mut().take();
             state_for_next.timeline_day_start_ms.set(
                 shift_timeline_period(selected, state_for_next.timeline_map_mode.get(), 1)
                     .min(today),
@@ -498,6 +502,7 @@ fn build_timeline_page(state: &Rc<UiState>) -> gtk::Widget {
     });
     let state_for_today = Rc::clone(state);
     state.timeline_today_button.connect_clicked(move |_| {
+        state_for_today.timeline_target_id.borrow_mut().take();
         state_for_today
             .timeline_day_start_ms
             .set(local_today_start_ms());
@@ -747,7 +752,7 @@ fn build_search_page(state: &Rc<UiState>) -> gtk::Widget {
     page.upcast()
 }
 
-fn build_brie_page(state: &Rc<UiState>) -> gtk::Widget {
+fn build_brie_page(state: &Rc<UiState>, stack: &gtk::Stack) -> gtk::Widget {
     let page = page_shell(
         "Brie",
         "Ask your history—and see exactly which Remembries answer.",
@@ -777,6 +782,7 @@ fn build_brie_page(state: &Rc<UiState>) -> gtk::Widget {
         "Brie",
         "I'm here. Ask me about anything Membrie has remembered, and I'll show the Remembries supporting my answer.",
         &[],
+        None,
     );
     let conversation = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Never)
@@ -793,6 +799,7 @@ fn build_brie_page(state: &Rc<UiState>) -> gtk::Widget {
 
     let ask: Rc<dyn Fn()> = {
         let state = Rc::clone(state);
+        let stack = stack.clone();
         Rc::new(move || {
             let question = state.brie_entry.text().trim().to_owned();
             if question.is_empty() || state.brie_busy.replace(true) {
@@ -802,7 +809,7 @@ fn build_brie_page(state: &Rc<UiState>) -> gtk::Widget {
             state.brie_entry.set_sensitive(false);
             state.brie_send_button.set_sensitive(false);
             state.brie_send_button.set_label("Brie is thinking…");
-            append_brie_message(&state.brie_messages, "You", &question, &[]);
+            append_brie_message(&state.brie_messages, "You", &question, &[], None);
             scroll_list_to_bottom(&conversation);
 
             let client = state.client.clone();
@@ -812,11 +819,12 @@ fn build_brie_page(state: &Rc<UiState>) -> gtk::Widget {
             });
             let state = Rc::clone(&state);
             let conversation = conversation.clone();
+            let stack = stack.clone();
             gtk::glib::timeout_add_local(Duration::from_millis(100), move || {
                 match receiver.try_recv() {
                     Ok(Ok(answer)) => {
                         finish_brie_request(&state);
-                        append_brie_answer(&state.brie_messages, &answer);
+                        append_brie_answer(&state.brie_messages, &answer, &state, &stack);
                         scroll_list_to_bottom(&conversation);
                         gtk::glib::ControlFlow::Break
                     }
@@ -827,6 +835,7 @@ fn build_brie_page(state: &Rc<UiState>) -> gtk::Widget {
                             "Brie",
                             &format!("I couldn't complete that locally: {error}"),
                             &[],
+                            None,
                         );
                         scroll_list_to_bottom(&conversation);
                         gtk::glib::ControlFlow::Break
@@ -1744,6 +1753,7 @@ fn timeline_map_button(
     }
     let state_for_day = Rc::clone(state);
     button.connect_clicked(move |_| {
+        state_for_day.timeline_target_id.borrow_mut().take();
         state_for_day.timeline_day_start_ms.set(day_start);
         *state_for_day.timeline_render_key.borrow_mut() = None;
         refresh_timeline(&state_for_day);
@@ -2737,8 +2747,19 @@ fn finish_brie_request(state: &UiState) {
     state.brie_entry.grab_focus();
 }
 
-fn append_brie_answer(list: &gtk::ListBox, answer: &BrieAnswer) {
-    append_brie_message(list, "Brie", &answer.answer, &answer.citations);
+fn append_brie_answer(
+    list: &gtk::ListBox,
+    answer: &BrieAnswer,
+    state: &Rc<UiState>,
+    stack: &gtk::Stack,
+) {
+    append_brie_message(
+        list,
+        "Brie",
+        &answer.answer,
+        &answer.citations,
+        Some((Rc::clone(state), stack.clone())),
+    );
 }
 
 fn append_brie_message(
@@ -2746,6 +2767,7 @@ fn append_brie_message(
     speaker: &str,
     message: &str,
     citations: &[BrieCitation],
+    navigation: Option<(Rc<UiState>, gtk::Stack)>,
 ) {
     let row = gtk::ListBoxRow::new();
     row.set_activatable(false);
@@ -2781,38 +2803,69 @@ fn append_brie_message(
             let label = format!("[{}] {}", citation.number, citation.remembrie.title);
             let button = gtk::Button::with_label(&label);
             button.add_css_class("flat");
+            button.add_css_class("citation-button");
             button.set_halign(Align::Start);
-            button.set_tooltip_text(Some("Open the exact supporting Remembrie"));
+            button.set_tooltip_text(Some(
+                "Open this Remembrie in the Timeline with exact evidence",
+            ));
             let citation = citation.clone();
+            let navigation = navigation.clone();
             button.connect_clicked(move |button| {
-                let source = citation
-                    .remembrie
-                    .source_app
-                    .as_deref()
-                    .unwrap_or("Unknown source");
-                let body = if citation.remembrie.body.trim().is_empty() {
-                    citation.excerpt.as_str()
+                if let Some((state, stack)) = &navigation {
+                    state
+                        .timeline_day_start_ms
+                        .set(local_day_start_ms(citation.remembrie.occurred_at_ms));
+                    *state.timeline_target_id.borrow_mut() = Some(citation.remembrie.id.clone());
+                    *state.timeline_render_key.borrow_mut() = None;
+                    stack.set_visible_child_name("timeline");
+                    refresh_timeline(state);
+                    let state_for_evidence = Rc::clone(state);
+                    let remembrie_id = citation.remembrie.id.clone();
+                    gtk::glib::idle_add_local_once(move || {
+                        show_remembrance_evidence(
+                            &state_for_evidence.timeline,
+                            &state_for_evidence.client,
+                            &remembrie_id,
+                        );
+                    });
+                    toast(
+                        state,
+                        &format!("Opened citation [{}] in the Timeline", citation.number),
+                    );
                 } else {
-                    citation.remembrie.body.as_str()
-                };
-                let dialog = adw::AlertDialog::builder()
-                    .heading(&citation.remembrie.title)
-                    .body(format!(
-                        "{} · {}\n\n{}",
-                        format_timestamp(citation.remembrie.occurred_at_ms),
-                        source,
-                        truncate_display_text(body, 5000)
-                    ))
-                    .build();
-                dialog.add_response("close", "Close");
-                dialog.set_default_response(Some("close"));
-                dialog.present(Some(button));
+                    show_citation_preview(button, &citation);
+                }
             });
             content.append(&button);
         }
     }
     row.set_child(Some(&content));
     list.append(&row);
+}
+
+fn show_citation_preview(parent: &gtk::Button, citation: &BrieCitation) {
+    let source = citation
+        .remembrie
+        .source_app
+        .as_deref()
+        .unwrap_or("Unknown source");
+    let body = if citation.remembrie.body.trim().is_empty() {
+        citation.excerpt.as_str()
+    } else {
+        citation.remembrie.body.as_str()
+    };
+    let dialog = adw::AlertDialog::builder()
+        .heading(&citation.remembrie.title)
+        .body(format!(
+            "{} · {}\n\n{}",
+            format_timestamp(citation.remembrie.occurred_at_ms),
+            source,
+            truncate_display_text(body, 5000)
+        ))
+        .build();
+    dialog.add_response("close", "Close");
+    dialog.set_default_response(Some("close"));
+    dialog.present(Some(parent));
 }
 
 fn scroll_list_to_bottom(scroll: &gtk::ScrolledWindow) {
@@ -3188,8 +3241,20 @@ fn render_timeline_entries(list: &gtk::ListBox, state: &Rc<UiState>, entries: &[
         );
         return;
     }
+    let target_id = state.timeline_target_id.borrow().clone();
+    let mut target_row = None;
     for entry in entries {
-        list.append(&timeline_entry_row(state, entry));
+        let row = timeline_entry_row(state, entry);
+        if target_id.as_deref() == Some(entry.id.as_str()) {
+            row.add_css_class("timeline-entry-target");
+            target_row = Some(row.clone());
+        }
+        list.append(&row);
+    }
+    if let Some(row) = target_row {
+        gtk::glib::idle_add_local_once(move || {
+            let _ = row.grab_focus();
+        });
     }
 }
 
@@ -3319,7 +3384,11 @@ fn timeline_entry_row(state: &Rc<UiState>, entry: &TimelineEntry) -> gtk::ListBo
     row
 }
 
-fn show_remembrance_evidence(parent: &gtk::Button, client: &DaemonClient, remembrie_id: &str) {
+fn show_remembrance_evidence(
+    parent: &impl IsA<gtk::Widget>,
+    client: &DaemonClient,
+    remembrie_id: &str,
+) {
     match client.get_remembrie(remembrie_id) {
         Ok(Some(remembrie)) => {
             let source = remembrie.source_app.as_deref().unwrap_or("Unknown source");
@@ -3585,12 +3654,25 @@ fn format_clock(timestamp_ms: i64) -> String {
 fn local_today_start_ms() -> i64 {
     gtk::glib::DateTime::now_local()
         .ok()
-        .and_then(|now| {
-            gtk::glib::DateTime::from_local(now.year(), now.month(), now.day_of_month(), 0, 0, 0.0)
-                .ok()
+        .map(|now| now.to_unix() * 1000)
+        .map(local_day_start_ms)
+        .unwrap_or_else(|| current_time_ms() - current_time_ms().rem_euclid(86_400_000))
+}
+
+fn local_day_start_ms(timestamp_ms: i64) -> i64 {
+    gtk::glib::DateTime::from_unix_local(timestamp_ms / 1000)
+        .and_then(|date| {
+            gtk::glib::DateTime::from_local(
+                date.year(),
+                date.month(),
+                date.day_of_month(),
+                0,
+                0,
+                0.0,
+            )
         })
         .map(|date| date.to_unix() * 1000)
-        .unwrap_or_else(|| current_time_ms() - current_time_ms().rem_euclid(86_400_000))
+        .unwrap_or(timestamp_ms - timestamp_ms.rem_euclid(86_400_000))
 }
 
 fn add_local_days(timestamp_ms: i64, days: i32) -> i64 {
@@ -3745,6 +3827,7 @@ fn install_css() {
          .memory-preview { opacity: 0.88; }
          .chat-user { border-left: 3px solid @accent_bg_color; padding-left: 10px; }
          .chat-assistant { border-left: 3px solid @success_color; padding-left: 10px; }
+         .citation-button { padding: 5px 8px; }
          .title { font-weight: 700; }
          .heading { font-weight: 600; }
          .timeline-day-navigation { margin-bottom: 2px; }
@@ -3800,6 +3883,11 @@ fn install_css() {
          .timeline-app-dot { min-width: 10px; min-height: 10px; border-radius: 999px; }
          .timeline-app-chip { padding: 4px 8px; border-radius: 999px; }
          .timeline-entry-accent { min-width: 5px; }
+         .timeline-entry-target {
+             background: alpha(@accent_bg_color, 0.13);
+             border: 2px solid @accent_bg_color;
+             border-radius: 10px;
+         }
          .timeline-insight {
              padding: 16px;
              border-left: 4px solid #7459c7;
