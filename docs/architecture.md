@@ -167,11 +167,12 @@ falls back to FTS5 when Ollama is unavailable, so exact recall never depends on 
 ## Timeline projection
 
 The Timeline is a read-only projection of canonical Remembries and activity-session ledgers.
-Its twelve-week map measures remembered active time only; it deliberately avoids streaks and
-productivity scores. A daily ribbon derives each application's duration from consecutive focus
-observations while preserving idle gaps. Application identities map deterministically onto a
-small accessible color palette, with names and durations always retained so meaning never
-depends on color alone.
+Its day, week, and month maps measure remembered active time only. Color identifies the dominant
+application in each period, while intensity reflects duration; the design deliberately avoids
+streaks and productivity scores. A daily ribbon derives each application's duration from
+consecutive focus observations while preserving idle gaps. Application identities map
+deterministically onto a small accessible color palette, with names and durations always retained
+so meaning never depends on color alone.
 
 Day entries remain grouped at the meaningful Remembrie level. Exact captured evidence is loaded
 on demand from the daemon, keeping the normal Timeline response compact. Lightweight repeated-

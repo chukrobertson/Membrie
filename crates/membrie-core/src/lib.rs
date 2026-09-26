@@ -12,6 +12,6 @@ pub use model::{
     IntelligenceStatus, LocalModel, NewRemembrie, PauseMode, ProcessingJob, Remembrie,
     ScreenAnalysis, ScreenCaptureCandidate, ScreenCaptureResult, SearchHit,
     SemanticCaptureCandidate, SemanticCaptureResult, TimelineActivityObservation,
-    TimelineActivitySummary, TimelineEntry, TimelineHistorySpan,
+    TimelineActivitySummary, TimelineEntry, TimelineHistorySpan, TimelineMapSlice,
 };
 pub use repository::{Repository, RepositoryError};

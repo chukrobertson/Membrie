@@ -163,6 +163,9 @@ fn dispatch_database(request: Request, repository: &Mutex<Repository>) -> Result
         Request::TimelineDay { start_ms, end_ms } => Ok(Response::TimelineDay {
             entries: repository.timeline_day(start_ms, end_ms)?,
         }),
+        Request::TimelineMap { start_ms, end_ms } => Ok(Response::TimelineMap {
+            slices: repository.timeline_map(start_ms, end_ms)?,
+        }),
         Request::SetPause { mode } => Ok(Response::PauseUpdated {
             status: with_capture_health(repository.set_pause(mode)?),
         }),

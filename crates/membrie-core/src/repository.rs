@@ -4,6 +4,7 @@ use crate::model::{
     NewRemembrie, PauseMode, ProcessingJob, Remembrie, ScreenAnalysis, ScreenCaptureCandidate,
     ScreenCaptureResult, SearchHit, SemanticCaptureCandidate, SemanticCaptureResult,
     TimelineActivityObservation, TimelineActivitySummary, TimelineEntry, TimelineHistorySpan,
+    TimelineMapSlice,
 };
 use crate::policy::{MAX_AUTOMATIC_CONTENT_BYTES, exclusion_reason, sensitive_reason};
 use rusqlite::{Connection, DatabaseName, OptionalExtension, Row, params};
@@ -635,6 +636,66 @@ impl Repository {
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn timeline_map(
+        &self,
+        start_ms: i64,
+        end_ms: i64,
+    ) -> Result<Vec<TimelineMapSlice>, RepositoryError> {
+        validate_timeline_range(start_ms, end_ms, 40 * 24 * 60 * 60 * 1000)?;
+        let records = {
+            let mut statement = self.connection.prepare(
+                "SELECT s.id, s.ended_at_ms, o.observed_at_ms, o.app_id, o.app_name
+                 FROM activity_sessions s
+                 JOIN remembries r ON r.id = s.remembrie_id AND r.deleted_at_ms IS NULL
+                 JOIN activity_observations o ON o.session_id = s.id
+                 WHERE s.ended_at_ms IS NOT NULL
+                   AND s.started_at_ms < ?2
+                   AND s.ended_at_ms >= ?1
+                 ORDER BY s.started_at_ms, s.id, o.observed_at_ms, o.created_at_ms
+                 LIMIT 20000",
+            )?;
+            let rows = statement.query_map(params![start_ms, end_ms], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+
+        let mut slices: Vec<TimelineMapSlice> = Vec::new();
+        for (index, record) in records.iter().enumerate() {
+            let next_at = records
+                .get(index + 1)
+                .filter(|next| next.0 == record.0)
+                .map(|next| next.2)
+                .unwrap_or(record.1);
+            let started_at_ms = record.2.max(start_ms);
+            let ended_at_ms = next_at.min(record.1).min(end_ms);
+            if ended_at_ms <= started_at_ms {
+                continue;
+            }
+            if let Some(previous) = slices.last_mut()
+                && previous.app_id == record.3
+                && previous.app_name == record.4
+                && previous.ended_at_ms >= started_at_ms
+            {
+                previous.ended_at_ms = previous.ended_at_ms.max(ended_at_ms);
+                continue;
+            }
+            slices.push(TimelineMapSlice {
+                started_at_ms,
+                ended_at_ms,
+                app_id: record.3.clone(),
+                app_name: record.4.clone(),
+            });
+        }
+        Ok(slices)
     }
 
     pub fn timeline_day(
@@ -3546,6 +3607,13 @@ mod tests {
         assert_eq!(history[0].kind, "activity");
         assert_eq!(history[0].started_at_ms, start);
         assert_eq!(history[0].ended_at_ms, start + 60_000);
+        let map = repository
+            .timeline_map(start - 1, start + 60 * 60_000)
+            .unwrap();
+        assert_eq!(map.len(), 1);
+        assert_eq!(map[0].app_name, "Text Editor");
+        assert_eq!(map[0].started_at_ms, start);
+        assert_eq!(map[0].ended_at_ms, start + 60_000);
         let timeline = repository
             .timeline_day(start - 1, start + 60 * 60_000)
             .unwrap();

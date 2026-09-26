@@ -25,6 +25,14 @@ pub struct TimelineHistorySpan {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TimelineMapSlice {
+    pub started_at_ms: i64,
+    pub ended_at_ms: i64,
+    pub app_id: String,
+    pub app_name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TimelineActivityObservation {
     pub observed_at_ms: i64,
     pub app_id: String,

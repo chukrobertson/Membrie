@@ -17,7 +17,7 @@ The project is intentionally local-only:
 - Local daemon with a small typed JSON protocol over a Unix socket
 - SQLite schema for Remembries, content, relationships, embeddings, and processing jobs
 - Manual Remembrie capture
-- Visual twelve-week history map and day-by-day chronology
+- Day, week, and month activity maps with stable application colors and day-by-day chronology
 - Color-grouped application time ribbon with idle gaps, stable app colors, and exact evidence
 - Evidence-backed repeated-context observations without productivity scoring
 - Exact full-text search powered by SQLite FTS5/BM25

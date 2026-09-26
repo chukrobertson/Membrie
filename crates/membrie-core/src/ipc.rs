@@ -3,6 +3,7 @@ use crate::model::{
     CaptureDecision, CaptureRule, CaptureStatus, IntelligenceSettings, IntelligenceStatus,
     NewRemembrie, PauseMode, Remembrie, ScreenCaptureCandidate, ScreenCaptureResult, SearchHit,
     SemanticCaptureCandidate, SemanticCaptureResult, TimelineEntry, TimelineHistorySpan,
+    TimelineMapSlice,
 };
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -34,6 +35,10 @@ pub enum Request {
         until_ms: i64,
     },
     TimelineDay {
+        start_ms: i64,
+        end_ms: i64,
+    },
+    TimelineMap {
         start_ms: i64,
         end_ms: i64,
     },
@@ -115,6 +120,7 @@ pub enum Response {
     Remembrie { remembrie: Option<Remembrie> },
     TimelineHistory { spans: Vec<TimelineHistorySpan> },
     TimelineDay { entries: Vec<TimelineEntry> },
+    TimelineMap { slices: Vec<TimelineMapSlice> },
     SearchResults { hits: Vec<SearchHit> },
     PauseUpdated { status: CaptureStatus },
     CaptureSourceUpdated { status: CaptureStatus },
@@ -270,6 +276,19 @@ impl DaemonClient {
     ) -> Result<Vec<TimelineEntry>, ClientError> {
         match self.request(&Request::TimelineDay { start_ms, end_ms })? {
             Response::TimelineDay { entries } => Ok(entries),
+            other => Err(ClientError::Rejected(format!(
+                "unexpected response: {other:?}"
+            ))),
+        }
+    }
+
+    pub fn timeline_map(
+        &self,
+        start_ms: i64,
+        end_ms: i64,
+    ) -> Result<Vec<TimelineMapSlice>, ClientError> {
+        match self.request(&Request::TimelineMap { start_ms, end_ms })? {
+            Response::TimelineMap { slices } => Ok(slices),
             other => Err(ClientError::Rejected(format!(
                 "unexpected response: {other:?}"
             ))),

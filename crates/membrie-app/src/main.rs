@@ -5,7 +5,7 @@ use membrie_core::{
     ActivitySnapshot, BrieAnswer, BrieCitation, CaptureRule, CaptureStatus, DaemonClient,
     IntelligenceSettings, IntelligenceStatus, LocalModel, NewRemembrie, PauseMode, Remembrie,
     ScreenCaptureCandidate, ScreenCaptureResult, SearchHit, TimelineActivityObservation,
-    TimelineEntry, TimelineHistorySpan, socket_path,
+    TimelineEntry, TimelineMapSlice, socket_path,
 };
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -17,6 +17,13 @@ const APP_ID: &str = "com.chuk.Membrie";
 const CLIPBOARD_DBUS_NAME: &str = "com.chuk.Membrie.Clipboard";
 const CLIPBOARD_DBUS_PATH: &str = "/com/chuk/Membrie/Clipboard";
 const CLIPBOARD_DBUS_INTERFACE: &str = "com.chuk.Membrie.Clipboard";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TimelineMapMode {
+    Day,
+    Week,
+    Month,
+}
 
 fn main() -> gtk::glib::ExitCode {
     let application = adw::Application::builder().application_id(APP_ID).build();
@@ -39,6 +46,7 @@ struct UiState {
     timeline_insight: gtk::Box,
     timeline_insight_label: gtk::Label,
     timeline_day_start_ms: Cell<i64>,
+    timeline_map_mode: Cell<TimelineMapMode>,
     search_results: gtk::ListBox,
     capture_rules: gtk::ListBox,
     privacy_stats: gtk::Label,
@@ -231,6 +239,7 @@ fn build_ui(application: &adw::Application) {
         timeline_insight,
         timeline_insight_label,
         timeline_day_start_ms: Cell::new(timeline_day_start_ms),
+        timeline_map_mode: Cell::new(TimelineMapMode::Week),
         search_results,
         capture_rules,
         privacy_stats,
@@ -465,7 +474,11 @@ fn build_timeline_page(state: &Rc<UiState>) -> gtk::Widget {
         .build();
     let state_for_previous = Rc::clone(state);
     previous.connect_clicked(move |_| {
-        let day = add_local_days(state_for_previous.timeline_day_start_ms.get(), -1);
+        let day = shift_timeline_period(
+            state_for_previous.timeline_day_start_ms.get(),
+            state_for_previous.timeline_map_mode.get(),
+            -1,
+        );
         state_for_previous.timeline_day_start_ms.set(day);
         *state_for_previous.timeline_render_key.borrow_mut() = None;
         refresh_timeline(&state_for_previous);
@@ -475,9 +488,10 @@ fn build_timeline_page(state: &Rc<UiState>) -> gtk::Widget {
         let selected = state_for_next.timeline_day_start_ms.get();
         let today = local_today_start_ms();
         if selected < today {
-            state_for_next
-                .timeline_day_start_ms
-                .set(add_local_days(selected, 1).min(today));
+            state_for_next.timeline_day_start_ms.set(
+                shift_timeline_period(selected, state_for_next.timeline_map_mode.get(), 1)
+                    .min(today),
+            );
             *state_for_next.timeline_render_key.borrow_mut() = None;
             refresh_timeline(&state_for_next);
         }
@@ -498,16 +512,43 @@ fn build_timeline_page(state: &Rc<UiState>) -> gtk::Widget {
 
     let history_section = gtk::Box::new(Orientation::Vertical, 8);
     history_section.add_css_class("timeline-section");
-    let history_heading = gtk::Label::new(Some("History map · 12 weeks"));
+    let history_top = gtk::Box::new(Orientation::Horizontal, 8);
+    let history_heading = gtk::Label::new(Some("Activity map"));
     history_heading.add_css_class("heading");
     history_heading.set_xalign(0.0);
+    history_heading.set_hexpand(true);
+    let day_mode = gtk::ToggleButton::with_label("Day");
+    let week_mode = gtk::ToggleButton::with_label("Week");
+    let month_mode = gtk::ToggleButton::with_label("Month");
+    week_mode.set_group(Some(&day_mode));
+    month_mode.set_group(Some(&day_mode));
+    week_mode.set_active(true);
+    for (button, mode) in [
+        (day_mode.clone(), TimelineMapMode::Day),
+        (week_mode.clone(), TimelineMapMode::Week),
+        (month_mode.clone(), TimelineMapMode::Month),
+    ] {
+        let state_for_mode = Rc::clone(state);
+        button.connect_toggled(move |button| {
+            if !button.is_active() || state_for_mode.timeline_map_mode.get() == mode {
+                return;
+            }
+            state_for_mode.timeline_map_mode.set(mode);
+            *state_for_mode.timeline_render_key.borrow_mut() = None;
+            refresh_timeline(&state_for_mode);
+        });
+    }
+    history_top.append(&history_heading);
+    history_top.append(&day_mode);
+    history_top.append(&week_mode);
+    history_top.append(&month_mode);
     let history_detail = gtk::Label::new(Some(
-        "Color intensity means remembered active time—not productivity, importance, or success.",
+        "Color identifies the dominant application; intensity means remembered active time—not productivity or importance.",
     ));
     history_detail.add_css_class("dim-label");
     history_detail.set_xalign(0.0);
     history_detail.set_wrap(true);
-    history_section.append(&history_heading);
+    history_section.append(&history_top);
     history_section.append(&history_detail);
     history_section.append(&state.timeline_history_grid);
     page.append(&history_section);
@@ -1427,27 +1468,27 @@ fn memory_list() -> gtk::ListBox {
 
 fn refresh_timeline(state: &Rc<UiState>) {
     let today = local_today_start_ms();
-    let history_start = history_grid_start_ms(today);
-    let history_end = add_local_days(today, 1);
     let day_start = state.timeline_day_start_ms.get().min(today);
     state.timeline_day_start_ms.set(day_start);
     let day_end = add_local_days(day_start, 1);
+    let map_mode = state.timeline_map_mode.get();
+    let (map_start, map_end) = timeline_map_range(day_start, map_mode);
     let result = state
         .client
-        .timeline_history(history_start, history_end)
-        .and_then(|spans| {
+        .timeline_map(map_start, map_end)
+        .and_then(|slices| {
             state
                 .client
                 .timeline_day(day_start, day_end)
-                .map(|entries| (spans, entries))
+                .map(|entries| (slices, entries))
         });
     match result {
-        Ok((spans, entries)) => {
-            let key = timeline_render_key(day_start, &spans, &entries);
+        Ok((slices, entries)) => {
+            let key = timeline_render_key(day_start, map_mode, &slices, &entries);
             if state.timeline_render_key.borrow().as_deref() == Some(&key) {
                 return;
             }
-            render_timeline_history(state, &spans, today, day_start);
+            render_timeline_map(state, &slices, day_start, map_mode, map_start, map_end);
             render_timeline_ribbon(state, &entries, day_start, day_end);
             render_timeline_entries(&state.timeline, state, &entries);
             render_timeline_insight(state, &entries);
@@ -1473,14 +1514,19 @@ fn refresh_timeline(state: &Rc<UiState>) {
 
 fn timeline_render_key(
     day_start: i64,
-    spans: &[TimelineHistorySpan],
+    map_mode: TimelineMapMode,
+    slices: &[TimelineMapSlice],
     entries: &[TimelineEntry],
 ) -> String {
-    let mut key = format!("{day_start}:{}:{}", spans.len(), entries.len());
-    for span in spans {
+    let mut key = format!(
+        "{day_start}:{map_mode:?}:{}:{}",
+        slices.len(),
+        entries.len()
+    );
+    for slice in slices {
         key.push_str(&format!(
             ":{}:{}:{}",
-            span.kind, span.started_at_ms, span.ended_at_ms
+            slice.app_id, slice.started_at_ms, slice.ended_at_ms
         ));
     }
     for entry in entries {
@@ -1500,62 +1546,219 @@ fn timeline_render_key(
     key
 }
 
-fn render_timeline_history(
+fn render_timeline_map(
     state: &Rc<UiState>,
-    spans: &[TimelineHistorySpan],
-    today: i64,
+    slices: &[TimelineMapSlice],
     selected_day: i64,
+    mode: TimelineMapMode,
+    map_start: i64,
+    map_end: i64,
 ) {
     clear_grid(&state.timeline_history_grid);
-    for (row, label) in ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+    match mode {
+        TimelineMapMode::Day | TimelineMapMode::Week => render_hour_map(
+            state,
+            slices,
+            selected_day,
+            map_start,
+            if mode == TimelineMapMode::Day { 1 } else { 7 },
+        ),
+        TimelineMapMode::Month => render_month_map(state, slices, selected_day, map_start, map_end),
+    }
+}
+
+fn render_hour_map(
+    state: &Rc<UiState>,
+    slices: &[TimelineMapSlice],
+    selected_day: i64,
+    map_start: i64,
+    day_count: i32,
+) {
+    for hour in 0..24_i32 {
+        let text = match hour {
+            0 => "12a".to_owned(),
+            6 => "6a".to_owned(),
+            12 => "12p".to_owned(),
+            18 => "6p".to_owned(),
+            _ => String::new(),
+        };
+        let label = gtk::Label::new(Some(&text));
+        label.add_css_class("caption");
+        label.add_css_class("dim-label");
+        state
+            .timeline_history_grid
+            .attach(&label, hour + 1, 0, 1, 1);
+    }
+
+    for day_offset in 0..day_count {
+        let day_start = add_local_days(map_start, day_offset);
+        let day_label = gtk::Label::new(Some(&format_map_row_day(day_start)));
+        day_label.add_css_class("caption");
+        day_label.add_css_class("dim-label");
+        day_label.set_xalign(0.0);
+        state
+            .timeline_history_grid
+            .attach(&day_label, 0, day_offset + 1, 1, 1);
+
+        for hour in 0..24_i32 {
+            let cell_start = add_local_hours(day_start, hour);
+            let cell_end = add_local_hours(day_start, hour + 1);
+            let summary = map_cell_summary(slices, cell_start, cell_end);
+            let button = timeline_map_button(
+                state,
+                summary.as_ref(),
+                cell_start,
+                cell_end,
+                day_start,
+                selected_day,
+                false,
+            );
+            state
+                .timeline_history_grid
+                .attach(&button, hour + 1, day_offset + 1, 1, 1);
+        }
+    }
+}
+
+fn render_month_map(
+    state: &Rc<UiState>,
+    slices: &[TimelineMapSlice],
+    selected_day: i64,
+    map_start: i64,
+    map_end: i64,
+) {
+    for (column, text) in ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
         .iter()
         .enumerate()
     {
-        let label = gtk::Label::new(Some(label));
+        let label = gtk::Label::new(Some(text));
         label.add_css_class("caption");
         label.add_css_class("dim-label");
-        label.set_xalign(0.0);
         state
             .timeline_history_grid
-            .attach(&label, 0, row as i32, 1, 1);
+            .attach(&label, column as i32, 0, 1, 1);
     }
 
-    let grid_start = history_grid_start_ms(today);
-    for offset in 0..84_i32 {
-        let day_start = add_local_days(grid_start, offset);
-        let day_end = add_local_days(day_start, 1);
-        let active_ms: i64 = spans
-            .iter()
-            .filter(|span| span.kind == "activity")
-            .map(|span| overlap_ms(span.started_at_ms, span.ended_at_ms, day_start, day_end))
-            .sum();
-        let level = match active_ms {
-            0 => 0,
-            1..1_800_000 => 1,
-            1_800_000..7_200_000 => 2,
-            7_200_000..14_400_000 => 3,
-            _ => 4,
-        };
-        let button = gtk::Button::new();
-        button.add_css_class("timeline-heat-cell");
-        button.add_css_class(&format!("timeline-heat-{level}"));
-        if day_start == selected_day {
-            button.add_css_class("timeline-heat-selected");
-        }
-        button.set_tooltip_text(Some(&format!(
-            "{} · {} observed active time",
-            format_day_short(day_start),
-            format_duration(active_ms)
-        )));
-        let state_for_day = Rc::clone(state);
-        button.connect_clicked(move |_| {
-            state_for_day.timeline_day_start_ms.set(day_start);
-            *state_for_day.timeline_render_key.borrow_mut() = None;
-            refresh_timeline(&state_for_day);
-        });
+    let first_weekday = local_day_of_week(map_start);
+    let mut day_start = map_start;
+    let mut offset = 0_i32;
+    while day_start < map_end {
+        let day_end = add_local_days(day_start, 1).min(map_end);
+        let position = first_weekday - 1 + offset;
+        let column = position % 7;
+        let row = position / 7 + 1;
+        let summary = map_cell_summary(slices, day_start, day_end);
+        let button = timeline_map_button(
+            state,
+            summary.as_ref(),
+            day_start,
+            day_end,
+            day_start,
+            selected_day,
+            true,
+        );
+        button.set_label(&local_day_number(day_start));
         state
             .timeline_history_grid
-            .attach(&button, 1 + offset / 7, offset % 7, 1, 1);
+            .attach(&button, column, row, 1, 1);
+        day_start = day_end;
+        offset += 1;
+    }
+}
+
+#[derive(Clone)]
+struct MapCellSummary {
+    app_id: String,
+    app_name: String,
+    active_ms: i64,
+}
+
+fn map_cell_summary(
+    slices: &[TimelineMapSlice],
+    cell_start: i64,
+    cell_end: i64,
+) -> Option<MapCellSummary> {
+    let mut apps: HashMap<String, (String, String, i64)> = HashMap::new();
+    let mut active_ms = 0_i64;
+    for slice in slices {
+        let duration = overlap_ms(slice.started_at_ms, slice.ended_at_ms, cell_start, cell_end);
+        if duration <= 0 {
+            continue;
+        }
+        active_ms += duration;
+        let identity = app_identity(&slice.app_id, &slice.app_name);
+        let total = apps.entry(identity).or_insert_with(|| {
+            (
+                slice.app_id.clone(),
+                display_map_app_name(&slice.app_id, &slice.app_name),
+                0,
+            )
+        });
+        total.2 += duration;
+    }
+    apps.into_values()
+        .max_by_key(|(_, _, duration)| *duration)
+        .map(|(app_id, app_name, _)| MapCellSummary {
+            app_id,
+            app_name,
+            active_ms,
+        })
+}
+
+fn timeline_map_button(
+    state: &Rc<UiState>,
+    summary: Option<&MapCellSummary>,
+    cell_start: i64,
+    cell_end: i64,
+    day_start: i64,
+    selected_day: i64,
+    is_day_cell: bool,
+) -> gtk::Button {
+    let button = gtk::Button::new();
+    button.add_css_class(if is_day_cell {
+        "timeline-map-day-cell"
+    } else {
+        "timeline-map-hour-cell"
+    });
+    if day_start == selected_day {
+        button.add_css_class("timeline-map-selected");
+    }
+    if let Some(summary) = summary {
+        let cell_duration = cell_end.saturating_sub(cell_start);
+        let level = map_intensity_level(summary.active_ms, cell_duration);
+        let color = app_color_index(&summary.app_id, &summary.app_name);
+        button.add_css_class(&format!("app-map-{color}"));
+        button.add_css_class(&format!("timeline-map-level-{level}"));
+        button.set_tooltip_text(Some(&format!(
+            "{} · {} dominant · {} observed active time",
+            format_map_cell_time(cell_start, is_day_cell),
+            summary.app_name,
+            format_duration(summary.active_ms)
+        )));
+    } else {
+        button.add_css_class("timeline-map-empty");
+        button.set_tooltip_text(Some(&format!(
+            "{} · no remembered activity",
+            format_map_cell_time(cell_start, is_day_cell)
+        )));
+    }
+    let state_for_day = Rc::clone(state);
+    button.connect_clicked(move |_| {
+        state_for_day.timeline_day_start_ms.set(day_start);
+        *state_for_day.timeline_render_key.borrow_mut() = None;
+        refresh_timeline(&state_for_day);
+    });
+    button
+}
+
+fn map_intensity_level(active_ms: i64, cell_duration_ms: i64) -> u8 {
+    let share = active_ms.saturating_mul(100) / cell_duration_ms.max(1);
+    match share {
+        0 => 0,
+        1..=24 => 1,
+        25..=49 => 2,
+        50..=74 => 3,
+        _ => 4,
     }
 }
 
@@ -3397,11 +3600,88 @@ fn add_local_days(timestamp_ms: i64, days: i32) -> i64 {
         .unwrap_or(timestamp_ms.saturating_add(i64::from(days) * 86_400_000))
 }
 
-fn history_grid_start_ms(today: i64) -> i64 {
-    let weekday = gtk::glib::DateTime::from_unix_local(today / 1000)
+fn add_local_hours(timestamp_ms: i64, hours: i32) -> i64 {
+    gtk::glib::DateTime::from_unix_local(timestamp_ms / 1000)
+        .and_then(|date| date.add_hours(hours))
+        .map(|date| date.to_unix() * 1000)
+        .unwrap_or(timestamp_ms.saturating_add(i64::from(hours) * 3_600_000))
+}
+
+fn add_local_months(timestamp_ms: i64, months: i32) -> i64 {
+    gtk::glib::DateTime::from_unix_local(timestamp_ms / 1000)
+        .and_then(|date| date.add_months(months))
+        .map(|date| date.to_unix() * 1000)
+        .unwrap_or(timestamp_ms)
+}
+
+fn local_day_of_week(timestamp_ms: i64) -> i32 {
+    gtk::glib::DateTime::from_unix_local(timestamp_ms / 1000)
         .map(|date| date.day_of_week())
-        .unwrap_or(1);
-    add_local_days(today, -(11 * 7 + weekday - 1))
+        .unwrap_or(1)
+}
+
+fn local_month_start_ms(timestamp_ms: i64) -> i64 {
+    gtk::glib::DateTime::from_unix_local(timestamp_ms / 1000)
+        .and_then(|date| gtk::glib::DateTime::from_local(date.year(), date.month(), 1, 0, 0, 0.0))
+        .map(|date| date.to_unix() * 1000)
+        .unwrap_or(timestamp_ms)
+}
+
+fn timeline_map_range(day_start: i64, mode: TimelineMapMode) -> (i64, i64) {
+    match mode {
+        TimelineMapMode::Day => (day_start, add_local_days(day_start, 1)),
+        TimelineMapMode::Week => {
+            let week_start = add_local_days(day_start, -(local_day_of_week(day_start) - 1));
+            (week_start, add_local_days(week_start, 7))
+        }
+        TimelineMapMode::Month => {
+            let month_start = local_month_start_ms(day_start);
+            (month_start, add_local_months(month_start, 1))
+        }
+    }
+}
+
+fn shift_timeline_period(day_start: i64, mode: TimelineMapMode, amount: i32) -> i64 {
+    match mode {
+        TimelineMapMode::Day => add_local_days(day_start, amount),
+        TimelineMapMode::Week => add_local_days(day_start, amount.saturating_mul(7)),
+        TimelineMapMode::Month => add_local_months(day_start, amount),
+    }
+}
+
+fn local_day_number(timestamp_ms: i64) -> String {
+    gtk::glib::DateTime::from_unix_local(timestamp_ms / 1000)
+        .map(|date| date.day_of_month().to_string())
+        .unwrap_or_default()
+}
+
+fn format_map_row_day(timestamp_ms: i64) -> String {
+    gtk::glib::DateTime::from_unix_local(timestamp_ms / 1000)
+        .and_then(|date| date.format("%a %-d"))
+        .map(|text| text.to_string())
+        .unwrap_or_else(|_| "Day".to_owned())
+}
+
+fn format_map_cell_time(timestamp_ms: i64, is_day_cell: bool) -> String {
+    let pattern = if is_day_cell {
+        "%A, %B %-d"
+    } else {
+        "%A, %B %-d · %-I %p"
+    };
+    gtk::glib::DateTime::from_unix_local(timestamp_ms / 1000)
+        .and_then(|date| date.format(pattern))
+        .map(|text| text.to_string())
+        .unwrap_or_else(|_| "Unknown time".to_owned())
+}
+
+fn display_map_app_name(app_id: &str, app_name: &str) -> String {
+    if !app_name.trim().is_empty() {
+        app_name.trim().to_owned()
+    } else if !app_id.trim().is_empty() {
+        app_id.trim().to_owned()
+    } else {
+        "Desktop".to_owned()
+    }
 }
 
 fn format_timeline_day(day_start: i64, today: i64) -> String {
@@ -3410,13 +3690,6 @@ fn format_timeline_day(day_start: i64, today: i64) -> String {
         .and_then(|date| date.format("%A, %B %-d"))
         .map(|date| format!("{prefix}{date}"))
         .unwrap_or_else(|_| "Timeline day".to_owned())
-}
-
-fn format_day_short(day_start: i64) -> String {
-    gtk::glib::DateTime::from_unix_local(day_start / 1000)
-        .and_then(|date| date.format("%a, %b %-d"))
-        .map(|date| date.to_string())
-        .unwrap_or_else(|_| "Unknown day".to_owned())
 }
 
 fn overlap_ms(left_start: i64, left_end: i64, right_start: i64, right_end: i64) -> i64 {
@@ -3482,20 +3755,36 @@ fn install_css() {
              padding: 16px;
          }
          .timeline-history-grid { margin-top: 6px; }
-         .timeline-heat-cell {
-             min-width: 14px;
-             min-height: 14px;
+         .timeline-map-hour-cell {
+             min-width: 18px;
+             min-height: 24px;
              padding: 0;
              border-radius: 4px;
              border: 1px solid alpha(@window_fg_color, 0.08);
              box-shadow: none;
          }
-         .timeline-heat-0 { background: alpha(@window_fg_color, 0.08); }
-         .timeline-heat-1 { background: alpha(#7459c7, 0.28); }
-         .timeline-heat-2 { background: alpha(#7459c7, 0.48); }
-         .timeline-heat-3 { background: alpha(#7459c7, 0.72); }
-         .timeline-heat-4 { background: #7459c7; }
-         .timeline-heat-selected { border: 2px solid @window_fg_color; }
+         .timeline-map-day-cell {
+             min-width: 54px;
+             min-height: 38px;
+             padding: 4px;
+             border-radius: 7px;
+             border: 1px solid alpha(@window_fg_color, 0.08);
+             box-shadow: none;
+         }
+         .timeline-map-empty { background: alpha(@window_fg_color, 0.08); }
+         .timeline-map-level-1 { opacity: 0.34; }
+         .timeline-map-level-2 { opacity: 0.54; }
+         .timeline-map-level-3 { opacity: 0.76; }
+         .timeline-map-level-4 { opacity: 1; }
+         .timeline-map-selected { border: 2px solid @window_fg_color; }
+         .app-map-0 { background: #7459c7; color: white; }
+         .app-map-1 { background: #3584e4; color: white; }
+         .app-map-2 { background: #2ec27e; color: white; }
+         .app-map-3 { background: #e66100; color: white; }
+         .app-map-4 { background: #e01b24; color: white; }
+         .app-map-5 { background: #1c8c8c; color: white; }
+         .app-map-6 { background: #c061cb; color: white; }
+         .app-map-7 { background: #986a44; color: white; }
          .timeline-ribbon-grid { margin-top: 2px; }
          .timeline-ribbon-track {
              background: alpha(@window_fg_color, 0.08);
