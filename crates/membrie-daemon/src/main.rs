@@ -1,6 +1,7 @@
 mod calendar;
 mod intelligence;
 mod ollama;
+mod transcription;
 
 use anyhow::{Context, Result, anyhow};
 use membrie_core::{

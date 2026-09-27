@@ -49,6 +49,14 @@ pub fn attachment_blob_path(hash: &str) -> PathBuf {
     attachment_blob_dir().join(shard).join(hash)
 }
 
+pub fn speech_model_path() -> PathBuf {
+    data_dir().join("models").join("ggml-base.en-q5_1.bin")
+}
+
+pub fn transcription_spool_dir() -> PathBuf {
+    data_dir().join("transcription-spool")
+}
+
 pub fn screen_spool_dir() -> PathBuf {
     if let Some(path) = env::var_os("XDG_RUNTIME_DIR") {
         return PathBuf::from(path).join("membrie-screen");

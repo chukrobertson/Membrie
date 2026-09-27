@@ -9,14 +9,19 @@ service.
 From a Membrie source checkout:
 
 ```bash
-sudo apt install build-essential cargo pkg-config libgtk-4-dev libadwaita-1-dev libglib2.0-dev gnome-shell gir1.2-ecal-2.0
+sudo apt install build-essential cargo pkg-config libgtk-4-dev libadwaita-1-dev libglib2.0-dev gnome-shell gir1.2-ecal-2.0 ffmpeg whisper.cpp
 ./scripts/install.sh
+./scripts/install-speech-model.sh
 ```
 
 The first command installs Ubuntu development packages. The second command compiles
 and installs Membrie for the current user. Log out and back in once if GNOME says the
 desktop bridge is queued rather than active. Membrie will then appear in the app
 grid and its local background services will start at login.
+
+The third command makes one verified 57 MiB model download and enables English voice-note
+transcription. It is optional: recordings are always retained even when the speech runtime or model
+is absent. Once installed, decoding and transcription happen entirely on this PC.
 
 After the GNOME bridge has loaded, press `Super+Shift+B` to open Quick Brie over the current
 workflow. GNOME launches a normal compact GTK window with a valid activation token rather than an
@@ -91,9 +96,10 @@ The Timeline composer can create an image Remembrie from a file picker, pasted i
 Mobile Companion adds a deliberate paste inbox and multi-file picker: text and links join the note,
 while every binary item iOS exposes is previewed before submission and retained on the PC. One mobile
 Remembrie accepts up to eight attachments and 100 MiB combined. PNG, JPEG, GIF, and WebP are interpreted
-by the selected local vision model; no item is sent to a remote API. Other formats are retained exactly
-but labeled unsupported for local understanding. Companion usage shown in its status sheet is only a
-local opening count and visible-time total, not telemetry.
+by the selected local vision model; common audio formats are transcribed by the optional local speech
+model for voice-note recall. No item is sent to a remote API. Other formats are retained exactly but
+labeled unsupported for local understanding. Companion usage shown in its status sheet is only a local
+opening count and visible-time total, not telemetry.
 
 ## Backups
 

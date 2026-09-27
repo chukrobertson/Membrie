@@ -3805,14 +3805,20 @@ fn apply_intelligence_status(state: &UiState, status: &IntelligenceStatus) {
     } else {
         String::new()
     };
+    let speech = if status.speech_available {
+        "Voice notes: ready"
+    } else {
+        "Voice notes: setup needed"
+    };
     state.brie_status.set_text(&format!(
-        "Ollama connected · {} · {} of {} Remembries indexed{}\nEmbeddings: {} · Context: {} tokens",
+        "Ollama connected · {} · {} of {} Remembries indexed{}\nEmbeddings: {} · Context: {} tokens · {}",
         status.settings.chat_model,
         status.indexed_remembries,
         status.total_remembries,
         processing,
         status.settings.embedding_model,
-        status.settings.context_tokens
+        status.settings.context_tokens,
+        speech
     ));
     state.brie_status.remove_css_class("error");
     state.brie_status.add_css_class("success");
@@ -4680,7 +4686,7 @@ fn timeline_entry_row(state: &Rc<UiState>, entry: &TimelineEntry) -> gtk::ListBo
 
     if !entry.attachments.is_empty() {
         let caution = gtk::Label::new(Some(
-            "Retained attachments are exact evidence. Any description or recognized text is local, machine-generated context and may be mistaken.",
+            "Retained attachments are exact evidence. Any description, recognized text, or audio transcript is local, machine-generated context and may be mistaken.",
         ));
         caution.add_css_class("caption");
         caution.add_css_class("timeline-evidence-caution");
@@ -4741,7 +4747,7 @@ fn timeline_evidence_caution(kind: &str) -> &'static str {
 fn attachment_analysis_label(state: &str) -> &'static str {
     match state {
         "pending" => "local understanding queued",
-        "complete" => "locally described and searchable",
+        "complete" => "locally understood and searchable",
         "failed" => "original retained; analysis unavailable",
         "unsupported" => "original retained; analysis not yet supported",
         _ => "original retained",
@@ -4784,7 +4790,7 @@ fn show_remembrance_evidence(
             let caution_text = if attachments.is_empty() {
                 timeline_evidence_caution(&remembrie.kind)
             } else {
-                "The retained attachments below are exact evidence. Machine-described image text is local interpretation and may be incomplete or mistaken."
+                "The retained attachments below are exact evidence. Machine-generated image descriptions and audio transcripts are local interpretations and may be incomplete or mistaken."
             };
             let caution = gtk::Label::new(Some(caution_text));
             caution.add_css_class("evidence-interpretation");

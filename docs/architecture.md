@@ -190,16 +190,21 @@ stored blob. A deliberate attachment retains the original bytes as canonical evi
 filename, media type, processing state, model, confidence, and generated interpretation remain
 attached to the Remembrie in SQLite.
 
-The first attachment analyzer accepts PNG, JPEG, GIF, and WebP images up to 32 MiB. It sends the
+The image attachment analyzer accepts PNG, JPEG, GIF, and WebP images up to 32 MiB. It sends the
 retained bytes only to the selected loopback Ollama vision model, stores the result as explicitly
 unverified machine description, and queues ordinary summary and embedding work afterward. Secret-like
-model output is withheld. Other formats and larger retained images remain available as originals but
-are labeled unsupported rather than silently interpreted. Deleting the last Remembrie that references
-a blob deletes that blob as well.
+model output is withheld. A separate speech-first analyzer accepts common audio attachments up to 30
+minutes. A fixed local FFmpeg command decodes them into a private temporary mono WAV, Ubuntu's
+`whisper.cpp` transcribes them with a verified model under Membrie's data directory, and the temporary
+audio is removed immediately afterward. The timestamped transcript is explicitly unverified,
+secret-like text is withheld, and recordings with no clear speech are labeled accordingly. Other
+formats and larger retained images remain available as originals but are labeled unsupported rather
+than silently interpreted. Deleting the last Remembrie that references a blob deletes that blob as
+well.
 
 Unknown and not-yet-understood attachment formats are never executed or presented as analyzed.
 Their filename, detected media type, size, and retained-original state remain visible. This lets
-capture support arrive independently from later PDF, office-document, audio, and video analyzers.
+capture support arrive independently from later PDF, office-document, and video analyzers.
 
 The daemon creates backups with SQLite's online backup API, verifies them with
 `integrity_check`, copies or hard-links every referenced attachment, writes a manifest, syncs the

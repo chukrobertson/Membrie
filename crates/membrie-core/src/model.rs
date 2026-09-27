@@ -149,9 +149,19 @@ pub struct Attachment {
 #[derive(Debug, Clone, PartialEq)]
 pub struct AttachmentProcessingJob {
     pub id: String,
+    pub kind: String,
     pub attachment: Attachment,
     pub model: String,
     pub attempts: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AudioTranscription {
+    pub transcript: String,
+    pub language: String,
+    pub speech_detected: bool,
+    pub confidence: String,
+    pub model: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -193,6 +203,7 @@ pub struct LocalModel {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct IntelligenceStatus {
     pub ollama_available: bool,
+    pub speech_available: bool,
     pub settings: IntelligenceSettings,
     pub available_models: Vec<LocalModel>,
     pub total_remembries: u64,

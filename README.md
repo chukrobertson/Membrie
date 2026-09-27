@@ -21,6 +21,7 @@ The project is intentionally local-first and self-hosted:
 - Image Remembries from the desktop, plus a Mobile Companion paste inbox for mixed text, links, images, and files
 - Content-addressed attachment storage with byte-level deduplication and retained original evidence
 - Local image description and visible-text extraction through the selected Ollama vision model
+- Local English voice-note transcription through Ubuntu's `whisper.cpp`, with timestamped searchable evidence
 - Day, week, and month activity maps with stable application colors and day-by-day chronology
 - Color-grouped application time ribbon with idle gaps, stable app colors, and exact evidence
 - Timeline filters for observed activity, scheduled events, and manual notes, including upcoming days
@@ -61,7 +62,7 @@ The project is intentionally local-first and self-hosted:
 - Coarse, local-only Companion usage totals for the last day, week, and month
 - Local model selection and visible indexing health
 
-Broader file understanding, per-calendar controls, Thunderbird evidence, meeting transcripts,
+Broader document understanding, per-calendar controls, Thunderbird evidence, meeting transcripts,
 individual device revocation, and deeper pattern detection are the next implementation milestones.
 
 ## Install on Ubuntu
@@ -69,7 +70,7 @@ individual device revocation, and deeper pattern detection are the next implemen
 Install the native build requirements once:
 
 ```bash
-sudo apt install build-essential cargo pkg-config libgtk-4-dev libadwaita-1-dev libglib2.0-dev gnome-shell gir1.2-ecal-2.0
+sudo apt install build-essential cargo pkg-config libgtk-4-dev libadwaita-1-dev libglib2.0-dev gnome-shell gir1.2-ecal-2.0 ffmpeg whisper.cpp
 ```
 
 Then run the local installer from this checkout:
@@ -100,6 +101,19 @@ Screen Memory and image-attachment understanding. Image understanding runs only 
 attachment; it does not require automatic Screen Memory to be enabled. Other installed vision-capable
 Ollama models can be selected in Privacy & Capture.
 
+Voice-note understanding uses Ubuntu's native `whisper.cpp` package rather than an audio upload or
+remote API. Install Membrie's small, quantized English model once:
+
+```bash
+./scripts/install-speech-model.sh
+```
+
+That script makes one verified 57 MiB model download. Afterward, M4A and other common audio
+attachments up to 30 minutes are decoded and transcribed entirely on this PC. Timestamped text is
+explicitly labeled as an unverified machine transcription; the original recording remains the
+canonical evidence. Audio with no clear speech is labeled that way instead of silently treated as a
+voice note.
+
 Calendar access is separately opt-in. Membrie reads enabled calendars from Ubuntu's local
 Evolution Data Server, never receives calendar-account credentials, and exposes no calendar write
 or refresh operation. A provider configured in GNOME may continue its own normal synchronization;
@@ -118,9 +132,10 @@ unless the user explicitly relaxes that boundary.
 The Mobile Companion accepts every file representation that iOS exposes through an explicit paste
 gesture or file picker, with up to eight attachments and 100 MiB combined in one Remembrie. Text and
 links enter the searchable note directly. PNG, JPEG, GIF, and WebP receive retained previews plus
-local understanding. Other formats, including HEIC when no local conversion is available, are
+local understanding. Common audio formats receive local speech transcription when the optional
+speech model is installed. Other formats, including HEIC when no local conversion is available, are
 retained exactly but labeled unsupported for machine analysis. Originals remain canonical; Brie
-sees only clearly labeled, fallible text produced by the local vision model.
+sees only clearly labeled, fallible text produced by local models.
 
 To remove the installed application while keeping every Remembrie and backup:
 

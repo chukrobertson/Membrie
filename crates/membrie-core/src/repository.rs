@@ -1,12 +1,12 @@
 use crate::model::{
     ActivityRecordResult, ActivitySnapshot, Attachment, AttachmentBatchImport, AttachmentImport,
-    AttachmentProcessingJob, CalendarEventSnapshot, CalendarSnapshot, CalendarSyncResult,
-    CaptureCandidate, CaptureDecision, CaptureRule, CaptureStatus, EmbeddedChunk,
-    IntelligenceSettings, IntelligenceStatus, LocalModel, MobileUsageSummary, NewRemembrie,
-    PauseMode, ProcessingJob, RecallSnapshot, Remembrie, ScreenAnalysis, ScreenCaptureCandidate,
-    ScreenCaptureResult, SearchHit, SemanticCaptureCandidate, SemanticCaptureResult,
-    StagedAttachmentImport, TimelineActivityObservation, TimelineActivitySummary, TimelineEntry,
-    TimelineHistorySpan, TimelineMapSlice,
+    AttachmentProcessingJob, AudioTranscription, CalendarEventSnapshot, CalendarSnapshot,
+    CalendarSyncResult, CaptureCandidate, CaptureDecision, CaptureRule, CaptureStatus,
+    EmbeddedChunk, IntelligenceSettings, IntelligenceStatus, LocalModel, MobileUsageSummary,
+    NewRemembrie, PauseMode, ProcessingJob, RecallSnapshot, Remembrie, ScreenAnalysis,
+    ScreenCaptureCandidate, ScreenCaptureResult, SearchHit, SemanticCaptureCandidate,
+    SemanticCaptureResult, StagedAttachmentImport, TimelineActivityObservation,
+    TimelineActivitySummary, TimelineEntry, TimelineHistorySpan, TimelineMapSlice,
 };
 use crate::policy::{MAX_AUTOMATIC_CONTENT_BYTES, exclusion_reason, sensitive_reason};
 use rusqlite::{Connection, DatabaseName, OptionalExtension, Row, Transaction, params};
@@ -19,7 +19,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use uuid::Uuid;
 
-const SCHEMA_VERSION: i64 = 9;
+const SCHEMA_VERSION: i64 = 10;
 const DUPLICATE_WINDOW_MS: i64 = 24 * 60 * 60 * 1000;
 const MIN_SEMANTIC_SIMILARITY: f64 = 0.25;
 const SEMANTIC_SCORE_WINDOW: f64 = 0.20;
@@ -411,6 +411,31 @@ CREATE INDEX IF NOT EXISTS idx_mobile_usage_time
     ON mobile_usage_events(occurred_at_ms DESC);
 "#;
 
+const MIGRATION_10: &str = r#"
+UPDATE remembrie_contents
+SET analysis_state = 'pending', analysis_error = NULL
+WHERE role = 'attachment' AND analysis_state = 'unsupported'
+  AND mime_type IN (
+      'audio/aac', 'audio/flac', 'audio/m4a', 'audio/mp4', 'audio/mpeg',
+      'audio/ogg', 'audio/opus', 'audio/wav', 'audio/webm', 'audio/x-aac',
+      'audio/x-caf', 'audio/x-flac', 'audio/x-m4a', 'audio/x-wav'
+  );
+
+INSERT OR IGNORE INTO processing_jobs(
+    id, remembrie_id, kind, state, attempts,
+    available_at_ms, created_at_ms, updated_at_ms
+)
+SELECT 'attachment:' || id, remembrie_id, 'attachment_audio', 'pending', 0,
+       0, created_at_ms, created_at_ms
+FROM remembrie_contents
+WHERE role = 'attachment' AND analysis_state = 'pending'
+  AND mime_type IN (
+      'audio/aac', 'audio/flac', 'audio/m4a', 'audio/mp4', 'audio/mpeg',
+      'audio/ogg', 'audio/opus', 'audio/wav', 'audio/webm', 'audio/x-aac',
+      'audio/x-caf', 'audio/x-flac', 'audio/x-m4a', 'audio/x-wav'
+  );
+"#;
+
 #[derive(Debug, Error)]
 pub enum RepositoryError {
     #[error("database error: {0}")]
@@ -443,6 +468,7 @@ struct StoredAttachmentInput {
     byte_size: u64,
     mime_type: String,
     analysis_state: &'static str,
+    processing_kind: Option<&'static str>,
     newly_stored: bool,
 }
 
@@ -526,6 +552,13 @@ impl Repository {
         if version < 9 {
             let transaction = connection.unchecked_transaction()?;
             transaction.execute_batch(MIGRATION_9)?;
+            transaction.pragma_update(None, "user_version", 9)?;
+            transaction.commit()?;
+            version = 9;
+        }
+        if version < 10 {
+            let transaction = connection.unchecked_transaction()?;
+            transaction.execute_batch(MIGRATION_10)?;
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             transaction.commit()?;
         }
@@ -700,12 +733,19 @@ impl Repository {
                 }
             };
             total_bytes = total_bytes.saturating_add(byte_size);
-            let analysis_state =
+            let processing_kind =
                 if supported_image_mime(&mime_type) && byte_size <= MAX_ANALYZED_IMAGE_BYTES {
-                    "pending"
+                    Some("attachment_image")
+                } else if supported_audio_mime(&mime_type) {
+                    Some("attachment_audio")
                 } else {
-                    "unsupported"
+                    None
                 };
+            let analysis_state = if processing_kind.is_some() {
+                "pending"
+            } else {
+                "unsupported"
+            };
             stored.push(StoredAttachmentInput {
                 content_id: Uuid::now_v7().to_string(),
                 original_name,
@@ -713,6 +753,7 @@ impl Repository {
                 byte_size,
                 mime_type,
                 analysis_state,
+                processing_kind,
                 newly_stored,
             });
         }
@@ -810,15 +851,16 @@ impl Repository {
                         attachment.analysis_state
                     ],
                 )?;
-                if attachment.analysis_state == "pending" {
+                if let Some(processing_kind) = attachment.processing_kind {
                     transaction.execute(
                         "INSERT INTO processing_jobs(
                             id, remembrie_id, kind, state, attempts,
                             available_at_ms, created_at_ms, updated_at_ms
-                         ) VALUES(?1, ?2, 'attachment_image', 'pending', 0, 0, ?3, ?3)",
+                         ) VALUES(?1, ?2, ?3, 'pending', 0, 0, ?4, ?4)",
                         params![
                             format!("attachment:{}", attachment.content_id),
                             remembrie_id,
+                            processing_kind,
                             now
                         ],
                     )?;
@@ -1509,30 +1551,34 @@ impl Repository {
 
     pub fn claim_attachment_processing_job(
         &mut self,
+        audio_ready: bool,
     ) -> Result<Option<AttachmentProcessingJob>, RepositoryError> {
         let now = now_ms()?;
         let transaction = self.connection.transaction()?;
         let candidate = transaction
             .query_row(
-                "SELECT p.id, p.attempts, c.id
+                "SELECT p.id, p.kind, p.attempts, c.id
                  FROM processing_jobs p
                  JOIN remembrie_contents c
                    ON p.id = 'attachment:' || c.id
-                 WHERE p.kind = 'attachment_image' AND p.state = 'pending'
-                   AND p.available_at_ms <= ?1 AND c.analysis_state = 'pending'
+                 WHERE p.kind IN ('attachment_image', 'attachment_audio')
+                   AND (p.kind = 'attachment_image' OR ?2 = 1)
+                   AND p.state = 'pending' AND p.available_at_ms <= ?1
+                   AND c.analysis_state = 'pending'
                  ORDER BY p.available_at_ms, p.created_at_ms
                  LIMIT 1",
-                [now],
+                params![now, audio_ready],
                 |row| {
                     Ok((
                         row.get::<_, String>(0)?,
-                        row.get::<_, u32>(1)?,
-                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, u32>(2)?,
+                        row.get::<_, String>(3)?,
                     ))
                 },
             )
             .optional()?;
-        let Some((job_id, attempts, content_id)) = candidate else {
+        let Some((job_id, kind, attempts, content_id)) = candidate else {
             transaction.commit()?;
             return Ok(None);
         };
@@ -1557,6 +1603,7 @@ impl Repository {
         )?;
         Ok(Some(AttachmentProcessingJob {
             id: job_id,
+            kind,
             attachment,
             model,
             attempts: attempts + 1,
@@ -1603,6 +1650,81 @@ impl Repository {
                 analysis_text,
                 analysis.model,
                 analysis.confidence
+            ],
+        )?;
+        rebuild_attachment_captured_body(&transaction, &remembrie_id)?;
+        transaction.execute(
+            "UPDATE processing_jobs
+             SET state = 'complete', last_error = NULL, updated_at_ms = ?2
+             WHERE id = ?1",
+            params![job_id, now],
+        )?;
+        transaction.execute(
+            "UPDATE processing_jobs
+             SET state = 'pending', attempts = 0, last_error = NULL,
+                 available_at_ms = 0, updated_at_ms = ?2
+             WHERE id = ?1",
+            params![format!("enrich:{remembrie_id}"), now],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn complete_attachment_transcription(
+        &mut self,
+        job_id: &str,
+        transcription: &AudioTranscription,
+    ) -> Result<(), RepositoryError> {
+        if !matches!(transcription.confidence.as_str(), "low" | "medium" | "high")
+            || transcription.model.trim().is_empty()
+            || transcription.model.chars().count() > 200
+            || transcription.language.chars().count() > 40
+            || transcription.transcript.chars().count() > 100_000
+        {
+            return Err(RepositoryError::Validation(
+                "invalid local audio transcription".to_owned(),
+            ));
+        }
+        let content_id = job_id.strip_prefix("attachment:").ok_or_else(|| {
+            RepositoryError::Validation("invalid attachment job identifier".to_owned())
+        })?;
+        let mut analysis_text = if transcription.speech_detected {
+            let language = if transcription.language.trim().is_empty() {
+                "unknown"
+            } else {
+                transcription.language.trim()
+            };
+            format!(
+                "Machine-transcribed audio attachment (unverified; language: {language}).\nTranscript: {}",
+                transcription.transcript.trim()
+            )
+        } else {
+            "Machine-transcribed audio attachment (unverified).\nNo clear speech was detected."
+                .to_owned()
+        };
+        if let Some(reason) = sensitive_reason(&analysis_text) {
+            analysis_text = format!(
+                "Local audio transcription was withheld because its text resembled {reason}. Inspect the original attachment directly."
+            );
+        }
+        let now = now_ms()?;
+        let transaction = self.connection.transaction()?;
+        let remembrie_id: String = transaction.query_row(
+            "SELECT remembrie_id FROM remembrie_contents
+             WHERE id = ?1 AND role = 'attachment'",
+            [content_id],
+            |row| row.get(0),
+        )?;
+        transaction.execute(
+            "UPDATE remembrie_contents
+             SET text_content = ?2, analysis_state = 'complete', analysis_model = ?3,
+                 analysis_confidence = ?4, analysis_error = NULL
+             WHERE id = ?1 AND role = 'attachment'",
+            params![
+                content_id,
+                analysis_text,
+                transcription.model,
+                transcription.confidence
             ],
         )?;
         rebuild_attachment_captured_body(&transaction, &remembrie_id)?;
@@ -1683,8 +1805,13 @@ impl Repository {
                    AND NOT EXISTS (
                        SELECT 1 FROM processing_jobs attachment_job
                        WHERE attachment_job.remembrie_id = processing_jobs.remembrie_id
-                         AND attachment_job.kind = 'attachment_image'
-                         AND attachment_job.state IN ('pending', 'running')
+                         AND (
+                             (attachment_job.kind = 'attachment_image'
+                              AND attachment_job.state IN ('pending', 'running'))
+                             OR
+                             (attachment_job.kind = 'attachment_audio'
+                              AND attachment_job.state = 'running')
+                         )
                    )
                  ORDER BY available_at_ms, created_at_ms
                  LIMIT 1",
@@ -1858,7 +1985,7 @@ impl Repository {
                AND id IN (
                    SELECT SUBSTR(id, LENGTH('attachment:') + 1)
                    FROM processing_jobs
-                   WHERE kind = 'attachment_image' AND state = 'failed'
+                   WHERE kind IN ('attachment_image', 'attachment_audio') AND state = 'failed'
                )",
             [],
         )? as u64;
@@ -1866,7 +1993,7 @@ impl Repository {
             "UPDATE processing_jobs
              SET state = 'pending', attempts = 0, last_error = NULL,
                  available_at_ms = 0, updated_at_ms = ?1
-             WHERE kind IN ('enrich', 'attachment_image') AND state = 'failed'",
+             WHERE kind IN ('enrich', 'attachment_image', 'attachment_audio') AND state = 'failed'",
             [now],
         )? as u64;
         transaction.commit()?;
@@ -1877,6 +2004,7 @@ impl Repository {
         &self,
         ollama_available: bool,
         available_models: Vec<LocalModel>,
+        speech_available: bool,
     ) -> Result<IntelligenceStatus, RepositoryError> {
         let settings = self.intelligence_settings()?;
         let total_remembries = self.connection.query_row(
@@ -1898,7 +2026,7 @@ impl Repository {
                 COALESCE(SUM(state = 'pending'), 0),
                 COALESCE(SUM(state = 'running'), 0),
                 COALESCE(SUM(state = 'failed'), 0)
-             FROM processing_jobs WHERE kind IN ('enrich', 'attachment_image')",
+             FROM processing_jobs WHERE kind IN ('enrich', 'attachment_image', 'attachment_audio')",
             [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
@@ -1914,6 +2042,7 @@ impl Repository {
             .optional()?;
         Ok(IntelligenceStatus {
             ollama_available,
+            speech_available,
             settings,
             available_models,
             total_remembries,
@@ -4441,11 +4570,9 @@ fn attachment_body(note: &str, attachments: &[AttachmentBodyPart<'_>]) -> String
             format_attachment_size(attachment.byte_size)
         ));
         match attachment.analysis_state {
-            "pending" => {
-                body.push_str("\nLocal image description and text recognition are pending.")
-            }
+            "pending" => body.push_str("\nLocal content understanding is pending."),
             "failed" => body.push_str(
-                "\nLocal image analysis was unavailable; the original attachment is retained.",
+                "\nLocal content analysis was unavailable; the original attachment is retained.",
             ),
             "unsupported" => body.push_str(
                 "\nThe original is retained. This format does not yet have local content analysis.",
@@ -4683,6 +4810,23 @@ fn sniff_attachment_mime(prefix: &[u8], declared: Option<&str>) -> String {
     if prefix.len() >= 12 && &prefix[..4] == b"RIFF" && &prefix[8..12] == b"WEBP" {
         return "image/webp".to_owned();
     }
+    if prefix.len() >= 12 && &prefix[..4] == b"RIFF" && &prefix[8..12] == b"WAVE" {
+        return "audio/wav".to_owned();
+    }
+    if prefix.starts_with(b"fLaC") {
+        return "audio/flac".to_owned();
+    }
+    if prefix.starts_with(b"OggS") {
+        return declared
+            .filter(|mime_type| matches!(*mime_type, "audio/opus" | "audio/ogg"))
+            .unwrap_or("audio/ogg")
+            .to_ascii_lowercase();
+    }
+    if prefix.starts_with(b"ID3")
+        || (prefix.len() >= 2 && prefix[0] == 0xff && prefix[1] & 0xe0 == 0xe0)
+    {
+        return "audio/mpeg".to_owned();
+    }
     if prefix.starts_with(b"%PDF-") {
         return "application/pdf".to_owned();
     }
@@ -4694,6 +4838,12 @@ fn sniff_attachment_mime(prefix: &[u8], declared: Option<&str>) -> String {
         )
     {
         return "image/heic".to_owned();
+    }
+    if prefix.len() >= 12
+        && &prefix[4..8] == b"ftyp"
+        && matches!(&prefix[8..12], b"M4A " | b"M4B " | b"M4P ")
+    {
+        return "audio/mp4".to_owned();
     }
     declared
         .map(str::trim)
@@ -4712,6 +4862,26 @@ fn supported_image_mime(mime_type: &str) -> bool {
     matches!(
         mime_type,
         "image/png" | "image/jpeg" | "image/gif" | "image/webp"
+    )
+}
+
+fn supported_audio_mime(mime_type: &str) -> bool {
+    matches!(
+        mime_type,
+        "audio/aac"
+            | "audio/flac"
+            | "audio/m4a"
+            | "audio/mp4"
+            | "audio/mpeg"
+            | "audio/ogg"
+            | "audio/opus"
+            | "audio/wav"
+            | "audio/webm"
+            | "audio/x-aac"
+            | "audio/x-caf"
+            | "audio/x-flac"
+            | "audio/x-m4a"
+            | "audio/x-wav"
     )
 }
 
@@ -5691,7 +5861,9 @@ mod tests {
         let settings = repository.intelligence_settings().unwrap();
         assert_eq!(settings.chat_model, "gemma4:12b");
         assert_eq!(settings.embedding_model, "embeddinggemma:latest");
-        let status = repository.intelligence_status(false, Vec::new()).unwrap();
+        let status = repository
+            .intelligence_status(false, Vec::new(), false)
+            .unwrap();
         assert_eq!(status.total_remembries, 1);
         assert_eq!(status.pending_jobs, 1);
         let _ = fs::remove_file(path);
@@ -5828,7 +6000,7 @@ mod tests {
         assert_eq!(fs::read(&blob_path).unwrap(), image_bytes);
 
         let job = repository
-            .claim_attachment_processing_job()
+            .claim_attachment_processing_job(false)
             .unwrap()
             .unwrap();
         repository
@@ -5857,6 +6029,153 @@ mod tests {
 
         assert_eq!(repository.delete_since(0).unwrap(), 2);
         assert!(!blob_path.exists());
+        drop(repository);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn imports_and_completes_a_local_audio_transcription() {
+        let directory = std::env::temp_dir().join(format!("membrie-audio-test-{}", Uuid::now_v7()));
+        let inbox = directory.join("attachment-inbox");
+        fs::create_dir_all(&inbox).unwrap();
+        let path = directory.join("membrie.db");
+        let staged = inbox.join("voice-note");
+        fs::write(&staged, b"test-audio-container").unwrap();
+
+        let mut repository = Repository::open(&path).unwrap();
+        let (remembrie, attachment) = repository
+            .import_attachment(AttachmentImport {
+                staged_path: staged.display().to_string(),
+                original_name: "Voice Note.m4a".to_owned(),
+                declared_mime_type: Some("audio/x-m4a".to_owned()),
+                title: "Reminder from my phone".to_owned(),
+                note: String::new(),
+                source_app: "Membrie Companion".to_owned(),
+                window_title: Some("Mobile WebUI".to_owned()),
+            })
+            .unwrap();
+        assert_eq!(attachment.analysis_state, "pending");
+        assert!(
+            repository
+                .claim_attachment_processing_job(false)
+                .unwrap()
+                .is_none()
+        );
+        assert!(repository.claim_processing_job().unwrap().is_some());
+
+        let job = repository
+            .claim_attachment_processing_job(true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.kind, "attachment_audio");
+        repository
+            .complete_attachment_transcription(
+                &job.id,
+                &AudioTranscription {
+                    transcript: "[00:02] Remember to call Duke tomorrow.".to_owned(),
+                    language: "en".to_owned(),
+                    speech_detected: true,
+                    confidence: "high".to_owned(),
+                    model: "whisper.cpp/base.en-q5_1".to_owned(),
+                },
+            )
+            .unwrap();
+
+        let remembered = repository.get(&remembrie.id).unwrap().unwrap();
+        assert!(
+            remembered
+                .body
+                .contains("Machine-transcribed audio attachment")
+        );
+        assert!(remembered.body.contains("Remember to call Duke tomorrow"));
+        let completed = repository.list_attachments(&remembrie.id).unwrap();
+        assert_eq!(completed[0].analysis_state, "complete");
+        assert_eq!(completed[0].analysis_confidence.as_deref(), Some("high"));
+        assert!(repository.claim_processing_job().unwrap().is_some());
+
+        drop(repository);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn upgrades_version_nine_audio_attachments_into_the_speech_queue() {
+        let directory =
+            std::env::temp_dir().join(format!("membrie-migration-v9-{}", Uuid::now_v7()));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("membrie.db");
+        let connection = Connection::open(&path).unwrap();
+        for migration in [
+            MIGRATION_1,
+            MIGRATION_2,
+            MIGRATION_3,
+            MIGRATION_4,
+            MIGRATION_5,
+            MIGRATION_6,
+            MIGRATION_7,
+            MIGRATION_8,
+            MIGRATION_9,
+        ] {
+            connection.execute_batch(migration).unwrap();
+        }
+        connection.pragma_update(None, "user_version", 9).unwrap();
+        let now = now_ms().unwrap();
+        connection
+            .execute(
+                "INSERT INTO remembries(
+                    id, kind, occurred_at_ms, title, sensitivity, importance,
+                    pinned, created_at_ms, updated_at_ms
+                 ) VALUES('existing-audio', 'note', ?1, 'Existing voice note',
+                          'normal', 0.5, 0, ?1, ?1)",
+                [now],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO remembrie_contents(
+                    id, remembrie_id, role, mime_type, text_content, created_at_ms
+                 ) VALUES('existing-audio-body', 'existing-audio', 'captured',
+                          'text/plain', 'Retained voice note', ?1)",
+                [now],
+            )
+            .unwrap();
+        let hash = "a".repeat(64);
+        connection
+            .execute(
+                "INSERT INTO attachment_blobs(hash, byte_size, mime_type, created_at_ms)
+                 VALUES(?1, 128, 'audio/x-m4a', ?2)",
+                params![hash, now],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO remembrie_contents(
+                    id, remembrie_id, role, mime_type, blob_hash, created_at_ms,
+                    original_name, analysis_state
+                 ) VALUES('existing-audio-file', 'existing-audio', 'attachment',
+                          'audio/x-m4a', ?1, ?2, 'Voice Note.m4a', 'unsupported')",
+                params![hash, now],
+            )
+            .unwrap();
+        drop(connection);
+
+        let mut repository = Repository::open(&path).unwrap();
+        let attachment = repository
+            .get_attachment("existing-audio-file")
+            .unwrap()
+            .unwrap();
+        assert_eq!(attachment.analysis_state, "pending");
+        assert!(
+            repository
+                .claim_attachment_processing_job(false)
+                .unwrap()
+                .is_none()
+        );
+        let job = repository
+            .claim_attachment_processing_job(true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.kind, "attachment_audio");
+
         drop(repository);
         fs::remove_dir_all(directory).unwrap();
     }
@@ -5917,7 +6236,7 @@ mod tests {
         );
         assert!(repository.claim_processing_job().unwrap().is_none());
         let image_job = repository
-            .claim_attachment_processing_job()
+            .claim_attachment_processing_job(false)
             .unwrap()
             .unwrap();
         repository
@@ -5996,7 +6315,9 @@ mod tests {
                 .unwrap()
         );
 
-        let status = repository.intelligence_status(true, Vec::new()).unwrap();
+        let status = repository
+            .intelligence_status(true, Vec::new(), false)
+            .unwrap();
         assert_eq!(status.indexed_remembries, 1);
         assert_eq!(status.pending_jobs, 0);
         let hits = repository

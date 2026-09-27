@@ -45,5 +45,6 @@ Attachment bytes are canonical evidence but deliberately live outside SQLite und
 `blobs/sha256/<prefix>/<hash>`. The database owns their references and lifecycle. Identical files
 deduplicate by hash; a single Remembrie can reference a reviewed set of attachments; complete backups
 contain both the verified database and every referenced blob.
-Image descriptions and extracted visible text are derived, fallible, model-labeled material and can
-be retried or regenerated without changing the retained original.
+Image descriptions, extracted visible text, and timestamped voice-note transcripts are derived,
+fallible, model-labeled material and can be retried or regenerated without changing the retained
+original.

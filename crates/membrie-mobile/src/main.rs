@@ -628,13 +628,13 @@ fn create_attachment(request: &mut Request, state: &AppState) -> Result<Prepared
                 .filter(|attachment| attachment.analysis_state == "pending")
                 .count();
             let message = match (attachments.len(), pending) {
-                (1, 1) => "Attachment saved; local image understanding is queued".to_owned(),
+                (1, 1) => "Attachment saved; local understanding is queued".to_owned(),
                 (1, _) => "Attachment saved; its original is retained locally".to_owned(),
                 (count, 0) => {
                     format!("{count} attachments saved; their originals are retained locally")
                 }
                 (count, pending) => format!(
-                    "{count} attachments saved; local understanding is queued for {pending} image{}",
+                    "{count} attachments saved; local understanding is queued for {pending} item{}",
                     if pending == 1 { "" } else { "s" }
                 ),
             };

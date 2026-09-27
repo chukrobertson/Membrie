@@ -82,4 +82,9 @@ fi
 if ! /usr/bin/python3 -c "import gi; gi.require_version('ECal', '2.0')" >/dev/null 2>&1; then
     echo "Optional calendar support needs: sudo apt install gir1.2-ecal-2.0"
 fi
+if ! command -v whisper-cli >/dev/null 2>&1 || ! command -v ffmpeg >/dev/null 2>&1; then
+    echo "Optional voice-note understanding needs: sudo apt install ffmpeg whisper.cpp"
+elif [[ ! -f "$data_home/membrie/models/ggml-base.en-q5_1.bin" ]]; then
+    echo "To enable local voice-note understanding, run: ./scripts/install-speech-model.sh"
+fi
 echo "Your Remembries remain in $data_home/membrie."

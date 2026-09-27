@@ -16,3 +16,4 @@ anyhow.workspace = true
 membrie-core = { path = "../membrie-core" }
 serde.workspace = true
 serde_json.workspace = true
+uuid.workspace = true
