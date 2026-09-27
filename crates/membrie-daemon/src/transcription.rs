@@ -20,9 +20,8 @@ const MAX_TRANSCRIPT_CHARACTERS: usize = 100_000;
 pub fn is_ready() -> bool {
     [FFMPEG, FFPROBE, TIMEOUT, WHISPER_CLI]
         .iter()
-        .all(regular_file)
-        && speech_model_path()
-            .metadata()
+        .all(installed_executable)
+        && fs::symlink_metadata(speech_model_path())
             .is_ok_and(|metadata| metadata.is_file() && metadata.len() > 20 * 1024 * 1024)
 }
 
@@ -81,9 +80,9 @@ pub fn transcribe(job: &AttachmentProcessingJob) -> Result<AudioTranscription> {
     if metadata.len() == 0 || metadata.len() > MAX_JSON_BYTES {
         bail!("the local speech model returned an invalid result");
     }
-    let json =
-        fs::read_to_string(&json_path).context("the local speech transcript could not be read")?;
-    parse_whisper_output(&json)
+    let json_bytes =
+        fs::read(&json_path).context("the local speech transcript could not be read")?;
+    parse_whisper_bytes(&json_bytes)
 }
 
 fn audio_duration(path: &std::path::Path) -> Result<f64> {
@@ -133,6 +132,10 @@ fn validated_attachment_path(job: &AttachmentProcessingJob) -> Result<std::path:
 
 fn regular_file(path: impl AsRef<std::path::Path>) -> bool {
     fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_file())
+}
+
+fn installed_executable(path: impl AsRef<std::path::Path>) -> bool {
+    fs::metadata(path).is_ok_and(|metadata| metadata.is_file())
 }
 
 struct TranscriptionWork {
@@ -264,6 +267,11 @@ fn parse_whisper_output(json: &str) -> Result<AudioTranscription> {
     })
 }
 
+fn parse_whisper_bytes(json: &[u8]) -> Result<AudioTranscription> {
+    let json = String::from_utf8_lossy(json);
+    parse_whisper_output(&json)
+}
+
 fn contains_speech(text: &str) -> bool {
     let compact = text
         .trim()
@@ -340,5 +348,18 @@ mod tests {
         assert!(!result.speech_detected);
         assert!(result.transcript.is_empty());
         assert_eq!(result.confidence, "low");
+    }
+
+    #[test]
+    fn replaces_invalid_model_bytes_without_losing_the_result() {
+        let mut json = br#"{
+            "result":{"language":"en"},
+            "transcription":[{"offsets":{"from":0},"text":" Voice note "#
+            .to_vec();
+        json.push(0xff);
+        json.extend_from_slice(br#" text","tokens":[{"text":" Voice","p":0.8}]}]}"#);
+        let result = parse_whisper_bytes(&json).unwrap();
+        assert!(result.speech_detected);
+        assert!(result.transcript.contains("Voice note"));
     }
 }
