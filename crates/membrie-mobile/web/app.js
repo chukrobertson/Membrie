@@ -8,9 +8,19 @@ let selectedAttachments = [];
 const attachmentPreviewUrls = new Map();
 let usageStarted = false;
 let pastedItemSequence = 0;
+let mediaRecorder = null;
+let recordingStream = null;
+let recordingChunks = [];
+let recordingStartedAt = 0;
+let recordingTimer = null;
+let recordedVoiceFile = null;
+let fetchedPcImage = null;
+let fetchedPcImageUrl = null;
+let recallMediaUrls = [];
 
 const MAX_ATTACHMENTS = 8;
 const MAX_ATTACHMENT_BYTES = 100 * 1024 * 1024;
+const MAX_RECORDING_MS = 30 * 60 * 1000;
 
 const $ = (selector) => document.querySelector(selector);
 const pairScreen = $("#pair-screen");
@@ -173,6 +183,10 @@ $("#note-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   const button = event.submitter;
   const result = $("#note-result");
+  if (mediaRecorder?.state === "recording") {
+    setResult(result, "Stop the voice recording before remembering it.", false);
+    return;
+  }
   button.disabled = true;
   const title = $("#note-title").value;
   const body = $("#note-body").value;
@@ -227,9 +241,11 @@ async function cancelUploads(uploadIds) {
 
 function clearAttachments() {
   selectedAttachments = [];
+  recordedVoiceFile = null;
   attachmentPreviewUrls.forEach((url) => URL.revokeObjectURL(url));
   attachmentPreviewUrls.clear();
   renderAttachments();
+  updateVoiceRecorder("Recorded here, understood locally on your PC.");
 }
 
 function addAttachments(files) {
@@ -269,6 +285,10 @@ function addAttachments(files) {
 
 function removeAttachment(index) {
   const [removed] = selectedAttachments.splice(index, 1);
+  if (removed === recordedVoiceFile) {
+    recordedVoiceFile = null;
+    updateVoiceRecorder("Recording discarded. You can make another whenever you are ready.");
+  }
   const url = attachmentPreviewUrls.get(removed);
   if (url) URL.revokeObjectURL(url);
   attachmentPreviewUrls.delete(removed);
@@ -296,6 +316,17 @@ function renderAttachments() {
         attachmentPreviewUrls.set(file, url);
       }
       visual.src = url;
+    } else if (file.type.startsWith("audio/")) {
+      visual = document.createElement("audio");
+      visual.className = "attachment-audio";
+      visual.controls = true;
+      visual.preload = "metadata";
+      let url = attachmentPreviewUrls.get(file);
+      if (!url) {
+        url = URL.createObjectURL(file);
+        attachmentPreviewUrls.set(file, url);
+      }
+      visual.src = url;
     } else {
       visual = textElement("div", fileKind(file), "attachment-kind");
     }
@@ -314,6 +345,126 @@ function renderAttachments() {
   });
   preview.hidden = false;
 }
+
+function preferredRecordingType() {
+  if (!window.MediaRecorder) return "";
+  return [
+    "audio/mp4;codecs=mp4a.40.2",
+    "audio/mp4",
+    "audio/webm;codecs=opus",
+    "audio/webm",
+    "audio/ogg;codecs=opus",
+  ].find((type) => MediaRecorder.isTypeSupported?.(type)) || "";
+}
+
+function recordingExtension(type) {
+  if (type.includes("mp4")) return "m4a";
+  if (type.includes("ogg")) return "ogg";
+  return "webm";
+}
+
+function voiceFilename(type) {
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  return `Voice note ${stamp}.${recordingExtension(type)}`;
+}
+
+function updateVoiceTimer() {
+  const elapsedMs = Math.min(Date.now() - recordingStartedAt, MAX_RECORDING_MS);
+  const elapsedSeconds = Math.floor(elapsedMs / 1000);
+  const minutes = Math.floor(elapsedSeconds / 60);
+  const seconds = String(elapsedSeconds % 60).padStart(2, "0");
+  $("#voice-timer").textContent = `${minutes}:${seconds}`;
+  if (elapsedMs >= MAX_RECORDING_MS) stopVoiceRecording();
+}
+
+function updateVoiceRecorder(message) {
+  const recording = mediaRecorder?.state === "recording";
+  const button = $("#record-voice");
+  button.classList.toggle("recording", recording);
+  button.replaceChildren(textElement("span", recording ? "■" : "●"), document.createTextNode(recording ? " Stop" : " Record"));
+  $("#voice-status").textContent = message;
+  $("#discard-voice").hidden = !recordedVoiceFile || recording;
+  if (!recording && !recordedVoiceFile) $("#voice-timer").textContent = "0:00";
+}
+
+async function startVoiceRecording() {
+  if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) {
+    throw new Error("Voice recording is not available in this browser. You can still attach a recording from Files.");
+  }
+  if (recordedVoiceFile) {
+    const index = selectedAttachments.indexOf(recordedVoiceFile);
+    if (index >= 0) removeAttachment(index);
+  }
+  recordingStream = await navigator.mediaDevices.getUserMedia({
+    audio: {echoCancellation: true, noiseSuppression: true, autoGainControl: true},
+  });
+  const requestedType = preferredRecordingType();
+  mediaRecorder = requestedType
+    ? new MediaRecorder(recordingStream, {mimeType: requestedType})
+    : new MediaRecorder(recordingStream);
+  recordingChunks = [];
+  mediaRecorder.addEventListener("dataavailable", (event) => {
+    if (event.data?.size) recordingChunks.push(event.data);
+  });
+  mediaRecorder.addEventListener("stop", finishVoiceRecording, {once: true});
+  mediaRecorder.start(1000);
+  recordingStartedAt = Date.now();
+  recordingTimer = setInterval(updateVoiceTimer, 250);
+  updateVoiceTimer();
+  updateVoiceRecorder("Recording privately on this device…");
+}
+
+function stopVoiceRecording() {
+  if (mediaRecorder?.state === "recording") mediaRecorder.stop();
+}
+
+function releaseRecordingStream() {
+  if (recordingTimer) clearInterval(recordingTimer);
+  recordingTimer = null;
+  recordingStream?.getTracks().forEach((track) => track.stop());
+  recordingStream = null;
+}
+
+function finishVoiceRecording() {
+  releaseRecordingStream();
+  const rawType = mediaRecorder?.mimeType || recordingChunks[0]?.type || "audio/webm";
+  const type = rawType.split(";")[0] || "audio/webm";
+  const blob = new Blob(recordingChunks, {type});
+  mediaRecorder = null;
+  recordingChunks = [];
+  if (!blob.size) {
+    updateVoiceRecorder("No audio was captured. Please try again.");
+    setResult($("#note-result"), "The recording was empty.", false);
+    return;
+  }
+  recordedVoiceFile = new File([blob], voiceFilename(type), {type, lastModified: Date.now()});
+  addAttachments([recordedVoiceFile]);
+  updateVoiceRecorder("Recording ready. Play it below, then remember it on your PC.");
+}
+
+$("#record-voice").addEventListener("click", async () => {
+  const button = $("#record-voice");
+  if (mediaRecorder?.state === "recording") {
+    stopVoiceRecording();
+    return;
+  }
+  button.disabled = true;
+  try {
+    await startVoiceRecording();
+  } catch (error) {
+    releaseRecordingStream();
+    mediaRecorder = null;
+    updateVoiceRecorder("Microphone access is used only while you record.");
+    setResult($("#note-result"), error.message, false);
+  } finally {
+    button.disabled = false;
+  }
+});
+
+$("#discard-voice").addEventListener("click", () => {
+  const index = selectedAttachments.indexOf(recordedVoiceFile);
+  if (index >= 0) removeAttachment(index);
+});
 
 $("#note-attachment").addEventListener("change", (event) => {
   addAttachments(Array.from(event.currentTarget.files || []));
@@ -467,7 +618,14 @@ $("#read-clipboard").addEventListener("click", async (event) => {
   const result = $("#read-clipboard-result");
   button.disabled = true;
   try {
+    if (await fetchPcClipboardImage()) {
+      $("#pc-clipboard").value = "";
+      $("#copy-fetched").disabled = true;
+      setResult(result, "Fetched an image explicitly from the PC.");
+      return;
+    }
     const response = await api("/api/clipboard");
+    clearFetchedPcImage();
     $("#pc-clipboard").value = response.text;
     $("#copy-fetched").disabled = false;
     setResult(result, "Fetched explicitly from the PC.");
@@ -475,6 +633,83 @@ $("#read-clipboard").addEventListener("click", async (event) => {
     setResult(result, error.message, false);
   } finally {
     button.disabled = false;
+  }
+});
+
+async function fetchPcClipboardImage() {
+  const response = await fetch("/api/clipboard/image", {
+    headers: {"X-Membrie-Token": token},
+    cache: "no-store",
+  });
+  if (response.status === 401) {
+    token = "";
+    localStorage.removeItem(TOKEN_KEY);
+    showPairing();
+    return false;
+  }
+  if (!response.ok) return false;
+  const blob = await response.blob();
+  if (!blob.type.startsWith("image/") || !blob.size) return false;
+  clearFetchedPcImage();
+  const extension = {"image/png": "png", "image/jpeg": "jpg", "image/webp": "webp"}[blob.type] || "img";
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  fetchedPcImage = new File([blob], `PC clipboard ${stamp}.${extension}`, {
+    type: blob.type,
+    lastModified: Date.now(),
+  });
+  fetchedPcImageUrl = URL.createObjectURL(fetchedPcImage);
+  $("#pc-clipboard-image-preview").src = fetchedPcImageUrl;
+  $("#pc-clipboard-image").hidden = false;
+  return true;
+}
+
+function clearFetchedPcImage() {
+  if (fetchedPcImageUrl) URL.revokeObjectURL(fetchedPcImageUrl);
+  fetchedPcImage = null;
+  fetchedPcImageUrl = null;
+  $("#pc-clipboard-image-preview").removeAttribute("src");
+  $("#pc-clipboard-image").hidden = true;
+}
+
+$("#remember-fetched-image").addEventListener("click", async (event) => {
+  if (!fetchedPcImage) return;
+  const button = event.currentTarget;
+  button.disabled = true;
+  let uploadId = null;
+  try {
+    uploadId = await uploadAttachment(fetchedPcImage);
+    const response = await api("/api/attachment", {
+      method: "POST",
+      body: JSON.stringify({
+        upload_ids: [uploadId],
+        title: "PC clipboard image",
+        body: "Fetched explicitly from the PC clipboard through Membrie Companion.",
+      }),
+    });
+    toast(response.message);
+    await Promise.all([refreshRecall(), refreshStatus()]);
+  } catch (error) {
+    if (uploadId) cancelUploads([uploadId]);
+    toast(error.message);
+  } finally {
+    button.disabled = false;
+  }
+});
+
+$("#share-fetched-image").addEventListener("click", async () => {
+  if (!fetchedPcImage) return;
+  try {
+    if (navigator.share && navigator.canShare?.({files: [fetchedPcImage]})) {
+      await navigator.share({files: [fetchedPcImage], title: "Membrie clipboard image"});
+      return;
+    }
+    const link = document.createElement("a");
+    link.href = fetchedPcImageUrl;
+    link.download = fetchedPcImage.name;
+    link.click();
+    toast("Image ready to save");
+  } catch (error) {
+    if (error.name !== "AbortError") toast("This browser could not open its share sheet");
   }
 });
 
@@ -528,6 +763,8 @@ $("#brie-form").addEventListener("submit", async (event) => {
 
 async function refreshRecall() {
   if (!token) return;
+  recallMediaUrls.forEach((url) => URL.revokeObjectURL(url));
+  recallMediaUrls = [];
   try {
     const response = await api("/api/recall");
     renderMemoryList($("#recent-list"), response.recent, "No recent desktop context is available yet.");
@@ -557,22 +794,165 @@ function renderMemoryList(container, records, emptyMessage) {
         image.alt = attachment.original_name;
         image.loading = "lazy";
         card.append(image);
-        loadAttachmentPreview(record.id, attachment, image);
+        loadAttachmentMedia(record.id, attachment, image);
+      } else if (attachment.mime_type.startsWith("audio/")) {
+        const audio = document.createElement("audio");
+        audio.controls = true;
+        audio.preload = "metadata";
+        card.append(audio);
+        loadAttachmentMedia(record.id, attachment, audio);
+        card.append(renderTranscriptPanel(record, attachment));
       } else {
         card.append(textElement(
           "div",
-          `${attachment.original_name} · ${attachment.analysis_state === "unsupported" ? "original retained" : attachment.analysis_state}`,
+          `${attachment.original_name} · ${formatBytes(attachment.byte_size || 0)} · ${attachment.analysis_state === "unsupported" ? "original retained" : attachment.analysis_state}`,
           "memory-attachment"
         ));
       }
     });
     if (record.preview) card.append(textElement("p", record.preview));
     card.append(textElement("p", record.source, "model-label"));
+    if (record.source === "Membrie Companion") {
+      const remove = textElement("button", "Delete this Remembrie", "danger memory-delete");
+      remove.type = "button";
+      remove.addEventListener("click", () => deleteRemembrance(record));
+      card.append(remove);
+    }
     container.append(card);
   });
 }
 
-async function loadAttachmentPreview(remembrieId, attachment, image) {
+function renderTranscriptPanel(record, attachment) {
+  const panel = document.createElement("details");
+  panel.className = "transcript-panel";
+  panel.open = Boolean(attachment.user_correction);
+  const stateLabel = {
+    pending: "Transcript queued on your PC",
+    complete: "Local transcript",
+    failed: "Transcription needs attention",
+  }[attachment.analysis_state] || "Audio details";
+  const summary = textElement("summary", stateLabel);
+  panel.append(summary);
+
+  if (attachment.analysis_text) {
+    panel.append(textElement("pre", attachment.analysis_text));
+  } else {
+    panel.append(textElement(
+      "p",
+      attachment.analysis_state === "pending"
+        ? "The original recording is safe. Refresh Recall shortly to see the local transcript."
+        : "No machine transcript is available yet.",
+      "transcript-note"
+    ));
+  }
+  if (attachment.user_correction) {
+    panel.append(textElement("strong", "Your correction"));
+    panel.append(textElement("pre", attachment.user_correction));
+    panel.append(textElement(
+      "p",
+      "Membrie preserves this separately from the machine transcript; the original audio remains the exact evidence.",
+      "transcript-note"
+    ));
+  }
+  if (attachment.analysis_model || attachment.analysis_confidence) {
+    panel.append(textElement(
+      "p",
+      [attachment.analysis_model, attachment.analysis_confidence && `${attachment.analysis_confidence} confidence`].filter(Boolean).join(" · "),
+      "transcript-note"
+    ));
+  }
+  if (record.source !== "Membrie Companion") return panel;
+
+  const editor = document.createElement("textarea");
+  editor.className = "transcript-editor";
+  editor.maxLength = 100000;
+  editor.value = attachment.user_correction || editableTranscript(attachment.analysis_text || "");
+  editor.placeholder = "Type the corrected words you heard…";
+  editor.hidden = true;
+  panel.append(editor);
+
+  const actions = document.createElement("div");
+  actions.className = "transcript-actions";
+  const correct = textElement("button", attachment.user_correction ? "Edit correction" : "Correct transcript", "secondary");
+  correct.type = "button";
+  const save = textElement("button", "Save correction", "primary");
+  save.type = "button";
+  save.hidden = true;
+  correct.addEventListener("click", () => {
+    editor.hidden = false;
+    save.hidden = false;
+    correct.hidden = true;
+    editor.focus();
+  });
+  save.addEventListener("click", async () => {
+    save.disabled = true;
+    try {
+      const response = await api("/api/attachment/correct", {
+        method: "POST",
+        body: JSON.stringify({
+          remembrie_id: record.id,
+          content_id: attachment.content_id,
+          correction: editor.value,
+        }),
+      });
+      toast(response.message);
+      await refreshRecall();
+    } catch (error) {
+      toast(error.message);
+      save.disabled = false;
+    }
+  });
+  const retry = textElement("button", "Transcribe again", "secondary");
+  retry.type = "button";
+  retry.disabled = attachment.analysis_state === "pending";
+  retry.addEventListener("click", () => runAttachmentAction("retry", record, attachment, retry));
+  const remove = textElement("button", "Delete audio", "secondary");
+  remove.type = "button";
+  remove.addEventListener("click", async () => {
+    if (!confirm("Delete this recording from Membrie? This cannot be undone.")) return;
+    await runAttachmentAction("delete", record, attachment, remove);
+  });
+  actions.append(correct, save, retry, remove);
+  panel.append(actions);
+  return panel;
+}
+
+function editableTranscript(value) {
+  const marker = "\nTranscript: ";
+  const index = value.indexOf(marker);
+  return index >= 0 ? value.slice(index + marker.length).trim() : "";
+}
+
+async function runAttachmentAction(action, record, attachment, button) {
+  button.disabled = true;
+  try {
+    const response = await api(`/api/attachment/${action}`, {
+      method: "POST",
+      body: JSON.stringify({remembrie_id: record.id, content_id: attachment.content_id}),
+    });
+    toast(response.message);
+    await refreshRecall();
+  } catch (error) {
+    toast(error.message);
+    button.disabled = false;
+  }
+}
+
+async function deleteRemembrance(record) {
+  if (!confirm(`Delete “${record.title}” and its attachments from Membrie? This cannot be undone.`)) return;
+  try {
+    const response = await api("/api/remembrance/delete", {
+      method: "POST",
+      body: JSON.stringify({id: record.id}),
+    });
+    toast(response.message);
+    await Promise.all([refreshRecall(), refreshStatus()]);
+  } catch (error) {
+    toast(error.message);
+  }
+}
+
+async function loadAttachmentMedia(remembrieId, attachment, element) {
   try {
     const response = await fetch(`/api/attachment/${encodeURIComponent(remembrieId)}/${encodeURIComponent(attachment.content_id)}`, {
       headers: {"X-Membrie-Token": token},
@@ -581,10 +961,14 @@ async function loadAttachmentPreview(remembrieId, attachment, image) {
     if (!response.ok) throw new Error("preview unavailable");
     const blob = await response.blob();
     const url = URL.createObjectURL(blob);
-    image.addEventListener("load", () => URL.revokeObjectURL(url), {once: true});
-    image.src = url;
+    if (element instanceof HTMLImageElement) {
+      element.addEventListener("load", () => URL.revokeObjectURL(url), {once: true});
+    } else {
+      recallMediaUrls.push(url);
+    }
+    element.src = url;
   } catch (_error) {
-    image.remove();
+    element.replaceWith(textElement("div", "The retained original is currently unavailable for preview.", "memory-attachment"));
   }
 }
 

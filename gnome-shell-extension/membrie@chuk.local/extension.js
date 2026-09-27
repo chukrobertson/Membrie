@@ -13,6 +13,7 @@ const DBUS_NAME = 'com.chuk.Membrie.Clipboard';
 const DBUS_PATH = '/com/chuk/Membrie/Clipboard';
 const DBUS_INTERFACE = 'com.chuk.Membrie.Clipboard';
 const MAX_TEXT_BYTES = 256 * 1024;
+const MAX_IMAGE_BYTES = 32 * 1024 * 1024;
 
 const DBUS_XML = `
 <node>
@@ -27,6 +28,10 @@ const DBUS_XML = `
     <method name="SetText">
       <arg direction="in" type="s" name="text"/>
       <arg direction="out" type="b" name="accepted"/>
+    </method>
+    <method name="ReadImage">
+      <arg direction="out" type="s" name="mimetype"/>
+      <arg direction="out" type="ay" name="content"/>
     </method>
     <method name="GetActivityState">
       <arg direction="out" type="s" name="app_id"/>
@@ -58,6 +63,7 @@ class ClipboardBridge {
         this._readGeneration = 0;
         this._readTimeoutId = 0;
         this._cachedText = '';
+        this._imageReading = false;
         this._screenCaptureInProgress = false;
         this._activitySignalId = 0;
         this._focusWindow = null;
@@ -222,6 +228,67 @@ class ClipboardBridge {
 
         this._clipboard.set_text(St.ClipboardType.CLIPBOARD, text);
         return true;
+    }
+
+    ReadImageAsync(_parameters, invocation) {
+        if (this._imageReading) {
+            invocation.return_dbus_error(
+                'com.chuk.Membrie.Error.Busy',
+                'A clipboard image is already being read'
+            );
+            return;
+        }
+        const available = this._clipboard.get_mimetypes(St.ClipboardType.CLIPBOARD);
+        const mimetype = [
+            'image/png',
+            'image/jpeg',
+            'image/webp',
+        ].find(type => available.includes(type));
+        if (!mimetype) {
+            invocation.return_dbus_error(
+                'com.chuk.Membrie.Error.NoImage',
+                'The clipboard does not contain a supported image'
+            );
+            return;
+        }
+
+        this._imageReading = true;
+        let finished = false;
+        const timeoutId = GLib.timeout_add(
+            GLib.PRIORITY_DEFAULT,
+            7000,
+            () => {
+                if (!finished) {
+                    finished = true;
+                    this._imageReading = false;
+                    invocation.return_dbus_error(
+                        'com.chuk.Membrie.Error.Timeout',
+                        'The clipboard image read timed out'
+                    );
+                }
+                return GLib.SOURCE_REMOVE;
+            }
+        );
+        this._clipboard.get_content(
+            St.ClipboardType.CLIPBOARD,
+            mimetype,
+            (_clipboard, bytes) => {
+                if (finished)
+                    return;
+                finished = true;
+                GLib.source_remove(timeoutId);
+                this._imageReading = false;
+                const content = bytes?.get_data();
+                if (!content || content.length === 0 || content.length > MAX_IMAGE_BYTES) {
+                    invocation.return_dbus_error(
+                        'com.chuk.Membrie.Error.InvalidImage',
+                        'The clipboard image is empty or too large'
+                    );
+                    return;
+                }
+                invocation.return_value(new GLib.Variant('(say)', [mimetype, content]));
+            }
+        );
     }
 
     GetActivityState() {

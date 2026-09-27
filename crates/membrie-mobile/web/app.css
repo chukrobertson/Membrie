@@ -132,17 +132,30 @@ input, textarea {
 }
 input:focus, textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
 textarea[readonly] { color: var(--muted); }
+.clipboard-image { display: grid; gap: 10px; padding: 10px; border: 1px solid var(--border); border-radius: 14px; background: var(--surface-soft); }
+.clipboard-image[hidden] { display: none; }
+.clipboard-image img { display: block; width: 100%; max-height: 360px; border-radius: 11px; object-fit: contain; background: var(--surface); }
+.clipboard-image p { margin: 0; font-size: 0.7rem; }
 input[type="file"] { padding: 10px; font-size: 0.8rem; }
 input[type="file"]::file-selector-button { margin-right: 10px; border: 0; border-radius: 9px; padding: 8px 10px; background: var(--accent-soft); color: var(--accent); font-weight: 760; }
 .paste-actions { display: flex; align-items: center; gap: 10px; }
 .paste-actions .secondary { flex: 0 0 auto; }
 .paste-actions span { color: var(--muted); font-size: 0.72rem; line-height: 1.35; }
+.voice-recorder { display: grid; gap: 10px; margin: 2px 0; padding: 13px; border: 1px solid var(--border); border-radius: 15px; background: var(--surface-soft); }
+.voice-recorder strong { font-size: 0.84rem; }
+.voice-recorder p { margin: 3px 0 0; font-size: 0.72rem; }
+.voice-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.voice-actions button { flex: 1 1 145px; }
+.voice-timer { color: var(--muted); font: 750 0.83rem ui-monospace, monospace; }
+.record-button span { margin-right: 5px; color: var(--danger); }
+.record-button.recording { border-color: var(--danger); color: var(--danger); }
 .paste-target { min-height: 58px; border: 1px dashed var(--accent); border-radius: 13px; padding: 12px 14px; outline: none; background: var(--accent-soft); color: var(--text); font-size: 0.82rem; line-height: 1.4; }
 .paste-target:empty::before { content: attr(data-placeholder); color: var(--muted); }
 .paste-target:focus { box-shadow: 0 0 0 3px var(--accent-soft); }
 .attachment-preview { display: grid; gap: 8px; }
 .attachment-item { display: grid; grid-template-columns: 58px 1fr auto; gap: 10px; align-items: center; padding: 9px; border: 1px solid var(--border); border-radius: 13px; background: var(--surface-soft); }
 .attachment-thumb, .attachment-kind { width: 58px; height: 58px; border-radius: 10px; object-fit: cover; background: var(--surface); }
+.attachment-audio { grid-column: 1 / -1; width: 100%; min-width: 0; height: 42px; }
 .attachment-kind { display: grid; place-items: center; color: var(--accent); font-size: 0.68rem; font-weight: 800; text-transform: uppercase; overflow: hidden; }
 .attachment-copy { min-width: 0; }
 .attachment-copy strong, .attachment-copy span { display: block; overflow-wrap: anywhere; }
@@ -188,7 +201,16 @@ input[type="file"]::file-selector-button { margin-right: 10px; border: 0; border
 .memory-card h4 { margin: 0 0 5px; font-size: 0.98rem; }
 .memory-card p { margin: 0; font-size: 0.82rem; }
 .memory-card img { display: block; width: 100%; max-height: 260px; margin: 9px 0; border-radius: 12px; object-fit: contain; background: var(--surface-soft); }
+.memory-card audio { display: block; width: 100%; margin: 10px 0; }
 .memory-attachment { margin: 9px 0; padding: 9px 10px; border-radius: 10px; background: var(--surface-soft); color: var(--muted); font-size: 0.75rem; overflow-wrap: anywhere; }
+.transcript-panel { display: grid; gap: 8px; margin: 9px 0; padding: 11px; border: 1px solid var(--border); border-radius: 12px; background: var(--surface-soft); }
+.transcript-panel summary { cursor: pointer; color: var(--text); font-size: 0.8rem; font-weight: 760; }
+.transcript-panel pre { max-height: 280px; margin: 2px 0 0; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; color: var(--text); font: 0.76rem/1.45 ui-monospace, monospace; }
+.transcript-note { margin: 0; font-size: 0.7rem; }
+.transcript-actions { display: flex; flex-wrap: wrap; gap: 7px; }
+.transcript-actions button { min-height: 36px; padding: 6px 10px; font-size: 0.75rem; }
+.transcript-editor { min-height: 120px; font-size: 0.78rem; }
+.memory-delete { margin-top: 9px; min-height: 38px; padding: 7px 11px; font-size: 0.75rem; }
 .empty-list { padding: 18px; border: 1px dashed var(--border); border-radius: 14px; color: var(--muted); text-align: center; }
 
 .bottom-nav {

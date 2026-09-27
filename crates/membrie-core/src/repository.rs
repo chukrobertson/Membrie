@@ -19,7 +19,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use uuid::Uuid;
 
-const SCHEMA_VERSION: i64 = 10;
+const SCHEMA_VERSION: i64 = 11;
 const DUPLICATE_WINDOW_MS: i64 = 24 * 60 * 60 * 1000;
 const MIN_SEMANTIC_SIMILARITY: f64 = 0.25;
 const SEMANTIC_SCORE_WINDOW: f64 = 0.20;
@@ -436,6 +436,10 @@ WHERE role = 'attachment' AND analysis_state = 'pending'
   );
 "#;
 
+const MIGRATION_11: &str = r#"
+ALTER TABLE remembrie_contents ADD COLUMN user_correction TEXT;
+"#;
+
 #[derive(Debug, Error)]
 pub enum RepositoryError {
     #[error("database error: {0}")]
@@ -559,6 +563,13 @@ impl Repository {
         if version < 10 {
             let transaction = connection.unchecked_transaction()?;
             transaction.execute_batch(MIGRATION_10)?;
+            transaction.pragma_update(None, "user_version", 10)?;
+            transaction.commit()?;
+            version = 10;
+        }
+        if version < 11 {
+            let transaction = connection.unchecked_transaction()?;
+            transaction.execute_batch(MIGRATION_11)?;
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             transaction.commit()?;
         }
@@ -791,6 +802,7 @@ impl Repository {
                 byte_size: attachment.byte_size,
                 analysis_state: attachment.analysis_state,
                 analysis_text: None,
+                user_correction: None,
             })
             .collect::<Vec<_>>();
         let captured_body = attachment_body(input.note.trim(), &body_parts);
@@ -902,7 +914,8 @@ impl Repository {
         let mut statement = self.connection.prepare(
             "SELECT c.id, c.remembrie_id, COALESCE(c.original_name, 'Attachment'),
                     b.mime_type, b.byte_size, b.hash, c.analysis_state,
-                    c.text_content, c.analysis_model, c.analysis_confidence, c.created_at_ms
+                    c.text_content, c.user_correction, c.analysis_model,
+                    c.analysis_confidence, c.created_at_ms
              FROM remembrie_contents c
              JOIN attachment_blobs b ON b.hash = c.blob_hash
              JOIN remembries r ON r.id = c.remembrie_id
@@ -919,7 +932,8 @@ impl Repository {
             .query_row(
                 "SELECT c.id, c.remembrie_id, COALESCE(c.original_name, 'Attachment'),
                         b.mime_type, b.byte_size, b.hash, c.analysis_state,
-                        c.text_content, c.analysis_model, c.analysis_confidence, c.created_at_ms
+                        c.text_content, c.user_correction, c.analysis_model,
+                        c.analysis_confidence, c.created_at_ms
                  FROM remembrie_contents c
                  JOIN attachment_blobs b ON b.hash = c.blob_hash
                  JOIN remembries r ON r.id = c.remembrie_id
@@ -931,10 +945,197 @@ impl Repository {
             .map_err(Into::into)
     }
 
+    pub fn set_attachment_correction(
+        &mut self,
+        content_id: &str,
+        correction: &str,
+    ) -> Result<Attachment, RepositoryError> {
+        let correction = correction.trim();
+        if correction.chars().count() > 100_000 {
+            return Err(RepositoryError::Validation(
+                "an attachment correction cannot exceed 100,000 characters".to_owned(),
+            ));
+        }
+        let (remembrie_id, mime_type): (String, String) = self
+            .connection
+            .query_row(
+                "SELECT c.remembrie_id, b.mime_type
+                 FROM remembrie_contents c
+                 JOIN attachment_blobs b ON b.hash = c.blob_hash
+                 JOIN remembries r ON r.id = c.remembrie_id
+                 WHERE c.id = ?1 AND c.role = 'attachment' AND r.deleted_at_ms IS NULL",
+                [content_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?
+            .ok_or_else(|| RepositoryError::Validation("attachment was not found".to_owned()))?;
+        if !supported_audio_mime(&mime_type) {
+            return Err(RepositoryError::Validation(
+                "only audio transcripts can be corrected in this pass".to_owned(),
+            ));
+        }
+
+        let now = now_ms()?;
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "UPDATE remembrie_contents SET user_correction = ?2 WHERE id = ?1",
+            params![
+                content_id,
+                if correction.is_empty() {
+                    None::<&str>
+                } else {
+                    Some(correction)
+                }
+            ],
+        )?;
+        rebuild_attachment_captured_body(&transaction, &remembrie_id)?;
+        transaction.execute(
+            "UPDATE processing_jobs
+             SET state = 'pending', attempts = 0, last_error = NULL,
+                 available_at_ms = 0, updated_at_ms = ?2
+             WHERE id = ?1",
+            params![format!("enrich:{remembrie_id}"), now],
+        )?;
+        transaction.commit()?;
+        self.get_attachment(content_id)?.ok_or_else(|| {
+            RepositoryError::Validation("corrected attachment could not be loaded".to_owned())
+        })
+    }
+
+    pub fn retry_attachment_processing(
+        &mut self,
+        content_id: &str,
+    ) -> Result<Attachment, RepositoryError> {
+        let (remembrie_id, mime_type, byte_size): (String, String, u64) = self
+            .connection
+            .query_row(
+                "SELECT c.remembrie_id, b.mime_type, b.byte_size
+                 FROM remembrie_contents c
+                 JOIN attachment_blobs b ON b.hash = c.blob_hash
+                 JOIN remembries r ON r.id = c.remembrie_id
+                 WHERE c.id = ?1 AND c.role = 'attachment' AND r.deleted_at_ms IS NULL",
+                [content_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?
+            .ok_or_else(|| RepositoryError::Validation("attachment was not found".to_owned()))?;
+        let processing_kind = if supported_audio_mime(&mime_type) {
+            "attachment_audio"
+        } else if supported_image_mime(&mime_type) && byte_size <= MAX_ANALYZED_IMAGE_BYTES {
+            "attachment_image"
+        } else {
+            return Err(RepositoryError::Validation(
+                "this attachment format does not have local understanding yet".to_owned(),
+            ));
+        };
+
+        let now = now_ms()?;
+        let job_id = format!("attachment:{content_id}");
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "UPDATE remembrie_contents
+             SET text_content = NULL, analysis_state = 'pending', analysis_model = NULL,
+                 analysis_confidence = NULL, analysis_error = NULL
+             WHERE id = ?1 AND role = 'attachment'",
+            [content_id],
+        )?;
+        transaction.execute(
+            "INSERT INTO processing_jobs(
+                id, remembrie_id, kind, state, attempts, last_error,
+                available_at_ms, created_at_ms, updated_at_ms
+             ) VALUES(?1, ?2, ?3, 'pending', 0, NULL, 0, ?4, ?4)
+             ON CONFLICT(id) DO UPDATE SET
+                remembrie_id = excluded.remembrie_id, kind = excluded.kind,
+                state = 'pending', attempts = 0, last_error = NULL,
+                available_at_ms = 0, updated_at_ms = excluded.updated_at_ms",
+            params![job_id, remembrie_id, processing_kind, now],
+        )?;
+        rebuild_attachment_captured_body(&transaction, &remembrie_id)?;
+        transaction.execute(
+            "UPDATE processing_jobs
+             SET state = 'pending', attempts = 0, last_error = NULL,
+                 available_at_ms = 0, updated_at_ms = ?2
+             WHERE id = ?1",
+            params![format!("enrich:{remembrie_id}"), now],
+        )?;
+        transaction.commit()?;
+        self.get_attachment(content_id)?.ok_or_else(|| {
+            RepositoryError::Validation("queued attachment could not be loaded".to_owned())
+        })
+    }
+
+    pub fn delete_attachment(&mut self, content_id: &str) -> Result<bool, RepositoryError> {
+        let Some((remembrie_id, note, attachment_count)) = self
+            .connection
+            .query_row(
+                "SELECT c.remembrie_id,
+                        COALESCE((SELECT text_content FROM remembrie_contents
+                                  WHERE remembrie_id = c.remembrie_id
+                                    AND role = 'attachment_note' LIMIT 1), ''),
+                        (SELECT COUNT(*) FROM remembrie_contents
+                         WHERE remembrie_id = c.remembrie_id AND role = 'attachment')
+                 FROM remembrie_contents c
+                 JOIN remembries r ON r.id = c.remembrie_id
+                 WHERE c.id = ?1 AND c.role = 'attachment' AND r.deleted_at_ms IS NULL",
+                [content_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, u64>(2)?,
+                    ))
+                },
+            )
+            .optional()?
+        else {
+            return Ok(false);
+        };
+
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "DELETE FROM processing_jobs WHERE id = ?1",
+            [format!("attachment:{content_id}")],
+        )?;
+        transaction.execute(
+            "DELETE FROM remembrie_contents WHERE id = ?1 AND role = 'attachment'",
+            [content_id],
+        )?;
+        if attachment_count == 1 && note.trim().is_empty() {
+            transaction.execute(
+                "DELETE FROM remembrie_fts WHERE remembrie_id = ?1",
+                [&remembrie_id],
+            )?;
+            transaction.execute("DELETE FROM remembries WHERE id = ?1", [&remembrie_id])?;
+        } else {
+            rebuild_attachment_captured_body(&transaction, &remembrie_id)?;
+            transaction.execute(
+                "UPDATE processing_jobs
+                 SET state = 'pending', attempts = 0, last_error = NULL,
+                     available_at_ms = 0, updated_at_ms = ?2
+                 WHERE id = ?1",
+                params![format!("enrich:{remembrie_id}"), now_ms()?],
+            )?;
+        }
+        transaction.commit()?;
+        self.prune_orphaned_attachment_blobs()?;
+        Ok(true)
+    }
+
+    pub fn delete_remembrance(&mut self, id: &str) -> Result<bool, RepositoryError> {
+        let transaction = self.connection.transaction()?;
+        transaction.execute("DELETE FROM remembrie_fts WHERE remembrie_id = ?1", [id])?;
+        let deleted = transaction.execute("DELETE FROM remembries WHERE id = ?1", [id])? > 0;
+        transaction.commit()?;
+        if deleted {
+            self.prune_orphaned_attachment_blobs()?;
+        }
+        Ok(deleted)
+    }
+
     pub fn referenced_attachment_blobs(&self) -> Result<Vec<Attachment>, RepositoryError> {
         let mut statement = self.connection.prepare(
             "SELECT MIN(c.id), MIN(c.remembrie_id), MIN(COALESCE(c.original_name, 'Attachment')),
-                    b.mime_type, b.byte_size, b.hash, 'complete', NULL, NULL, NULL,
+                    b.mime_type, b.byte_size, b.hash, 'complete', NULL, NULL, NULL, NULL,
                     MIN(c.created_at_ms)
              FROM attachment_blobs b
              JOIN remembrie_contents c ON c.blob_hash = b.hash
@@ -4551,6 +4752,7 @@ struct AttachmentBodyPart<'a> {
     byte_size: u64,
     analysis_state: &'a str,
     analysis_text: Option<&'a str>,
+    user_correction: Option<&'a str>,
 }
 
 fn attachment_body(note: &str, attachments: &[AttachmentBodyPart<'_>]) -> String {
@@ -4588,6 +4790,15 @@ fn attachment_body(note: &str, attachments: &[AttachmentBodyPart<'_>]) -> String
             }
             _ => {}
         }
+        if let Some(correction) = attachment
+            .user_correction
+            .filter(|correction| !correction.trim().is_empty())
+        {
+            body.push_str(
+                "\nUser-corrected transcript (user-authored; retained original audio remains canonical evidence): ",
+            );
+            body.push_str(correction.trim());
+        }
         body.push('\n');
     }
     body.trim().to_owned()
@@ -4610,7 +4821,7 @@ fn rebuild_attachment_captured_body(
     let records = {
         let mut statement = transaction.prepare(
             "SELECT COALESCE(c.original_name, 'Attachment'), b.mime_type, b.byte_size,
-                    c.analysis_state, c.text_content
+                    c.analysis_state, c.text_content, c.user_correction
              FROM remembrie_contents c
              JOIN attachment_blobs b ON b.hash = c.blob_hash
              WHERE c.remembrie_id = ?1 AND c.role = 'attachment'
@@ -4623,6 +4834,7 @@ fn rebuild_attachment_captured_body(
                 row.get::<_, u64>(2)?,
                 row.get::<_, String>(3)?,
                 row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<String>>(5)?,
             ))
         })?;
         rows.collect::<Result<Vec<_>, _>>()?
@@ -4635,6 +4847,7 @@ fn rebuild_attachment_captured_body(
             byte_size: record.2,
             analysis_state: &record.3,
             analysis_text: record.4.as_deref(),
+            user_correction: record.5.as_deref(),
         })
         .collect();
     let body = attachment_body(&note, &parts);
@@ -4665,9 +4878,10 @@ fn map_attachment(row: &Row<'_>) -> rusqlite::Result<Attachment> {
         blob_hash: row.get(5)?,
         analysis_state: row.get(6)?,
         analysis_text: row.get(7)?,
-        analysis_model: row.get(8)?,
-        analysis_confidence: row.get(9)?,
-        created_at_ms: row.get(10)?,
+        user_correction: row.get(8)?,
+        analysis_model: row.get(9)?,
+        analysis_confidence: row.get(10)?,
+        created_at_ms: row.get(11)?,
     })
 }
 
@@ -6092,6 +6306,51 @@ mod tests {
         assert_eq!(completed[0].analysis_state, "complete");
         assert_eq!(completed[0].analysis_confidence.as_deref(), Some("high"));
         assert!(repository.claim_processing_job().unwrap().is_some());
+
+        let corrected = repository
+            .set_attachment_correction(
+                &attachment.content_id,
+                "[00:02] Remember to call Duke today, not tomorrow.",
+            )
+            .unwrap();
+        assert!(
+            corrected
+                .analysis_text
+                .as_deref()
+                .unwrap()
+                .contains("call Duke tomorrow")
+        );
+        assert_eq!(
+            corrected.user_correction.as_deref(),
+            Some("[00:02] Remember to call Duke today, not tomorrow.")
+        );
+        let corrected_remembrance = repository.get(&remembrie.id).unwrap().unwrap();
+        assert!(corrected_remembrance.body.contains("call Duke tomorrow"));
+        assert!(corrected_remembrance.body.contains("call Duke today"));
+
+        let queued = repository
+            .retry_attachment_processing(&attachment.content_id)
+            .unwrap();
+        assert_eq!(queued.analysis_state, "pending");
+        assert!(queued.analysis_text.is_none());
+        assert_eq!(
+            queued.user_correction.as_deref(),
+            Some("[00:02] Remember to call Duke today, not tomorrow.")
+        );
+        let retried_job = repository
+            .claim_attachment_processing_job(true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(retried_job.attachment.content_id, attachment.content_id);
+
+        let blob_path = attachment_path_in(&directory, &attachment.blob_hash);
+        assert!(
+            repository
+                .delete_attachment(&attachment.content_id)
+                .unwrap()
+        );
+        assert!(repository.get(&remembrie.id).unwrap().is_none());
+        assert!(!blob_path.exists());
 
         drop(repository);
         fs::remove_dir_all(directory).unwrap();

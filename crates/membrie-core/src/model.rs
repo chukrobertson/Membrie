@@ -141,6 +141,8 @@ pub struct Attachment {
     pub blob_hash: String,
     pub analysis_state: String,
     pub analysis_text: Option<String>,
+    #[serde(default)]
+    pub user_correction: Option<String>,
     pub analysis_model: Option<String>,
     pub analysis_confidence: Option<String>,
     pub created_at_ms: i64,

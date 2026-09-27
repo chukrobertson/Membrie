@@ -32,6 +32,19 @@
           <input id="note-title" maxlength="300" autocomplete="off" placeholder="What is this about?">
           <label for="note-body">Remembrie</label>
           <textarea id="note-body" maxlength="20000" rows="8" placeholder="A thought, link, name, or detail you do not want to lose…"></textarea>
+          <div class="voice-recorder" aria-labelledby="voice-heading">
+            <div class="split-heading">
+              <div>
+                <strong id="voice-heading">Voice note</strong>
+                <p id="voice-status">Recorded here, understood locally on your PC.</p>
+              </div>
+              <span id="voice-timer" class="voice-timer">0:00</span>
+            </div>
+            <div class="voice-actions">
+              <button id="record-voice" class="secondary record-button" type="button"><span aria-hidden="true">●</span> Record</button>
+              <button id="discard-voice" class="secondary" type="button" hidden>Discard recording</button>
+            </div>
+          </div>
           <div class="paste-actions">
             <button id="paste-from-device" class="secondary" type="button">Paste from iPhone</button>
             <span>Text, links, images, and any files iOS exposes</span>
@@ -61,12 +74,20 @@
           <div class="split-heading">
             <div>
               <label for="pc-clipboard">Bring from PC</label>
-              <p>Membrie blocks text that resembles a credential or payment card.</p>
+              <p>Fetch text or an image explicitly. Membrie blocks text that resembles a credential or payment card.</p>
             </div>
             <button id="read-clipboard" class="secondary" type="button">Fetch</button>
           </div>
           <textarea id="pc-clipboard" rows="7" readonly placeholder="Explicitly fetched clipboard text appears here."></textarea>
           <button id="copy-fetched" class="secondary" type="button" disabled>Copy on this device</button>
+          <div id="pc-clipboard-image" class="clipboard-image" hidden>
+            <img id="pc-clipboard-image-preview" alt="Image fetched explicitly from the PC clipboard">
+            <div class="voice-actions">
+              <button id="remember-fetched-image" class="primary" type="button">Remember image</button>
+              <button id="share-fetched-image" class="secondary" type="button">Share or save</button>
+            </div>
+            <p>The image stays temporary until you choose Remember. Sharing uses this device’s normal share sheet.</p>
+          </div>
           <p id="read-clipboard-result" class="result" role="status"></p>
         </div>
       </section>

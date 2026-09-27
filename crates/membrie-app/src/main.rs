@@ -1011,13 +1011,13 @@ fn build_timeline_page(state: &Rc<UiState>) -> gtk::Widget {
 
     let pending_attachment = Rc::new(RefCell::new(None::<PendingAttachment>));
     let attachment_controls = gtk::Box::new(Orientation::Horizontal, 8);
-    let choose_attachment = gtk::Button::with_label("Attach image");
+    let choose_attachment = gtk::Button::with_label("Attach file");
     choose_attachment.set_icon_name("mail-attachment-symbolic");
     let paste_attachment = gtk::Button::with_label("Paste image");
     paste_attachment.set_icon_name("edit-paste-symbolic");
     let remove_attachment = gtk::Button::with_label("Remove");
     remove_attachment.set_icon_name("edit-delete-symbolic");
-    let attachment_label = gtk::Label::new(Some("No image attached"));
+    let attachment_label = gtk::Label::new(Some("No attachment"));
     attachment_label.add_css_class("dim-label");
     attachment_label.set_xalign(0.0);
     attachment_label.set_hexpand(true);
@@ -1051,16 +1051,12 @@ fn build_timeline_page(state: &Rc<UiState>) -> gtk::Widget {
     let state_for_choose = Rc::clone(state);
     choose_attachment.connect_clicked(move |_| {
         let chooser = gtk::FileChooserNative::new(
-            Some("Attach an image to this Remembrie"),
+            Some("Attach a file to this Remembrie"),
             None::<&gtk::Window>,
             gtk::FileChooserAction::Open,
             Some("Attach"),
             Some("Cancel"),
         );
-        let filter = gtk::FileFilter::new();
-        filter.set_name(Some("Images"));
-        filter.add_mime_type("image/*");
-        chooser.set_filter(&filter);
         let pending = Rc::clone(&pending_for_choose);
         let label = label_for_choose.clone();
         let preview = preview_for_choose.clone();
@@ -1072,14 +1068,14 @@ fn build_timeline_page(state: &Rc<UiState>) -> gtk::Widget {
             let result = chooser
                 .file()
                 .and_then(|file| file.path())
-                .ok_or_else(|| "Choose a local image file".to_owned())
+                .ok_or_else(|| "Choose a local file".to_owned())
                 .and_then(|path| stage_desktop_attachment(&path));
             match result {
                 Ok(attachment) => {
                     set_pending_attachment(&pending, &label, &preview, Some(attachment));
-                    toast(&state, "Image ready to remember");
+                    toast(&state, "Attachment ready to remember");
                 }
-                Err(error) => toast(&state, &format!("Could not attach image: {error}")),
+                Err(error) => toast(&state, &format!("Could not attach file: {error}")),
             }
         });
         chooser.show();
@@ -1132,13 +1128,13 @@ fn build_timeline_page(state: &Rc<UiState>) -> gtk::Widget {
                     &preview_for_drop,
                     Some(attachment),
                 );
-                toast(&state_for_drop, "Dropped image ready to remember");
+                toast(&state_for_drop, "Dropped attachment ready to remember");
                 true
             }
             Err(error) => {
                 toast(
                     &state_for_drop,
-                    &format!("Could not attach dropped image: {error}"),
+                    &format!("Could not attach dropped file: {error}"),
                 );
                 false
             }
@@ -1162,7 +1158,7 @@ fn build_timeline_page(state: &Rc<UiState>) -> gtk::Widget {
         let attachment = pending_for_save.borrow().clone();
         let saved_attachment = attachment.is_some();
         if title.trim().is_empty() && body.trim().is_empty() && attachment.is_none() {
-            toast(&state_for_save, "Write something or attach an image first");
+            toast(&state_for_save, "Write something or attach a file first");
             return;
         }
         let result = if let Some(attachment) = attachment {
@@ -1193,7 +1189,7 @@ fn build_timeline_page(state: &Rc<UiState>) -> gtk::Widget {
                 toast(
                     &state_for_save,
                     if saved_attachment {
-                        "Image Remembrie saved locally; understanding is queued"
+                        "Attachment Remembrie saved locally; understanding is queued when supported"
                     } else {
                         "Remembrie saved locally"
                     },
@@ -3276,10 +3272,15 @@ fn set_pending_attachment(
                 .map(|metadata| format_file_size(metadata.len()))
                 .unwrap_or_else(|_| "local image".to_owned())
         ));
-        preview.set_filename(Some(&attachment.staged_path));
-        preview.set_visible(true);
+        if attachment.mime_type.starts_with("image/") {
+            preview.set_filename(Some(&attachment.staged_path));
+            preview.set_visible(true);
+        } else {
+            preview.set_filename(None::<&Path>);
+            preview.set_visible(false);
+        }
     } else {
-        label.set_text("No image attached");
+        label.set_text("No attachment");
         preview.set_filename(None::<&Path>);
         preview.set_visible(false);
     }
@@ -3289,18 +3290,18 @@ fn stage_desktop_attachment(source: &Path) -> Result<PendingAttachment, String> 
     let metadata = fs::symlink_metadata(source)
         .map_err(|error| format!("the selected file is unavailable: {error}"))?;
     if !metadata.file_type().is_file() || metadata.len() == 0 {
-        return Err("Choose a non-empty regular image file".to_owned());
+        return Err("Choose a non-empty regular file".to_owned());
     }
     if metadata.len() > 100 * 1024 * 1024 {
-        return Err("The first attachment pass accepts images up to 100 MiB".to_owned());
+        return Err("Attachments can be up to 100 MiB".to_owned());
     }
     let original_name = source
         .file_name()
         .and_then(|name| name.to_str())
         .filter(|name| !name.trim().is_empty())
-        .ok_or_else(|| "The selected image does not have a usable filename".to_owned())?
+        .ok_or_else(|| "The selected file does not have a usable filename".to_owned())?
         .to_owned();
-    let mime_type = desktop_image_mime(source)?;
+    let mime_type = desktop_attachment_mime(source)?;
     let inbox = attachment_inbox_dir();
     fs::create_dir_all(&inbox)
         .map_err(|error| format!("the private attachment inbox is unavailable: {error}"))?;
@@ -3309,13 +3310,13 @@ fn stage_desktop_attachment(source: &Path) -> Result<PendingAttachment, String> 
         .map_err(|error| format!("the private attachment inbox could not be protected: {error}"))?;
     let staged_path = inbox.join(random_attachment_id()?);
     fs::copy(source, &staged_path)
-        .map_err(|error| format!("the image could not be staged privately: {error}"))?;
+        .map_err(|error| format!("the file could not be staged privately: {error}"))?;
     #[cfg(unix)]
     fs::set_permissions(&staged_path, fs::Permissions::from_mode(0o600))
-        .map_err(|error| format!("the staged image could not be protected: {error}"))?;
+        .map_err(|error| format!("the staged file could not be protected: {error}"))?;
     File::open(&staged_path)
         .and_then(|file| file.sync_all())
-        .map_err(|error| format!("the staged image could not be finished: {error}"))?;
+        .map_err(|error| format!("the staged file could not be finished: {error}"))?;
     Ok(PendingAttachment {
         staged_path,
         original_name,
@@ -3344,11 +3345,11 @@ fn stage_pasted_texture(texture: &gtk::gdk::Texture) -> Result<PendingAttachment
     })
 }
 
-fn desktop_image_mime(path: &Path) -> Result<String, String> {
+fn desktop_attachment_mime(path: &Path) -> Result<String, String> {
     let mut prefix = [0_u8; 16];
     let count = File::open(path)
         .and_then(|mut file| file.read(&mut prefix))
-        .map_err(|error| format!("the selected image could not be read: {error}"))?;
+        .map_err(|error| format!("the selected file could not be read: {error}"))?;
     let prefix = &prefix[..count];
     let mime = if prefix.starts_with(b"\x89PNG\r\n\x1a\n") {
         "image/png"
@@ -3358,12 +3359,55 @@ fn desktop_image_mime(path: &Path) -> Result<String, String> {
         "image/gif"
     } else if prefix.len() >= 12 && &prefix[..4] == b"RIFF" && &prefix[8..12] == b"WEBP" {
         "image/webp"
-    } else if prefix.len() >= 12 && &prefix[4..8] == b"ftyp" {
+    } else if prefix.len() >= 12
+        && &prefix[4..8] == b"ftyp"
+        && matches!(
+            &prefix[8..12],
+            b"heic" | b"heix" | b"hevc" | b"hevx" | b"mif1"
+        )
+    {
         "image/heic"
+    } else if prefix.len() >= 12
+        && &prefix[4..8] == b"ftyp"
+        && matches!(&prefix[8..12], b"M4A " | b"M4B " | b"M4P ")
+    {
+        "audio/mp4"
+    } else if prefix.len() >= 12 && &prefix[..4] == b"RIFF" && &prefix[8..12] == b"WAVE" {
+        "audio/wav"
+    } else if prefix.starts_with(b"fLaC") {
+        "audio/flac"
+    } else if prefix.starts_with(b"OggS") {
+        "audio/ogg"
+    } else if prefix.starts_with(b"ID3")
+        || (prefix.len() >= 2 && prefix[0] == 0xff && prefix[1] & 0xe0 == 0xe0)
+    {
+        "audio/mpeg"
+    } else if prefix.starts_with(b"%PDF-") {
+        "application/pdf"
     } else {
-        return Err(
-            "This first attachment pass accepts PNG, JPEG, GIF, WebP, and HEIC images".to_owned(),
-        );
+        match path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            Some("aac") => "audio/aac",
+            Some("caf") => "audio/x-caf",
+            Some("opus") => "audio/opus",
+            Some("webm") => "audio/webm",
+            Some("odt") => "application/vnd.oasis.opendocument.text",
+            Some("ods") => "application/vnd.oasis.opendocument.spreadsheet",
+            Some("odp") => "application/vnd.oasis.opendocument.presentation",
+            Some("docx") => {
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            }
+            Some("xlsx") => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            Some("pptx") => {
+                "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+            }
+            Some("txt") | Some("md") => "text/plain",
+            _ => "application/octet-stream",
+        }
     };
     Ok(mime.to_owned())
 }
@@ -4841,6 +4885,17 @@ fn show_remembrance_evidence(
                         picture.add_css_class("attachment-preview");
                         content.append(&picture);
                     }
+                } else if attachment.mime_type.starts_with("audio/") {
+                    let path = attachment_blob_path(&attachment.blob_hash);
+                    if path.is_file() {
+                        let media = gtk::MediaFile::for_filename(path);
+                        let controls = gtk::MediaControls::new(Some(&media));
+                        controls.set_hexpand(true);
+                        controls.set_tooltip_text(Some(
+                            "Play the retained original recording on this PC",
+                        ));
+                        content.append(&controls);
+                    }
                 }
             }
 
@@ -5489,5 +5544,21 @@ mod tests {
             timeline_filter_summary(TimelineFilter::Scheduled, 2, 5)
                 .contains("not proof of attendance")
         );
+    }
+
+    #[test]
+    fn desktop_attachment_types_distinguish_audio_from_heic() {
+        let directory = std::env::temp_dir().join(format!(
+            "membrie-desktop-mime-{}",
+            random_attachment_id().unwrap()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let audio = directory.join("voice.m4a");
+        let image = directory.join("photo.heic");
+        fs::write(&audio, b"0000ftypM4A private").unwrap();
+        fs::write(&image, b"0000ftypheicprivate").unwrap();
+        assert_eq!(desktop_attachment_mime(&audio).unwrap(), "audio/mp4");
+        assert_eq!(desktop_attachment_mime(&image).unwrap(), "image/heic");
+        fs::remove_dir_all(directory).unwrap();
     }
 }

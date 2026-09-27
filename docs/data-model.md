@@ -6,7 +6,8 @@ not an individual key press or low-level operating-system event.
 ## Canonical records
 
 - `remembries`: identity, time range, source context, importance, and privacy state
-- `remembrie_contents`: original or user-authored text, attachment references, and labeled local analysis
+- `remembrie_contents`: original or user-authored text, attachment references, labeled local analysis,
+  and an optional user correction stored separately from the machine interpretation
 - `attachment_blobs`: unique SHA-256 identities, byte sizes, and detected media types for retained files
 - `remembrie_links`: explicit and inferred relationships between Remembries
 - `capture_rules`: exclusions and capture policy
@@ -48,3 +49,5 @@ contain both the verified database and every referenced blob.
 Image descriptions, extracted visible text, and timestamped voice-note transcripts are derived,
 fallible, model-labeled material and can be retried or regenerated without changing the retained
 original.
+When a user corrects a voice transcript, Membrie retains both the machine text and the separate
+user-authored correction; Brie is instructed to state that distinction if they conflict.

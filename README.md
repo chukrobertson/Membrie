@@ -18,10 +18,11 @@ The project is intentionally local-first and self-hosted:
 - Local daemon with a small typed JSON protocol over a Unix socket
 - SQLite schema for Remembries, content, relationships, embeddings, and processing jobs
 - Manual Remembrie capture
-- Image Remembries from the desktop, plus a Mobile Companion paste inbox for mixed text, links, images, and files
+- File Remembries from the desktop, plus a Mobile Companion paste inbox for mixed text, links, images, audio, and files
 - Content-addressed attachment storage with byte-level deduplication and retained original evidence
 - Local image description and visible-text extraction through the selected Ollama vision model
-- Local English voice-note transcription through Ubuntu's `whisper.cpp`, with timestamped searchable evidence
+- Direct Companion voice recording, local playback, and English transcription through Ubuntu's `whisper.cpp`, with timestamped searchable evidence
+- Transcript correction stored separately from the preserved machine interpretation, per-recording retry, and explicit attachment or Remembrie deletion
 - Day, week, and month activity maps with stable application colors and day-by-day chronology
 - Color-grouped application time ribbon with idle gaps, stable app colors, and exact evidence
 - Timeline filters for observed activity, scheduled events, and manual notes, including upcoming days
@@ -55,14 +56,14 @@ The project is intentionally local-first and self-hosted:
 - Brie citations open the matching Timeline day, highlight the source, and show its exact evidence
 - Quick Brie compact window for local recall and note capture without leaving the current workflow
 - Opt-in read-only GNOME Calendar integration with recurring-event expansion and local reconciliation
-- Responsive Mobile Companion for universal paste capture, multi-file selection, explicit clipboard transfers, Brie, and compact recall
+- Responsive Mobile Companion for universal paste capture, multi-file selection, direct voice notes, explicit text/image clipboard transfers, Brie, and compact recall
 - Independent Mobile Companion pairing plus a fail-closed locked-PC privacy boundary
 - One-use five-minute QR or 8-digit pairing invitations, with the reusable token retained as fallback
 - Truthful `Membrie Companion` provenance for phone notes and source-aware recent-note recall in Brie
 - Coarse, local-only Companion usage totals for the last day, week, and month
 - Local model selection and visible indexing health
 
-Broader document understanding, per-calendar controls, Thunderbird evidence, meeting transcripts,
+Broader document understanding, per-calendar controls, LibreOffice and Thunderbird evidence, meeting transcripts,
 individual device revocation, and deeper pattern detection are the next implementation milestones.
 
 ## Install on Ubuntu
@@ -112,7 +113,9 @@ That script makes one verified 57 MiB model download. Afterward, M4A and other c
 attachments up to 30 minutes are decoded and transcribed entirely on this PC. Timestamped text is
 explicitly labeled as an unverified machine transcription; the original recording remains the
 canonical evidence. Audio with no clear speech is labeled that way instead of silently treated as a
-voice note.
+voice note. Companion can record and preview a voice note directly. Recall can play the retained
+original, show its timestamped transcript, queue another local transcription, and store a user's
+correction alongside—never over—the machine interpretation.
 
 Calendar access is separately opt-in. Membrie reads enabled calendars from Ubuntu's local
 Evolution Data Server, never receives calendar-account credentials, and exposes no calendar write
@@ -136,6 +139,11 @@ local understanding. Common audio formats receive local speech transcription whe
 speech model is installed. Other formats, including HEIC when no local conversion is available, are
 retained exactly but labeled unsupported for machine analysis. Originals remain canonical; Brie
 sees only clearly labeled, fallible text produced by local models.
+
+Clipboard ferrying is always explicit. Text that resembles a credential or payment card is blocked.
+On GNOME Wayland, **Fetch** can also bring a current PNG, JPEG, or WebP clipboard image to Companion
+for a temporary preview; the user then chooses whether to remember it, save it, or invoke the phone's
+share sheet. Binary clipboard content is never captured or published automatically.
 
 To remove the installed application while keeping every Remembrie and backup:
 

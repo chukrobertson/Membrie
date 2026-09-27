@@ -92,7 +92,8 @@ clipboard directions. **Allow recall while this PC is locked** is a separate exp
 Tailscale access does not weaken this rule: tailnet membership and pairing are required before the
 locked-session boundary is evaluated.
 
-The Timeline composer can create an image Remembrie from a file picker, pasted image, or dropped file.
+The Timeline composer can create a file Remembrie from a file picker or dropped file, and can paste
+an image directly from the desktop clipboard.
 Mobile Companion adds a deliberate paste inbox and multi-file picker: text and links join the note,
 while every binary item iOS exposes is previewed before submission and retained on the PC. One mobile
 Remembrie accepts up to eight attachments and 100 MiB combined. PNG, JPEG, GIF, and WebP are interpreted
@@ -100,6 +101,12 @@ by the selected local vision model; common audio formats are transcribed by the 
 model for voice-note recall. No item is sent to a remote API. Other formats are retained exactly but
 labeled unsupported for local understanding. Companion usage shown in its status sheet is only a local
 opening count and visible-time total, not telemetry.
+
+Companion's voice-note control requests microphone access only after **Record** is pressed. The browser
+holds the recording until it is reviewed and explicitly remembered. Recall provides playback, the
+timestamped local transcript, a separate user correction, retry, and deletion controls. **Fetch** in
+the Clipboard view can retrieve a current PNG, JPEG, or WebP clipboard image from the GNOME bridge;
+the image stays temporary until it is explicitly remembered, saved, or shared.
 
 ## Backups
 

@@ -31,6 +31,19 @@ pub enum Request {
     ListAttachments {
         remembrie_id: String,
     },
+    CorrectAttachmentTranscript {
+        content_id: String,
+        correction: String,
+    },
+    RetryAttachment {
+        content_id: String,
+    },
+    DeleteAttachment {
+        content_id: String,
+    },
+    DeleteRemembrance {
+        id: String,
+    },
     Capture {
         candidate: CaptureCandidate,
     },
@@ -158,6 +171,15 @@ pub enum Response {
     },
     Attachments {
         attachments: Vec<Attachment>,
+    },
+    AttachmentUpdated {
+        attachment: Attachment,
+    },
+    AttachmentDeleted {
+        content_id: String,
+    },
+    RemembranceDeleted {
+        id: String,
     },
     CaptureResult {
         decision: CaptureDecision,
@@ -377,6 +399,56 @@ impl DaemonClient {
             remembrie_id: remembrie_id.into(),
         })? {
             Response::Attachments { attachments } => Ok(attachments),
+            other => Err(ClientError::Rejected(format!(
+                "unexpected response: {other:?}"
+            ))),
+        }
+    }
+
+    pub fn correct_attachment_transcript(
+        &self,
+        content_id: impl Into<String>,
+        correction: impl Into<String>,
+    ) -> Result<Attachment, ClientError> {
+        match self.request(&Request::CorrectAttachmentTranscript {
+            content_id: content_id.into(),
+            correction: correction.into(),
+        })? {
+            Response::AttachmentUpdated { attachment } => Ok(attachment),
+            other => Err(ClientError::Rejected(format!(
+                "unexpected response: {other:?}"
+            ))),
+        }
+    }
+
+    pub fn retry_attachment(
+        &self,
+        content_id: impl Into<String>,
+    ) -> Result<Attachment, ClientError> {
+        match self.request(&Request::RetryAttachment {
+            content_id: content_id.into(),
+        })? {
+            Response::AttachmentUpdated { attachment } => Ok(attachment),
+            other => Err(ClientError::Rejected(format!(
+                "unexpected response: {other:?}"
+            ))),
+        }
+    }
+
+    pub fn delete_attachment(&self, content_id: impl Into<String>) -> Result<(), ClientError> {
+        match self.request(&Request::DeleteAttachment {
+            content_id: content_id.into(),
+        })? {
+            Response::AttachmentDeleted { .. } => Ok(()),
+            other => Err(ClientError::Rejected(format!(
+                "unexpected response: {other:?}"
+            ))),
+        }
+    }
+
+    pub fn delete_remembrance(&self, id: impl Into<String>) -> Result<(), ClientError> {
+        match self.request(&Request::DeleteRemembrance { id: id.into() })? {
+            Response::RemembranceDeleted { .. } => Ok(()),
             other => Err(ClientError::Rejected(format!(
                 "unexpected response: {other:?}"
             ))),

@@ -27,6 +27,7 @@ const MAX_ATTACHMENT_BYTES: u64 = 100 * 1024 * 1024;
 const MAX_ATTACHMENTS_PER_REMEMBRIE: usize = 8;
 const MAX_NOTE_CHARACTERS: usize = 20_000;
 const MAX_CLIPBOARD_BYTES: usize = 256 * 1024;
+const MAX_CLIPBOARD_IMAGE_BYTES: usize = 32 * 1024 * 1024;
 const TOKEN_BYTES: usize = 32;
 const DBUS_NAME: &str = "com.chuk.Membrie.Clipboard";
 const DBUS_PATH: &str = "/com/chuk/Membrie/Clipboard";
@@ -87,6 +88,24 @@ struct ClipboardInput {
 }
 
 #[derive(Deserialize)]
+struct AttachmentCorrectionInput {
+    remembrie_id: String,
+    content_id: String,
+    correction: String,
+}
+
+#[derive(Deserialize)]
+struct AttachmentActionInput {
+    remembrie_id: String,
+    content_id: String,
+}
+
+#[derive(Deserialize)]
+struct RemembranceActionInput {
+    id: String,
+}
+
+#[derive(Deserialize)]
 struct PairingInput {
     code: String,
 }
@@ -122,7 +141,12 @@ struct MobileAttachment {
     content_id: String,
     original_name: String,
     mime_type: String,
+    byte_size: u64,
     analysis_state: String,
+    analysis_text: Option<String>,
+    user_correction: Option<String>,
+    analysis_model: Option<String>,
+    analysis_confidence: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -201,7 +225,7 @@ impl PreparedResponse {
             ("X-Frame-Options", "DENY"),
             (
                 "Permissions-Policy",
-                "camera=(), microphone=(), geolocation=(), payment=()",
+                "camera=(), microphone=(self), geolocation=(), payment=()",
             ),
             (
                 "Content-Security-Policy",
@@ -447,8 +471,13 @@ fn route_api(request: &mut Request, state: &AppState, path: &str) -> Result<Prep
         )),
         (&Method::Get, "/api/recall") => recall(state),
         (&Method::Post, "/api/brie") => ask_brie(request, state),
+        (&Method::Get, "/api/clipboard/image") => read_clipboard_image(),
         (&Method::Get, "/api/clipboard") => read_clipboard(),
         (&Method::Post, "/api/clipboard") => write_clipboard(request),
+        (&Method::Post, "/api/attachment/correct") => correct_attachment(request, state),
+        (&Method::Post, "/api/attachment/retry") => retry_attachment(request, state),
+        (&Method::Post, "/api/attachment/delete") => delete_attachment(request, state),
+        (&Method::Post, "/api/remembrance/delete") => delete_remembrance(request, state),
         (&Method::Get, path) if path.starts_with("/api/attachment/") => {
             read_attachment(state, path)
         }
@@ -768,6 +797,45 @@ fn read_clipboard() -> Result<PreparedResponse> {
     Ok(PreparedResponse::json(200, &ClipboardResponse { text }))
 }
 
+fn read_clipboard_image() -> Result<PreparedResponse> {
+    let (mime_type, content) = match bridge_read_clipboard_image() {
+        Ok(image) => image,
+        Err(error) => {
+            eprintln!("Mobile clipboard image fetch unavailable: {error:#}");
+            return Ok(PreparedResponse::error(
+                404,
+                "The PC clipboard does not contain a supported image",
+            ));
+        }
+    };
+    if content.is_empty() || content.len() > MAX_CLIPBOARD_IMAGE_BYTES {
+        return Ok(PreparedResponse::error(
+            413,
+            "The PC clipboard image is empty or too large",
+        ));
+    }
+    let Some(content_type) = verified_clipboard_image_type(&mime_type, &content) else {
+        return Ok(PreparedResponse::error(
+            415,
+            "The PC clipboard image format could not be verified",
+        ));
+    };
+    Ok(PreparedResponse::text(200, content_type, content))
+}
+
+fn verified_clipboard_image_type(mime_type: &str, content: &[u8]) -> Option<&'static str> {
+    match mime_type {
+        "image/png" if content.starts_with(b"\x89PNG\r\n\x1a\n") => Some("image/png"),
+        "image/jpeg" if content.starts_with(b"\xff\xd8\xff") => Some("image/jpeg"),
+        "image/webp"
+            if content.len() >= 12 && &content[..4] == b"RIFF" && &content[8..12] == b"WEBP" =>
+        {
+            Some("image/webp")
+        }
+        _ => None,
+    }
+}
+
 fn write_clipboard(request: &mut Request) -> Result<PreparedResponse> {
     let input: ClipboardInput = match read_json(request) {
         Ok(input) => input,
@@ -799,6 +867,104 @@ fn write_clipboard(request: &mut Request) -> Result<PreparedResponse> {
     ))
 }
 
+fn correct_attachment(request: &mut Request, state: &AppState) -> Result<PreparedResponse> {
+    let input: AttachmentCorrectionInput = match read_json(request) {
+        Ok(input) => input,
+        Err(response) => return Ok(response),
+    };
+    if !companion_attachment_is_available(state, &input.remembrie_id, &input.content_id)? {
+        return Ok(PreparedResponse::error(404, "Attachment not found"));
+    }
+    let attachment = state
+        .client
+        .correct_attachment_transcript(input.content_id, input.correction)?;
+    Ok(PreparedResponse::json(
+        200,
+        &ApiMessage {
+            message: if attachment.user_correction.is_some() {
+                "Transcript correction saved; the machine transcript and original audio were preserved"
+            } else {
+                "Transcript correction removed; the machine transcript and original audio remain"
+            },
+        },
+    ))
+}
+
+fn retry_attachment(request: &mut Request, state: &AppState) -> Result<PreparedResponse> {
+    let input: AttachmentActionInput = match read_json(request) {
+        Ok(input) => input,
+        Err(response) => return Ok(response),
+    };
+    if !companion_attachment_is_available(state, &input.remembrie_id, &input.content_id)? {
+        return Ok(PreparedResponse::error(404, "Attachment not found"));
+    }
+    state.client.retry_attachment(input.content_id)?;
+    Ok(PreparedResponse::json(
+        200,
+        &ApiMessage {
+            message: "Local understanding was queued again",
+        },
+    ))
+}
+
+fn delete_attachment(request: &mut Request, state: &AppState) -> Result<PreparedResponse> {
+    let input: AttachmentActionInput = match read_json(request) {
+        Ok(input) => input,
+        Err(response) => return Ok(response),
+    };
+    if !companion_attachment_is_available(state, &input.remembrie_id, &input.content_id)? {
+        return Ok(PreparedResponse::error(404, "Attachment not found"));
+    }
+    state.client.delete_attachment(input.content_id)?;
+    Ok(PreparedResponse::json(
+        200,
+        &ApiMessage {
+            message: "Attachment deleted locally",
+        },
+    ))
+}
+
+fn delete_remembrance(request: &mut Request, state: &AppState) -> Result<PreparedResponse> {
+    let input: RemembranceActionInput = match read_json(request) {
+        Ok(input) => input,
+        Err(response) => return Ok(response),
+    };
+    let Some(remembrance) = state.client.get_remembrie(&input.id)? else {
+        return Ok(PreparedResponse::error(404, "Remembrie not found"));
+    };
+    if remembrance.source_app.as_deref() != Some("Membrie Companion") {
+        return Ok(PreparedResponse::error(
+            403,
+            "Only Remembries created in Companion can be deleted here",
+        ));
+    }
+    state.client.delete_remembrance(input.id)?;
+    Ok(PreparedResponse::json(
+        200,
+        &ApiMessage {
+            message: "Remembrie and its private attachments were deleted locally",
+        },
+    ))
+}
+
+fn companion_attachment_is_available(
+    state: &AppState,
+    remembrie_id: &str,
+    content_id: &str,
+) -> Result<bool> {
+    let Some(remembrance) = state.client.get_remembrie(remembrie_id)? else {
+        return Ok(false);
+    };
+    if remembrance.source_app.as_deref() != Some("Membrie Companion") {
+        return Ok(false);
+    }
+    Ok(state
+        .client
+        .list_attachments(remembrie_id)?
+        .into_iter()
+        .any(|attachment| attachment.content_id == content_id))
+}
+
 fn read_attachment(state: &AppState, path: &str) -> Result<PreparedResponse> {
     let mut parts = path
         .trim_start_matches("/api/attachment/")
@@ -826,6 +992,15 @@ fn read_attachment(state: &AppState, path: &str) -> Result<PreparedResponse> {
         "image/jpeg" => "image/jpeg",
         "image/gif" => "image/gif",
         "image/webp" => "image/webp",
+        "audio/aac" | "audio/x-aac" => "audio/aac",
+        "audio/flac" | "audio/x-flac" => "audio/flac",
+        "audio/m4a" | "audio/mp4" | "audio/x-m4a" => "audio/mp4",
+        "audio/mpeg" => "audio/mpeg",
+        "audio/ogg" => "audio/ogg",
+        "audio/opus" => "audio/opus",
+        "audio/wav" | "audio/x-wav" => "audio/wav",
+        "audio/webm" => "audio/webm",
+        "audio/x-caf" => "audio/x-caf",
         _ => {
             return Ok(PreparedResponse::error(
                 415,
@@ -876,7 +1051,16 @@ fn mobile_remembrance(record: Remembrie, state: &AppState) -> Result<MobileRemem
             content_id: attachment.content_id,
             original_name: attachment.original_name,
             mime_type: attachment.mime_type,
+            byte_size: attachment.byte_size,
             analysis_state: attachment.analysis_state,
+            analysis_text: attachment
+                .analysis_text
+                .map(|text| truncate(&text, MAX_NOTE_CHARACTERS)),
+            user_correction: attachment
+                .user_correction
+                .map(|text| truncate(&text, MAX_NOTE_CHARACTERS)),
+            analysis_model: attachment.analysis_model,
+            analysis_confidence: attachment.analysis_confidence,
         })
         .collect();
     Ok(MobileRemembrance {
@@ -1035,6 +1219,17 @@ fn bridge_read_clipboard() -> Result<String> {
         None::<&gio::Cancellable>,
     )?;
     Ok(response.try_get::<(String,)>()?.0)
+}
+
+fn bridge_read_clipboard_image() -> Result<(String, Vec<u8>)> {
+    let response = desktop_proxy()?.call_sync(
+        "ReadImage",
+        None,
+        gio::DBusCallFlags::NONE,
+        8_000,
+        None::<&gio::Cancellable>,
+    )?;
+    Ok(response.try_get::<(String, Vec<u8>)>()?)
 }
 
 fn bridge_write_clipboard(text: &str) -> Result<bool> {
@@ -1262,6 +1457,34 @@ mod tests {
         );
         assert!(percent_decode("bad%2name.png").is_none());
         assert!(percent_decode("bad%FFname.png").is_none());
+    }
+
+    #[test]
+    fn pc_clipboard_images_require_matching_content_signatures() {
+        assert_eq!(
+            verified_clipboard_image_type("image/png", b"\x89PNG\r\n\x1a\nprivate"),
+            Some("image/png")
+        );
+        assert_eq!(
+            verified_clipboard_image_type("image/jpeg", b"\xff\xd8\xffprivate"),
+            Some("image/jpeg")
+        );
+        assert_eq!(
+            verified_clipboard_image_type("image/webp", b"RIFF0000WEBPprivate"),
+            Some("image/webp")
+        );
+        assert!(verified_clipboard_image_type("image/png", b"not-a-png").is_none());
+        assert!(
+            verified_clipboard_image_type("application/octet-stream", b"\x89PNG\r\n\x1a\n")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn pc_clipboard_image_dbus_payload_round_trips() {
+        let variant = ("image/png", vec![1_u8, 2, 3]).to_variant();
+        let decoded = variant.try_get::<(String, Vec<u8>)>().unwrap();
+        assert_eq!(decoded, ("image/png".to_owned(), vec![1, 2, 3]));
     }
 
     #[test]

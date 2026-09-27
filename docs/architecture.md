@@ -29,6 +29,8 @@ state cannot be read. A paired device may still submit a deliberate note or atta
 but Recall, Brie, and clipboard reads or writes return a locked response unless the user separately
 enables locked-session access. Response previews are bounded, likely secrets are blocked from
 clipboard transfer, request bodies have hard limits, and private API responses are never cached.
+The gateway permits its own microphone only so a user gesture can start a Companion voice note;
+camera and unrelated browser permissions remain disabled.
 
 Normal device setup uses a private invitation file created by the desktop app. It contains a random
 8-digit code and a five-minute expiry, is mode `0600`, and is protected by a process-wide pairing
@@ -103,6 +105,12 @@ UI distinguish an installed bridge from a capture process that has stopped respo
 Application exclusions become fully effective for adapters that provide trusted
 source-application context; arbitrary clipboard text still cannot reliably identify its
 originating application under Wayland.
+
+The same bridge supports an explicit, on-demand image ferry for PNG, JPEG, and WebP clipboard
+content. It reads bytes only after a paired Companion user presses **Fetch**, caps the result at
+32 MiB, and returns it over the local session bus. The gateway verifies both the declared media type
+and file signature before returning the image through private Tailscale HTTPS. It is not automatic
+clipboard capture: the temporary phone preview is stored only after a separate **Remember** action.
 
 Activity context is independently disabled by default. When enabled, the same GNOME
 bridge exposes the focused application, focused window title, lock state, and Mutter's
@@ -201,6 +209,12 @@ secret-like text is withheld, and recordings with no clear speech are labeled ac
 formats and larger retained images remain available as originals but are labeled unsupported rather
 than silently interpreted. Deleting the last Remembrie that references a blob deletes that blob as
 well.
+
+A transcript correction is stored in its own database field and incorporated into search with an
+explicit user-authored label. It never overwrites the machine transcript or retained original.
+Attachment retry clears only the replaceable machine interpretation and queues local processing
+again; a user correction remains intact. Deletion prunes content-addressed bytes only after no
+remaining Remembrie references them.
 
 Unknown and not-yet-understood attachment formats are never executed or presented as analyzed.
 Their filename, detected media type, size, and retained-original state remain visible. This lets

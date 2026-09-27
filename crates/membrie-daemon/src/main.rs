@@ -171,6 +171,33 @@ fn dispatch_database(request: Request, repository: &Mutex<Repository>) -> Result
         Request::ListAttachments { remembrie_id } => Ok(Response::Attachments {
             attachments: repository.list_attachments(&remembrie_id)?,
         }),
+        Request::CorrectAttachmentTranscript {
+            content_id,
+            correction,
+        } => Ok(Response::AttachmentUpdated {
+            attachment: repository.set_attachment_correction(&content_id, &correction)?,
+        }),
+        Request::RetryAttachment { content_id } => Ok(Response::AttachmentUpdated {
+            attachment: repository.retry_attachment_processing(&content_id)?,
+        }),
+        Request::DeleteAttachment { content_id } => {
+            if repository.delete_attachment(&content_id)? {
+                Ok(Response::AttachmentDeleted { content_id })
+            } else {
+                Ok(Response::Error {
+                    message: "attachment was not found".to_owned(),
+                })
+            }
+        }
+        Request::DeleteRemembrance { id } => {
+            if repository.delete_remembrance(&id)? {
+                Ok(Response::RemembranceDeleted { id })
+            } else {
+                Ok(Response::Error {
+                    message: "Remembrie was not found".to_owned(),
+                })
+            }
+        }
         Request::Capture { candidate } => Ok(Response::CaptureResult {
             decision: repository.capture(candidate)?,
         }),
