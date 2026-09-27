@@ -134,9 +134,21 @@ input:focus, textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 3px
 textarea[readonly] { color: var(--muted); }
 input[type="file"] { padding: 10px; font-size: 0.8rem; }
 input[type="file"]::file-selector-button { margin-right: 10px; border: 0; border-radius: 9px; padding: 8px 10px; background: var(--accent-soft); color: var(--accent); font-weight: 760; }
-.attachment-preview { display: grid; grid-template-columns: 70px 1fr; gap: 11px; align-items: center; padding: 10px; border: 1px solid var(--border); border-radius: 13px; background: var(--surface-soft); }
-.attachment-preview img { width: 70px; height: 70px; border-radius: 10px; object-fit: cover; }
-.attachment-preview p { margin: 0; font-size: 0.78rem; overflow-wrap: anywhere; }
+.paste-actions { display: flex; align-items: center; gap: 10px; }
+.paste-actions .secondary { flex: 0 0 auto; }
+.paste-actions span { color: var(--muted); font-size: 0.72rem; line-height: 1.35; }
+.paste-target { min-height: 58px; border: 1px dashed var(--accent); border-radius: 13px; padding: 12px 14px; outline: none; background: var(--accent-soft); color: var(--text); font-size: 0.82rem; line-height: 1.4; }
+.paste-target:empty::before { content: attr(data-placeholder); color: var(--muted); }
+.paste-target:focus { box-shadow: 0 0 0 3px var(--accent-soft); }
+.attachment-preview { display: grid; gap: 8px; }
+.attachment-item { display: grid; grid-template-columns: 58px 1fr auto; gap: 10px; align-items: center; padding: 9px; border: 1px solid var(--border); border-radius: 13px; background: var(--surface-soft); }
+.attachment-thumb, .attachment-kind { width: 58px; height: 58px; border-radius: 10px; object-fit: cover; background: var(--surface); }
+.attachment-kind { display: grid; place-items: center; color: var(--accent); font-size: 0.68rem; font-weight: 800; text-transform: uppercase; overflow: hidden; }
+.attachment-copy { min-width: 0; }
+.attachment-copy strong, .attachment-copy span { display: block; overflow-wrap: anywhere; }
+.attachment-copy strong { font-size: 0.8rem; }
+.attachment-copy span { margin-top: 3px; color: var(--muted); font-size: 0.7rem; }
+.remove-attachment { width: 34px; height: 34px; border: 1px solid var(--border); border-radius: 50%; background: var(--surface); color: var(--muted); font-size: 1rem; }
 
 .primary, .secondary, .danger {
   min-height: 46px;
@@ -176,6 +188,7 @@ input[type="file"]::file-selector-button { margin-right: 10px; border: 0; border
 .memory-card h4 { margin: 0 0 5px; font-size: 0.98rem; }
 .memory-card p { margin: 0; font-size: 0.82rem; }
 .memory-card img { display: block; width: 100%; max-height: 260px; margin: 9px 0; border-radius: 12px; object-fit: contain; background: var(--surface-soft); }
+.memory-attachment { margin: 9px 0; padding: 9px 10px; border-radius: 10px; background: var(--surface-soft); color: var(--muted); font-size: 0.75rem; overflow-wrap: anywhere; }
 .empty-list { padding: 18px; border: 1px dashed var(--border); border-radius: 14px; color: var(--muted); text-align: center; }
 
 .bottom-nav {

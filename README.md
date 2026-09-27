@@ -18,7 +18,7 @@ The project is intentionally local-first and self-hosted:
 - Local daemon with a small typed JSON protocol over a Unix socket
 - SQLite schema for Remembries, content, relationships, embeddings, and processing jobs
 - Manual Remembrie capture
-- Image Remembries from the desktop or Mobile Companion by picker, paste, or drag-and-drop
+- Image Remembries from the desktop, plus a Mobile Companion paste inbox for mixed text, links, images, and files
 - Content-addressed attachment storage with byte-level deduplication and retained original evidence
 - Local image description and visible-text extraction through the selected Ollama vision model
 - Day, week, and month activity maps with stable application colors and day-by-day chronology
@@ -54,7 +54,7 @@ The project is intentionally local-first and self-hosted:
 - Brie citations open the matching Timeline day, highlight the source, and show its exact evidence
 - Quick Brie compact window for local recall and note capture without leaving the current workflow
 - Opt-in read-only GNOME Calendar integration with recurring-event expansion and local reconciliation
-- Responsive Mobile Companion for notes, images, explicit clipboard transfers, Brie, and compact recall
+- Responsive Mobile Companion for universal paste capture, multi-file selection, explicit clipboard transfers, Brie, and compact recall
 - Independent Mobile Companion pairing plus a fail-closed locked-PC privacy boundary
 - One-use five-minute QR or 8-digit pairing invitations, with the reusable token retained as fallback
 - Truthful `Membrie Companion` provenance for phone notes and source-aware recent-note recall in Brie
@@ -115,10 +115,12 @@ MagicDNS hostname over private tailnet HTTPS; Membrie still opens no LAN or publ
 While the PC is locked, paired devices can add notes but cannot read Remembries or clipboard text
 unless the user explicitly relaxes that boundary.
 
-The desktop composer and Mobile Companion accept PNG, JPEG, GIF, and WebP images for retained
-preview plus local understanding. Other image formats, including HEIC when no local conversion is
-available, are still retained exactly but are labeled unsupported for machine analysis. Originals
-remain canonical; Brie sees only clearly labeled, fallible text produced by the local vision model.
+The Mobile Companion accepts every file representation that iOS exposes through an explicit paste
+gesture or file picker, with up to eight attachments and 100 MiB combined in one Remembrie. Text and
+links enter the searchable note directly. PNG, JPEG, GIF, and WebP receive retained previews plus
+local understanding. Other formats, including HEIC when no local conversion is available, are
+retained exactly but labeled unsupported for machine analysis. Originals remain canonical; Brie
+sees only clearly labeled, fallible text produced by the local vision model.
 
 To remove the installed application while keeping every Remembrie and backup:
 

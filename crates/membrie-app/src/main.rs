@@ -4576,20 +4576,22 @@ fn timeline_entry_row(state: &Rc<UiState>, entry: &TimelineEntry) -> gtk::ListBo
     top.append(&time);
     content.append(&top);
 
-    if let Some(attachment) = entry.attachments.first() {
-        if matches!(
+    if let Some(attachment) = entry.attachments.first()
+        && matches!(
             attachment.mime_type.as_str(),
             "image/png" | "image/jpeg" | "image/gif" | "image/webp" | "image/heic"
-        ) {
-            let path = attachment_blob_path(&attachment.blob_hash);
-            if path.is_file() {
-                let picture = gtk::Picture::for_filename(&path);
-                picture.set_size_request(-1, 220);
-                picture.set_content_fit(gtk::ContentFit::Contain);
-                picture.add_css_class("attachment-preview");
-                content.append(&picture);
-            }
+        )
+    {
+        let path = attachment_blob_path(&attachment.blob_hash);
+        if path.is_file() {
+            let picture = gtk::Picture::for_filename(&path);
+            picture.set_size_request(-1, 220);
+            picture.set_content_fit(gtk::ContentFit::Contain);
+            picture.add_css_class("attachment-preview");
+            content.append(&picture);
         }
+    }
+    for attachment in &entry.attachments {
         let attachment_detail = gtk::Label::new(Some(&format!(
             "{} · {} · {}",
             attachment.original_name,
@@ -4678,7 +4680,7 @@ fn timeline_entry_row(state: &Rc<UiState>, entry: &TimelineEntry) -> gtk::ListBo
 
     if !entry.attachments.is_empty() {
         let caution = gtk::Label::new(Some(
-            "The retained image is exact evidence. Any description or recognized text is local, machine-generated context and may be mistaken.",
+            "Retained attachments are exact evidence. Any description or recognized text is local, machine-generated context and may be mistaken.",
         ));
         caution.add_css_class("caption");
         caution.add_css_class("timeline-evidence-caution");
@@ -4782,7 +4784,7 @@ fn show_remembrance_evidence(
             let caution_text = if attachments.is_empty() {
                 timeline_evidence_caution(&remembrie.kind)
             } else {
-                "The retained attachment below is exact evidence. Machine-described image text is local interpretation and may be incomplete or mistaken."
+                "The retained attachments below are exact evidence. Machine-described image text is local interpretation and may be incomplete or mistaken."
             };
             let caution = gtk::Label::new(Some(caution_text));
             caution.add_css_class("evidence-interpretation");

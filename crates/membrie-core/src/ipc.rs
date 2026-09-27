@@ -1,8 +1,8 @@
 use crate::model::{
-    ActivityRecordResult, ActivitySnapshot, Attachment, AttachmentImport, BackupInfo, BrieAnswer,
-    CalendarSyncResult, CaptureCandidate, CaptureDecision, CaptureRule, CaptureStatus,
-    IntelligenceSettings, IntelligenceStatus, MobileUsageSummary, NewRemembrie, PauseMode,
-    RecallSnapshot, Remembrie, ScreenCaptureCandidate, ScreenCaptureResult, SearchHit,
+    ActivityRecordResult, ActivitySnapshot, Attachment, AttachmentBatchImport, AttachmentImport,
+    BackupInfo, BrieAnswer, CalendarSyncResult, CaptureCandidate, CaptureDecision, CaptureRule,
+    CaptureStatus, IntelligenceSettings, IntelligenceStatus, MobileUsageSummary, NewRemembrie,
+    PauseMode, RecallSnapshot, Remembrie, ScreenCaptureCandidate, ScreenCaptureResult, SearchHit,
     SemanticCaptureCandidate, SemanticCaptureResult, TimelineEntry, TimelineHistorySpan,
     TimelineMapSlice,
 };
@@ -24,6 +24,9 @@ pub enum Request {
     },
     ImportAttachment {
         attachment: AttachmentImport,
+    },
+    ImportAttachments {
+        batch: AttachmentBatchImport,
     },
     ListAttachments {
         remembrie_id: String,
@@ -148,6 +151,10 @@ pub enum Response {
     AttachmentImported {
         remembrie: Remembrie,
         attachment: Attachment,
+    },
+    AttachmentsImported {
+        remembrie: Remembrie,
+        attachments: Vec<Attachment>,
     },
     Attachments {
         attachments: Vec<Attachment>,
@@ -338,6 +345,24 @@ impl DaemonClient {
                 remembrie,
                 attachment,
             } => Ok((remembrie, attachment)),
+            other => Err(ClientError::Rejected(format!(
+                "unexpected response: {other:?}"
+            ))),
+        }
+    }
+
+    pub fn import_attachments(
+        &self,
+        batch: AttachmentBatchImport,
+    ) -> Result<(Remembrie, Vec<Attachment>), ClientError> {
+        match self.request_with_timeout(
+            &Request::ImportAttachments { batch },
+            Duration::from_secs(120),
+        )? {
+            Response::AttachmentsImported {
+                remembrie,
+                attachments,
+            } => Ok((remembrie, attachments)),
             other => Err(ClientError::Rejected(format!(
                 "unexpected response: {other:?}"
             ))),

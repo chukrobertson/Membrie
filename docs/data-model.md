@@ -43,6 +43,7 @@ Deleting or regenerating derived records must never destroy captured evidence.
 
 Attachment bytes are canonical evidence but deliberately live outside SQLite under
 `blobs/sha256/<prefix>/<hash>`. The database owns their references and lifecycle. Identical files
-deduplicate by hash; complete backups contain both the verified database and every referenced blob.
+deduplicate by hash; a single Remembrie can reference a reviewed set of attachments; complete backups
+contain both the verified database and every referenced blob.
 Image descriptions and extracted visible text are derived, fallible, model-labeled material and can
 be retried or regenerated without changing the retained original.

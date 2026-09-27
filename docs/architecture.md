@@ -25,7 +25,7 @@ workers. Every API request requires a 256-bit token stored in Membrie's private 
 tailnet membership does not replace that application-level pairing.
 
 The gateway checks GNOME's lock state before every reading operation and fails closed when that
-state cannot be read. A paired device may still submit a deliberate note or image while the PC is locked,
+state cannot be read. A paired device may still submit a deliberate note or attachment set while the PC is locked,
 but Recall, Brie, and clipboard reads or writes return a locked response unless the user separately
 enables locked-session access. Response previews are bounded, likely secrets are blocked from
 clipboard transfer, request bodies have hard limits, and private API responses are never cached.
@@ -50,6 +50,13 @@ user-authored recollections rather than observations. Their source is recorded a
 and their window provenance as `Mobile WebUI`. Brie uses that exact provenance when a question names
 mobile, phone, iPhone, Companion, or WebUI notes, and combines it with explicit recency language. Older
 notes created before provenance existed are never retroactively relabeled by guesswork.
+
+Companion capture is deliberately user-initiated. A paste button uses only clipboard representations
+that the browser exposes after that gesture; a dedicated paste surface supports iOS's system Paste
+action when programmatic clipboard reading is unavailable. Text and links are merged into the note,
+while exposed binary items and picker selections become a reviewed attachment tray. One submission
+creates one Remembrie with at most eight attachments and 100 MiB of combined retained data. Partial
+uploads can be explicitly discarded, and abandoned private staging files expire locally after one day.
 
 The companion records only coarse local usage events: an opening count and bounded active-time
 pulses while the page is visible. It records no navigation path, device fingerprint, analytics
@@ -189,6 +196,10 @@ unverified machine description, and queues ordinary summary and embedding work a
 model output is withheld. Other formats and larger retained images remain available as originals but
 are labeled unsupported rather than silently interpreted. Deleting the last Remembrie that references
 a blob deletes that blob as well.
+
+Unknown and not-yet-understood attachment formats are never executed or presented as analyzed.
+Their filename, detected media type, size, and retained-original state remain visible. This lets
+capture support arrive independently from later PDF, office-document, audio, and video analyzers.
 
 The daemon creates backups with SQLite's online backup API, verifies them with
 `integrity_check`, copies or hard-links every referenced attachment, writes a manifest, syncs the

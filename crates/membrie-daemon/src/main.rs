@@ -160,6 +160,13 @@ fn dispatch_database(request: Request, repository: &Mutex<Repository>) -> Result
                 attachment,
             })
         }
+        Request::ImportAttachments { batch } => {
+            let (remembrie, attachments) = repository.import_attachments(batch)?;
+            Ok(Response::AttachmentsImported {
+                remembrie,
+                attachments,
+            })
+        }
         Request::ListAttachments { remembrie_id } => Ok(Response::Attachments {
             attachments: repository.list_attachments(&remembrie_id)?,
         }),

@@ -4,11 +4,12 @@ use anyhow::{Context, Result, anyhow, bail};
 use gio::prelude::*;
 use glib::variant::ToVariant;
 use membrie_core::{
-    AttachmentImport, DaemonClient, MobileUsageSummary, NewRemembrie, Remembrie,
-    attachment_blob_path, attachment_inbox_dir, mobile_pairing_invitation_path,
-    mobile_tailnet_host_path, mobile_token_path, socket_path,
+    AttachmentBatchImport, DaemonClient, MobileUsageSummary, NewRemembrie, Remembrie,
+    StagedAttachmentImport, attachment_blob_path, attachment_inbox_dir,
+    mobile_pairing_invitation_path, mobile_tailnet_host_path, mobile_token_path, socket_path,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Cursor, Read, Write};
 use std::net::SocketAddr;
@@ -23,6 +24,7 @@ const LISTEN_ADDRESS: &str = "127.0.0.1:47381";
 const WORKERS: usize = 4;
 const MAX_REQUEST_BYTES: u64 = 300 * 1024;
 const MAX_ATTACHMENT_BYTES: u64 = 100 * 1024 * 1024;
+const MAX_ATTACHMENTS_PER_REMEMBRIE: usize = 8;
 const MAX_NOTE_CHARACTERS: usize = 20_000;
 const MAX_CLIPBOARD_BYTES: usize = 256 * 1024;
 const TOKEN_BYTES: usize = 32;
@@ -52,7 +54,10 @@ struct NoteInput {
 
 #[derive(Deserialize)]
 struct AttachmentInput {
-    upload_id: String,
+    #[serde(default)]
+    upload_id: Option<String>,
+    #[serde(default)]
+    upload_ids: Vec<String>,
     #[serde(default)]
     title: String,
     #[serde(default)]
@@ -64,6 +69,11 @@ struct UsageInput {
     active_ms: u64,
     #[serde(default)]
     opened: bool,
+}
+
+#[derive(Deserialize)]
+struct CancelUploadsInput {
+    upload_ids: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -104,7 +114,7 @@ struct MobileRemembrance {
     source: String,
     occurred_at_ms: i64,
     preview: String,
-    attachment: Option<MobileAttachment>,
+    attachments: Vec<MobileAttachment>,
 }
 
 #[derive(Serialize)]
@@ -222,6 +232,9 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    if let Err(error) = cleanup_stale_uploads() {
+        eprintln!("could not clean old staged attachments: {error:#}");
+    }
     let token = Arc::new(load_or_create_token()?);
     let tailnet_host = load_tailnet_host()?.map(Arc::new);
     let state = AppState {
@@ -425,6 +438,7 @@ fn route_api(request: &mut Request, state: &AppState, path: &str) -> Result<Prep
         )),
         (&Method::Post, "/api/note") => create_note(request, state),
         (&Method::Post, "/api/upload") => upload_attachment(request),
+        (&Method::Post, "/api/uploads/cancel") => cancel_uploads(request),
         (&Method::Post, "/api/attachment") => create_attachment(request, state),
         (&Method::Post, "/api/usage") => record_mobile_usage(request, state),
         _ if !read_allowed => Ok(PreparedResponse::error(
@@ -527,32 +541,48 @@ fn upload_attachment(request: &mut Request) -> Result<PreparedResponse> {
         ));
     }
     file.sync_all()?;
-    let metadata_path = inbox.join(format!("{upload_id}.name"));
-    let mut metadata_options = OpenOptions::new();
-    metadata_options.write(true).create_new(true);
-    #[cfg(unix)]
-    metadata_options.mode(0o600);
-    let mut metadata = metadata_options.open(&metadata_path)?;
-    writeln!(metadata, "{original_name}")?;
-    writeln!(metadata, "{declared_mime_type}")?;
-    metadata.sync_all()?;
+    let metadata_result = (|| -> Result<()> {
+        let metadata_path = inbox.join(format!("{upload_id}.name"));
+        let mut metadata_options = OpenOptions::new();
+        metadata_options.write(true).create_new(true);
+        #[cfg(unix)]
+        metadata_options.mode(0o600);
+        let mut metadata = metadata_options.open(&metadata_path)?;
+        writeln!(metadata, "{original_name}")?;
+        writeln!(metadata, "{declared_mime_type}")?;
+        metadata.sync_all()?;
+        Ok(())
+    })();
+    if let Err(error) = metadata_result {
+        let _ = fs::remove_file(&path);
+        return Err(error);
+    }
     Ok(PreparedResponse::json(201, &UploadResponse { upload_id }))
 }
 
 fn create_attachment(request: &mut Request, state: &AppState) -> Result<PreparedResponse> {
-    let input: AttachmentInput = match read_json(request) {
+    let mut input: AttachmentInput = match read_json(request) {
         Ok(input) => input,
         Err(response) => return Ok(response),
     };
-    if input.upload_id.len() != 32
-        || !input
-            .upload_id
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    if input.upload_ids.is_empty()
+        && let Some(upload_id) = input.upload_id.take()
+    {
+        input.upload_ids.push(upload_id);
+    }
+    if input.upload_ids.is_empty()
+        || input.upload_ids.len() > MAX_ATTACHMENTS_PER_REMEMBRIE
+        || input.upload_ids.iter().any(|upload_id| {
+            upload_id.len() != 32
+                || !upload_id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+        || input.upload_ids.iter().collect::<HashSet<_>>().len() != input.upload_ids.len()
     {
         return Ok(PreparedResponse::error(
             422,
-            "That upload identifier is invalid",
+            "The pasted attachment set is invalid",
         ));
     }
     if input.title.chars().count() > 300 || input.body.chars().count() > MAX_NOTE_CHARACTERS {
@@ -562,39 +592,95 @@ fn create_attachment(request: &mut Request, state: &AppState) -> Result<Prepared
         ));
     }
     let inbox = attachment_inbox_dir();
-    let staged_path = inbox.join(&input.upload_id);
-    let metadata_path = inbox.join(format!("{}.name", input.upload_id));
-    let metadata = fs::read_to_string(&metadata_path)
-        .context("the staged attachment metadata was unavailable")?;
-    let mut metadata_lines = metadata.lines();
-    let original_name = metadata_lines.next().unwrap_or("").trim().to_owned();
-    let declared_mime_type = metadata_lines
-        .next()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_owned);
-    let imported = state.client.import_attachment(AttachmentImport {
-        staged_path: staged_path.display().to_string(),
-        original_name,
-        declared_mime_type,
+    let mut staged = Vec::with_capacity(input.upload_ids.len());
+    for upload_id in &input.upload_ids {
+        let staged_path = inbox.join(upload_id);
+        let metadata_path = inbox.join(format!("{upload_id}.name"));
+        let metadata = fs::read_to_string(&metadata_path)
+            .context("the staged attachment metadata was unavailable")?;
+        let mut metadata_lines = metadata.lines();
+        let original_name = metadata_lines.next().unwrap_or("").trim().to_owned();
+        let declared_mime_type = metadata_lines
+            .next()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned);
+        staged.push(StagedAttachmentImport {
+            staged_path: staged_path.display().to_string(),
+            original_name,
+            declared_mime_type,
+        });
+    }
+    let imported = state.client.import_attachments(AttachmentBatchImport {
+        attachments: staged,
         title: input.title,
         note: input.body,
         source_app: "Membrie Companion".to_owned(),
         window_title: Some("Mobile WebUI".to_owned()),
     });
-    let _ = fs::remove_file(&metadata_path);
+    for upload_id in &input.upload_ids {
+        let _ = fs::remove_file(inbox.join(format!("{upload_id}.name")));
+    }
     match imported {
-        Ok((_remembrie, _)) => Ok(PreparedResponse::json(
-            201,
-            &ApiMessage {
-                message: "Image Remembrie saved; local understanding is queued",
-            },
-        )),
+        Ok((_remembrie, attachments)) => {
+            let pending = attachments
+                .iter()
+                .filter(|attachment| attachment.analysis_state == "pending")
+                .count();
+            let message = match (attachments.len(), pending) {
+                (1, 1) => "Attachment saved; local image understanding is queued".to_owned(),
+                (1, _) => "Attachment saved; its original is retained locally".to_owned(),
+                (count, 0) => {
+                    format!("{count} attachments saved; their originals are retained locally")
+                }
+                (count, pending) => format!(
+                    "{count} attachments saved; local understanding is queued for {pending} image{}",
+                    if pending == 1 { "" } else { "s" }
+                ),
+            };
+            Ok(PreparedResponse::json(
+                201,
+                &ApiMessage { message: &message },
+            ))
+        }
         Err(error) => {
-            let _ = fs::remove_file(&staged_path);
+            for upload_id in &input.upload_ids {
+                let _ = fs::remove_file(inbox.join(upload_id));
+            }
             Err(error.into())
         }
     }
+}
+
+fn cancel_uploads(request: &mut Request) -> Result<PreparedResponse> {
+    let input: CancelUploadsInput = match read_json(request) {
+        Ok(input) => input,
+        Err(response) => return Ok(response),
+    };
+    if input.upload_ids.len() > MAX_ATTACHMENTS_PER_REMEMBRIE
+        || input.upload_ids.iter().any(|upload_id| {
+            upload_id.len() != 32
+                || !upload_id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+    {
+        return Ok(PreparedResponse::error(
+            422,
+            "The staged attachment set is invalid",
+        ));
+    }
+    let inbox = attachment_inbox_dir();
+    for upload_id in input.upload_ids {
+        let _ = fs::remove_file(inbox.join(&upload_id));
+        let _ = fs::remove_file(inbox.join(format!("{upload_id}.name")));
+    }
+    Ok(PreparedResponse::json(
+        200,
+        &ApiMessage {
+            message: "Staged attachments discarded",
+        },
+    ))
 }
 
 fn record_mobile_usage(request: &mut Request, state: &AppState) -> Result<PreparedResponse> {
@@ -782,17 +868,17 @@ fn mobile_remembrance(record: Remembrie, state: &AppState) -> Result<MobileRemem
         .as_deref()
         .filter(|summary| !summary.trim().is_empty())
         .unwrap_or(record.body.as_str());
-    let attachment = state
+    let attachments = state
         .client
         .list_attachments(&record.id)?
         .into_iter()
-        .next()
         .map(|attachment| MobileAttachment {
             content_id: attachment.content_id,
             original_name: attachment.original_name,
             mime_type: attachment.mime_type,
             analysis_state: attachment.analysis_state,
-        });
+        })
+        .collect();
     Ok(MobileRemembrance {
         id: record.id,
         kind: record.kind,
@@ -802,7 +888,7 @@ fn mobile_remembrance(record: Remembrie, state: &AppState) -> Result<MobileRemem
             .unwrap_or_else(|| "Unknown local source".to_owned()),
         occurred_at_ms: record.occurred_at_ms,
         preview: truncate(preview, 260),
-        attachment,
+        attachments,
     })
 }
 
@@ -1075,6 +1161,35 @@ fn random_hex_identifier() -> Result<String> {
     let mut random = [0_u8; 16];
     File::open("/dev/urandom")?.read_exact(&mut random)?;
     Ok(random.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+fn cleanup_stale_uploads() -> Result<()> {
+    let inbox = attachment_inbox_dir();
+    if !inbox.exists() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(inbox)? {
+        let entry = entry?;
+        let metadata = entry.metadata()?;
+        if !metadata.file_type().is_file()
+            || metadata.modified()?.elapsed().unwrap_or_default().as_secs() < 24 * 60 * 60
+        {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let identifier = name.strip_suffix(".name").unwrap_or(name);
+        if identifier.len() == 32
+            && identifier
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            fs::remove_file(entry.path())?;
+        }
+    }
+    Ok(())
 }
 
 fn percent_decode(value: &str) -> Option<String> {

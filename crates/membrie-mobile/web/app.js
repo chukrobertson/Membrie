@@ -4,9 +4,13 @@ const TOKEN_KEY = "membrie-pairing-token";
 let token = localStorage.getItem(TOKEN_KEY) || "";
 let statusState = null;
 let toastTimer = null;
-let selectedAttachment = null;
-let attachmentPreviewUrl = "";
+let selectedAttachments = [];
+const attachmentPreviewUrls = new Map();
 let usageStarted = false;
+let pastedItemSequence = 0;
+
+const MAX_ATTACHMENTS = 8;
+const MAX_ATTACHMENT_BYTES = 100 * 1024 * 1024;
 
 const $ = (selector) => document.querySelector(selector);
 const pairScreen = $("#pair-screen");
@@ -46,7 +50,7 @@ async function uploadAttachment(file) {
     method: "POST",
     headers: {
       "X-Membrie-Token": token,
-      "X-Membrie-Filename": encodeURIComponent(file.name || "Pasted image.png"),
+      "X-Membrie-Filename": encodeURIComponent(file.name || clipboardFilename(file.type)),
       "Content-Type": file.type || "application/octet-stream",
     },
     body: file,
@@ -172,19 +176,22 @@ $("#note-form").addEventListener("submit", async (event) => {
   button.disabled = true;
   const title = $("#note-title").value;
   const body = $("#note-body").value;
-  if (!selectedAttachment && !title.trim() && !body.trim()) {
-    setResult(result, "Write something or attach an image first.", false);
+  if (!selectedAttachments.length && !title.trim() && !body.trim()) {
+    setResult(result, "Paste, write, or attach something first.", false);
     button.disabled = false;
     return;
   }
-  button.textContent = selectedAttachment ? "Sending privately…" : "Remembering…";
+  button.textContent = selectedAttachments.length ? "Sending privately…" : "Remembering…";
+  const uploadIds = [];
   try {
     let response;
-    if (selectedAttachment) {
-      const uploadId = await uploadAttachment(selectedAttachment);
+    if (selectedAttachments.length) {
+      for (const attachment of selectedAttachments) {
+        uploadIds.push(await uploadAttachment(attachment));
+      }
       response = await api("/api/attachment", {
         method: "POST",
-        body: JSON.stringify({upload_id: uploadId, title, body}),
+        body: JSON.stringify({upload_ids: uploadIds, title, body}),
       });
     } else {
       response = await api("/api/note", {
@@ -195,10 +202,11 @@ $("#note-form").addEventListener("submit", async (event) => {
     $("#note-title").value = "";
     $("#note-body").value = "";
     $("#note-attachment").value = "";
-    setSelectedAttachment(null);
+    clearAttachments();
     setResult(result, response.message);
     toast("Saved on your PC");
   } catch (error) {
+    if (uploadIds.length) cancelUploads(uploadIds);
     setResult(result, error.message, false);
   } finally {
     button.disabled = false;
@@ -206,55 +214,233 @@ $("#note-form").addEventListener("submit", async (event) => {
   }
 });
 
-function setSelectedAttachment(file) {
-  selectedAttachment = file;
-  if (attachmentPreviewUrl) URL.revokeObjectURL(attachmentPreviewUrl);
-  attachmentPreviewUrl = "";
+async function cancelUploads(uploadIds) {
+  try {
+    await api("/api/uploads/cancel", {
+      method: "POST",
+      body: JSON.stringify({upload_ids: uploadIds}),
+    });
+  } catch (_error) {
+    // Private staged uploads also expire locally; capture errors remain the useful message.
+  }
+}
+
+function clearAttachments() {
+  selectedAttachments = [];
+  attachmentPreviewUrls.forEach((url) => URL.revokeObjectURL(url));
+  attachmentPreviewUrls.clear();
+  renderAttachments();
+}
+
+function addAttachments(files) {
+  let total = selectedAttachments.reduce((sum, file) => sum + file.size, 0);
+  const rejected = [];
+  for (const file of files) {
+    if (!(file instanceof Blob) || file.size === 0) {
+      rejected.push("an empty item");
+      continue;
+    }
+    if (selectedAttachments.length >= MAX_ATTACHMENTS) {
+      rejected.push(`more than ${MAX_ATTACHMENTS} items`);
+      break;
+    }
+    if (total + file.size > MAX_ATTACHMENT_BYTES) {
+      rejected.push("more than 100 MiB total");
+      continue;
+    }
+    const duplicate = selectedAttachments.some((existing) =>
+      existing.name === file.name && existing.size === file.size && existing.type === file.type
+        && existing.lastModified === file.lastModified
+    );
+    if (duplicate) continue;
+    selectedAttachments.push(file);
+    total += file.size;
+  }
+  renderAttachments();
+  if (rejected.length) {
+    setResult($("#note-result"), `Some clipboard items were not added: ${rejected.join(", ")}.`, false);
+  } else if (files.length) {
+    setResult(
+      $("#note-result"),
+      `${selectedAttachments.length} attachment${selectedAttachments.length === 1 ? "" : "s"} ready. Review, then remember.`
+    );
+  }
+}
+
+function removeAttachment(index) {
+  const [removed] = selectedAttachments.splice(index, 1);
+  const url = attachmentPreviewUrls.get(removed);
+  if (url) URL.revokeObjectURL(url);
+  attachmentPreviewUrls.delete(removed);
+  renderAttachments();
+}
+
+function renderAttachments() {
   const preview = $("#attachment-preview");
   preview.replaceChildren();
-  if (!file) {
+  if (!selectedAttachments.length) {
     preview.hidden = true;
     return;
   }
-  if (!file.type.startsWith("image/")) {
-    setResult($("#note-result"), "This first attachment pass accepts images.", false);
-    selectedAttachment = null;
-    preview.hidden = true;
-    return;
-  }
-  if (file.size > 100 * 1024 * 1024) {
-    setResult($("#note-result"), "That image is larger than 100 MiB.", false);
-    selectedAttachment = null;
-    preview.hidden = true;
-    return;
-  }
-  attachmentPreviewUrl = URL.createObjectURL(file);
-  const image = document.createElement("img");
-  image.src = attachmentPreviewUrl;
-  image.alt = "Selected image preview";
-  preview.append(image, textElement("p", `${file.name || "Pasted image"} · ${formatBytes(file.size)}`));
+  selectedAttachments.forEach((file, index) => {
+    const item = document.createElement("div");
+    item.className = "attachment-item";
+    let visual;
+    if (file.type.startsWith("image/")) {
+      visual = document.createElement("img");
+      visual.className = "attachment-thumb";
+      visual.alt = "";
+      let url = attachmentPreviewUrls.get(file);
+      if (!url) {
+        url = URL.createObjectURL(file);
+        attachmentPreviewUrls.set(file, url);
+      }
+      visual.src = url;
+    } else {
+      visual = textElement("div", fileKind(file), "attachment-kind");
+    }
+    const copy = document.createElement("div");
+    copy.className = "attachment-copy";
+    copy.append(
+      textElement("strong", file.name || clipboardFilename(file.type)),
+      textElement("span", `${file.type || "unknown format"} · ${formatBytes(file.size)}`)
+    );
+    const remove = textElement("button", "×", "remove-attachment");
+    remove.type = "button";
+    remove.setAttribute("aria-label", `Remove ${file.name || "attachment"}`);
+    remove.addEventListener("click", () => removeAttachment(index));
+    item.append(visual, copy, remove);
+    preview.append(item);
+  });
   preview.hidden = false;
-  setResult($("#note-result"), "Image ready to remember.");
 }
 
 $("#note-attachment").addEventListener("change", (event) => {
-  setSelectedAttachment(event.currentTarget.files[0] || null);
+  addAttachments(Array.from(event.currentTarget.files || []));
+  event.currentTarget.value = "";
+});
+
+function appendNoteText(text) {
+  const addition = String(text || "").trim();
+  if (!addition) return false;
+  const body = $("#note-body");
+  const combined = [body.value.trimEnd(), addition].filter(Boolean).join("\n\n");
+  if (combined.length > 20000) {
+    setResult($("#note-result"), "That pasted text is longer than the 20,000-character note limit.", false);
+    return false;
+  }
+  body.value = combined;
+  return true;
+}
+
+function textFromHtml(html) {
+  const documentFragment = new DOMParser().parseFromString(html, "text/html");
+  documentFragment.querySelectorAll("script, style, template").forEach((node) => node.remove());
+  return documentFragment.body?.textContent || "";
+}
+
+function filesFromTransfer(transfer) {
+  const files = Array.from(transfer?.files || []);
+  for (const item of Array.from(transfer?.items || [])) {
+    if (item.kind !== "file") continue;
+    const file = item.getAsFile();
+    if (file && !files.some((candidate) =>
+      candidate.name === file.name && candidate.size === file.size && candidate.type === file.type
+        && candidate.lastModified === file.lastModified
+    )) files.push(file);
+  }
+  return files;
+}
+
+function ingestTransfer(transfer) {
+  const files = filesFromTransfer(transfer);
+  if (files.length) addAttachments(files);
+  let text = transfer?.getData("text/uri-list") || transfer?.getData("text/plain") || "";
+  if (!text) text = textFromHtml(transfer?.getData("text/html") || "");
+  if (/^file:\/\//i.test(text.trim())) text = "";
+  const addedText = appendNoteText(text);
+  if (addedText) setResult($("#note-result"), "Pasted text is ready. Review, then remember.");
+  return files.length > 0 || addedText;
+}
+
+function clipboardFilename(type, numbered = false) {
+  const extension = {
+    "image/png": "png", "image/jpeg": "jpg", "image/gif": "gif", "image/webp": "webp",
+    "image/heic": "heic", "application/pdf": "pdf", "audio/mpeg": "mp3",
+    "audio/mp4": "m4a", "audio/x-m4a": "m4a", "video/mp4": "mp4", "video/quicktime": "mov",
+  }[type] || "bin";
+  const suffix = numbered ? ` ${++pastedItemSequence}` : "";
+  return `Pasted item${suffix}.${extension}`;
+}
+
+function fileKind(file) {
+  const subtype = (file.type || "file").split("/").pop() || "file";
+  return subtype.slice(0, 6);
+}
+
+async function pasteFromClipboard() {
+  if (!navigator.clipboard?.read) throw new Error("Use the long-press Paste area below on this iPhone.");
+  const clipboardItems = await navigator.clipboard.read();
+  const files = [];
+  const texts = [];
+  for (const item of clipboardItems) {
+    const binaryType = item.types.find((type) => !["text/plain", "text/html", "text/uri-list"].includes(type));
+    if (binaryType) {
+      const blob = await item.getType(binaryType);
+      files.push(new File([blob], clipboardFilename(binaryType, true), {type: binaryType, lastModified: Date.now()}));
+      continue;
+    }
+    const textType = ["text/uri-list", "text/plain", "text/html"].find((type) => item.types.includes(type));
+    if (!textType) continue;
+    const text = await (await item.getType(textType)).text();
+    texts.push(textType === "text/html" ? textFromHtml(text) : text);
+  }
+  if (files.length) addAttachments(files);
+  const addedText = appendNoteText(texts.join("\n\n"));
+  if (!files.length && !addedText) throw new Error("iOS did not expose usable clipboard content.");
+  if (addedText) setResult($("#note-result"), "Pasted content is ready. Review, then remember.");
+}
+
+$("#paste-from-device").addEventListener("click", async (event) => {
+  const button = event.currentTarget;
+  button.disabled = true;
+  try {
+    await pasteFromClipboard();
+  } catch (error) {
+    $("#paste-target").focus();
+    setResult($("#note-result"), error.message, false);
+  } finally {
+    button.disabled = false;
+  }
+});
+
+$("#paste-target").addEventListener("paste", (event) => {
+  event.preventDefault();
+  ingestTransfer(event.clipboardData);
+  event.currentTarget.replaceChildren();
+});
+
+$("#paste-target").addEventListener("input", (event) => {
+  const text = event.currentTarget.textContent;
+  if (appendNoteText(text)) setResult($("#note-result"), "Pasted text is ready. Review, then remember.");
+  event.currentTarget.replaceChildren();
 });
 
 $("#note-form").addEventListener("paste", (event) => {
-  const image = Array.from(event.clipboardData?.files || []).find((file) => file.type.startsWith("image/"));
-  if (image) {
+  if (event.target === $("#paste-target")) return;
+  const files = filesFromTransfer(event.clipboardData);
+  if (files.length) {
     event.preventDefault();
-    setSelectedAttachment(image);
+    addAttachments(files);
   }
 });
 
 $("#note-form").addEventListener("dragover", (event) => event.preventDefault());
 $("#note-form").addEventListener("drop", (event) => {
-  const image = Array.from(event.dataTransfer?.files || []).find((file) => file.type.startsWith("image/"));
-  if (image) {
+  const files = filesFromTransfer(event.dataTransfer);
+  if (files.length) {
     event.preventDefault();
-    setSelectedAttachment(image);
+    addAttachments(files);
   }
 });
 
@@ -365,22 +551,30 @@ function renderMemoryList(container, records, emptyMessage) {
     meta.className = "meta";
     meta.append(textElement("span", record.kind), textElement("time", formatDate(record.occurred_at_ms)));
     card.append(meta, textElement("h4", record.title));
-    if (record.attachment && record.attachment.mime_type.startsWith("image/")) {
-      const image = document.createElement("img");
-      image.alt = record.attachment.original_name;
-      image.loading = "lazy";
-      card.append(image);
-      loadAttachmentPreview(record, image);
-    }
+    (record.attachments || []).forEach((attachment) => {
+      if (["image/png", "image/jpeg", "image/gif", "image/webp"].includes(attachment.mime_type)) {
+        const image = document.createElement("img");
+        image.alt = attachment.original_name;
+        image.loading = "lazy";
+        card.append(image);
+        loadAttachmentPreview(record.id, attachment, image);
+      } else {
+        card.append(textElement(
+          "div",
+          `${attachment.original_name} · ${attachment.analysis_state === "unsupported" ? "original retained" : attachment.analysis_state}`,
+          "memory-attachment"
+        ));
+      }
+    });
     if (record.preview) card.append(textElement("p", record.preview));
     card.append(textElement("p", record.source, "model-label"));
     container.append(card);
   });
 }
 
-async function loadAttachmentPreview(record, image) {
+async function loadAttachmentPreview(remembrieId, attachment, image) {
   try {
-    const response = await fetch(`/api/attachment/${encodeURIComponent(record.id)}/${encodeURIComponent(record.attachment.content_id)}`, {
+    const response = await fetch(`/api/attachment/${encodeURIComponent(remembrieId)}/${encodeURIComponent(attachment.content_id)}`, {
       headers: {"X-Membrie-Token": token},
       cache: "no-store",
     });

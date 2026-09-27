@@ -25,15 +25,20 @@
         <div class="hero-card">
           <p class="eyebrow">QUICK CAPTURE</p>
           <h2 id="capture-title">Send a thought home</h2>
-          <p>Notes travel directly to this PC and become searchable Remembries.</p>
+          <p>Paste or choose something from this iPhone. You approve the preview, then it travels directly to your PC.</p>
         </div>
         <form id="note-form" class="card form-stack">
           <label for="note-title">Title <span>optional</span></label>
           <input id="note-title" maxlength="300" autocomplete="off" placeholder="What is this about?">
           <label for="note-body">Remembrie</label>
           <textarea id="note-body" maxlength="20000" rows="8" placeholder="A thought, link, name, or detail you do not want to lose…"></textarea>
-          <label for="note-attachment">Photo or image <span>optional</span></label>
-          <input id="note-attachment" type="file" accept="image/*">
+          <div class="paste-actions">
+            <button id="paste-from-device" class="secondary" type="button">Paste from iPhone</button>
+            <span>Text, links, images, and any files iOS exposes</span>
+          </div>
+          <div id="paste-target" class="paste-target" contenteditable="true" role="textbox" aria-label="Paste something from this device" spellcheck="false" data-placeholder="If iOS asks, long-press here and choose Paste"></div>
+          <label for="note-attachment">Attachments <span>optional · up to 8 items / 100 MiB total</span></label>
+          <input id="note-attachment" type="file" multiple>
           <div id="attachment-preview" class="attachment-preview" hidden></div>
           <button class="primary" type="submit">Remember on my PC</button>
           <p id="note-result" class="result" role="status"></p>

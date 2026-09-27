@@ -11,13 +11,14 @@ pub use config::{
 };
 pub use ipc::{DaemonClient, Request, Response};
 pub use model::{
-    ActivityRecordResult, ActivitySnapshot, Attachment, AttachmentImport, AttachmentProcessingJob,
-    BackupInfo, BrieAnswer, BrieCitation, CalendarEventSnapshot, CalendarSnapshot,
-    CalendarSourceSnapshot, CalendarSyncResult, CaptureCandidate, CaptureDecision, CaptureRule,
-    CaptureStatus, EmbeddedChunk, IntelligenceSettings, IntelligenceStatus, LocalModel,
-    MobileUsageSummary, NewRemembrie, PauseMode, ProcessingJob, Remembrie, ScreenAnalysis,
-    ScreenCaptureCandidate, ScreenCaptureResult, SearchHit, SemanticCaptureCandidate,
-    SemanticCaptureResult, TimelineActivityObservation, TimelineActivitySummary, TimelineEntry,
-    TimelineHistorySpan, TimelineMapSlice,
+    ActivityRecordResult, ActivitySnapshot, Attachment, AttachmentBatchImport, AttachmentImport,
+    AttachmentProcessingJob, BackupInfo, BrieAnswer, BrieCitation, CalendarEventSnapshot,
+    CalendarSnapshot, CalendarSourceSnapshot, CalendarSyncResult, CaptureCandidate,
+    CaptureDecision, CaptureRule, CaptureStatus, EmbeddedChunk, IntelligenceSettings,
+    IntelligenceStatus, LocalModel, MobileUsageSummary, NewRemembrie, PauseMode, ProcessingJob,
+    Remembrie, ScreenAnalysis, ScreenCaptureCandidate, ScreenCaptureResult, SearchHit,
+    SemanticCaptureCandidate, SemanticCaptureResult, StagedAttachmentImport,
+    TimelineActivityObservation, TimelineActivitySummary, TimelineEntry, TimelineHistorySpan,
+    TimelineMapSlice,
 };
 pub use repository::{Repository, RepositoryError};

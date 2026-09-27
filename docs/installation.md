@@ -87,9 +87,11 @@ clipboard directions. **Allow recall while this PC is locked** is a separate exp
 Tailscale access does not weaken this rule: tailnet membership and pairing are required before the
 locked-session boundary is evaluated.
 
-The Timeline composer and Mobile Companion can create an image Remembrie from a file picker, pasted
-image, or dropped file. PNG, JPEG, GIF, and WebP receive a retained preview and are interpreted by
-the selected local vision model; no image is sent to a remote API. Other formats are retained exactly
+The Timeline composer can create an image Remembrie from a file picker, pasted image, or dropped file.
+Mobile Companion adds a deliberate paste inbox and multi-file picker: text and links join the note,
+while every binary item iOS exposes is previewed before submission and retained on the PC. One mobile
+Remembrie accepts up to eight attachments and 100 MiB combined. PNG, JPEG, GIF, and WebP are interpreted
+by the selected local vision model; no item is sent to a remote API. Other formats are retained exactly
 but labeled unsupported for local understanding. Companion usage shown in its status sheet is only a
 local opening count and visible-time total, not telemetry.
 

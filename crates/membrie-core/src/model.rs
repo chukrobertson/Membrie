@@ -116,6 +116,22 @@ pub struct AttachmentImport {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct StagedAttachmentImport {
+    pub staged_path: String,
+    pub original_name: String,
+    pub declared_mime_type: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AttachmentBatchImport {
+    pub attachments: Vec<StagedAttachmentImport>,
+    pub title: String,
+    pub note: String,
+    pub source_app: String,
+    pub window_title: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Attachment {
     pub content_id: String,
     pub remembrie_id: String,
