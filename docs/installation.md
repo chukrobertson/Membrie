@@ -63,10 +63,24 @@ does not make Membrie reachable from the LAN or tailnet. Enable it in **Privacy 
 local preview, and use **Show pairing token** to pair that browser. The token file is private to the
 current Ubuntu user and is retained with the rest of Membrie's data during uninstall.
 
+For tailnet access, first record this PC's exact MagicDNS name with the installed companion binary,
+then point Tailscale Serve at the loopback listener:
+
+```bash
+~/.local/libexec/membrie/membrie-mobile --trust-tailnet-host exact-name.example.ts.net
+systemctl --user restart membrie-mobile.service
+sudo tailscale serve --bg --yes http://127.0.0.1:47381
+```
+
+Use the exact hostname reported by `tailscale status --json`; do not copy the example. Tailscale
+Serve provides private HTTPS to tailnet members and persists its configuration. Membrie validates
+that exact Host and HTTPS Origin, still requires the pairing token, and continues to reject direct
+network peers. Do not use Tailscale Funnel, which is intended for public internet exposure.
+
 The default locked-PC rule permits paired devices to create notes but denies Recall, Brie, and both
 clipboard directions. **Allow recall while this PC is locked** is a separate explicit choice. The
-local preview intentionally does not configure Tailscale; tailnet exposure is a later, auditable
-step after this boundary has been tested on the PC.
+Tailscale access does not weaken this rule: tailnet membership and pairing are required before the
+locked-session boundary is evaluated.
 
 ## Backups
 

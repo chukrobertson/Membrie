@@ -55,8 +55,8 @@ The project is intentionally local-first and self-hosted:
 - Independent Mobile Companion pairing plus a fail-closed locked-PC privacy boundary
 - Local model selection and visible indexing health
 
-Tailscale exposure for the locally verified companion, per-calendar controls, Thunderbird evidence,
-meeting transcripts, and deeper pattern detection are the next implementation milestones.
+Per-calendar controls, Thunderbird evidence, meeting transcripts, per-device pairing revocation,
+and deeper pattern detection are the next implementation milestones.
 
 ## Install on Ubuntu
 
@@ -101,11 +101,12 @@ Membrie only reads the resulting local calendar view.
 Membrie connects only to Ollama's fixed loopback address (`127.0.0.1`). Cloud-backed
 Ollama model names are deliberately rejected.
 
-Mobile Companion is separately opt-in in **Privacy & Capture**. Its first-stage preview is
-available only from the Ubuntu PC at `http://127.0.0.1:47381` and requires a private pairing
-token generated on that PC. While the PC is locked, paired devices can add notes but cannot read
-Remembries or clipboard text unless the user explicitly relaxes that boundary. Tailscale access
-is not opened automatically by this preview.
+Mobile Companion is separately opt-in in **Privacy & Capture**. It always listens only on the
+Ubuntu PC at `http://127.0.0.1:47381` and requires a private pairing token generated on that PC.
+An explicitly configured Tailscale Serve proxy can publish that loopback service to the exact
+MagicDNS hostname over private tailnet HTTPS; Membrie still opens no LAN or public listener.
+While the PC is locked, paired devices can add notes but cannot read Remembries or clipboard text
+unless the user explicitly relaxes that boundary.
 
 To remove the installed application while keeping every Remembrie and backup:
 

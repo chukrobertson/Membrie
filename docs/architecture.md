@@ -29,9 +29,12 @@ state cannot be read. A paired device may still submit a deliberate note while t
 but Recall, Brie, and clipboard reads or writes return a locked response unless the user separately
 enables locked-session access. Response previews are bounded, likely secrets are blocked from
 clipboard transfer, request bodies have hard limits, and private API responses are never cached.
-The first-stage service accepts only a local Host and Origin. Later Tailscale Serve support must add
-the exact tailnet hostname as an explicit trusted origin; it must not change the database daemon's
-Unix-socket boundary or bind the companion directly to a public interface.
+The service accepts only a local Host and Origin until an exact `.ts.net` hostname has been written
+to its private configuration. It then accepts that hostname only over an HTTPS Origin. Tailscale
+Serve terminates tailnet HTTPS and forwards to the same loopback listener; the companion still
+rejects non-loopback peers, and the database daemon remains behind its Unix-socket boundary.
+Tailscale identity and ACLs are an outer boundary, while Membrie's independent pairing token and
+locked-session policy remain the application boundary. Tailscale Funnel is never used.
 
 Quick Brie is a second, compact GTK application window in the same single-instance desktop client.
 The GNOME bridge owns only its global shortcut and launches the app through GNOME's normal

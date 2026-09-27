@@ -5,7 +5,7 @@ use membrie_core::{
     ActivitySnapshot, BrieAnswer, BrieCitation, CaptureRule, CaptureStatus, DaemonClient,
     IntelligenceSettings, IntelligenceStatus, LocalModel, NewRemembrie, PauseMode, Remembrie,
     ScreenCaptureCandidate, ScreenCaptureResult, SearchHit, TimelineActivityObservation,
-    TimelineEntry, TimelineMapSlice, mobile_token_path, socket_path,
+    TimelineEntry, TimelineMapSlice, mobile_tailnet_host_path, mobile_token_path, socket_path,
 };
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -1744,7 +1744,7 @@ fn build_privacy_page(state: &Rc<UiState>) -> gtk::Widget {
     mobile_detail.set_xalign(0.0);
     mobile_detail.set_wrap(true);
     let mobile_preview_detail = gtk::Label::new(Some(
-        "This first preview listens only on this PC. Tailscale access will be enabled separately after the local privacy boundary has been verified.",
+        "The companion itself listens only on this PC. When Tailscale access is configured, its private HTTPS proxy can reach that loopback listener; Membrie never opens a LAN or public listener.",
     ));
     mobile_preview_detail.add_css_class("dim-label");
     mobile_preview_detail.set_xalign(0.0);
@@ -3904,14 +3904,27 @@ fn apply_status_ui(state: &UiState, status: &CaptureStatus) {
         };
         state.calendar_status.set_text(&calendar_text);
     }
+    let companion_address = fs::read_to_string(mobile_tailnet_host_path())
+        .ok()
+        .map(|host| host.trim().trim_end_matches('.').to_ascii_lowercase())
+        .filter(|host| {
+            host.ends_with(".ts.net")
+                && host
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.'))
+        })
+        .map(|host| format!("https://{host}"))
+        .unwrap_or_else(|| "local preview: http://127.0.0.1:47381".to_owned());
     let mobile_text = if !status.mobile_enabled {
         "Off · paired devices cannot access Membrie".to_owned()
     } else if status.mobile_allow_while_locked {
-        "On · local preview: 127.0.0.1:47381\nPaired devices may use recall and clipboard features while this PC is locked"
-            .to_owned()
+        format!(
+            "On · {companion_address}\nPaired devices may use recall and clipboard features while this PC is locked"
+        )
     } else {
-        "On · local preview: 127.0.0.1:47381\nWhile this PC is locked, paired devices may add notes but cannot read Remembries or clipboard text"
-            .to_owned()
+        format!(
+            "On · {companion_address}\nWhile this PC is locked, paired devices may add notes but cannot read Remembries or clipboard text"
+        )
     };
     state.mobile_status.set_text(&mobile_text);
     state.privacy_stats.set_text(&format!(

@@ -3,7 +3,9 @@
 use anyhow::{Context, Result, anyhow, bail};
 use gio::prelude::*;
 use glib::variant::ToVariant;
-use membrie_core::{DaemonClient, NewRemembrie, Remembrie, mobile_token_path, socket_path};
+use membrie_core::{
+    DaemonClient, NewRemembrie, Remembrie, mobile_tailnet_host_path, mobile_token_path, socket_path,
+};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Cursor, Read, Write};
@@ -33,6 +35,7 @@ const APP_JS: &str = include_str!("../web/app.js");
 struct AppState {
     client: DaemonClient,
     token: Arc<String>,
+    tailnet_host: Option<Arc<String>>,
 }
 
 #[derive(Deserialize)]
@@ -157,17 +160,41 @@ impl PreparedResponse {
 }
 
 fn main() -> Result<()> {
+    let mut arguments = std::env::args().skip(1);
+    if let Some(argument) = arguments.next() {
+        if argument != "--trust-tailnet-host" {
+            bail!("unknown Mobile Companion option: {argument}");
+        }
+        let host = arguments
+            .next()
+            .ok_or_else(|| anyhow!("--trust-tailnet-host needs an exact hostname"))?;
+        if arguments.next().is_some() {
+            bail!("--trust-tailnet-host accepts exactly one hostname");
+        }
+        let host = normalize_tailnet_host(&host)?;
+        save_tailnet_host(&host)?;
+        println!("Membrie trusts the exact tailnet origin https://{host}");
+        return Ok(());
+    }
+
     let token = Arc::new(load_or_create_token()?);
+    let tailnet_host = load_tailnet_host()?.map(Arc::new);
     let state = AppState {
         client: DaemonClient::new(socket_path()),
         token,
+        tailnet_host,
     };
     let server = Arc::new(
         Server::http(LISTEN_ADDRESS)
             .map_err(|error| anyhow!("could not bind the local mobile companion: {error}"))?,
     );
     println!("Membrie Mobile Companion ready at http://{LISTEN_ADDRESS}");
-    println!("  local-only: yes");
+    println!("  listener: loopback only");
+    if let Some(host) = state.tailnet_host.as_deref() {
+        println!("  trusted tailnet origin: https://{host}");
+    } else {
+        println!("  trusted tailnet origin: none");
+    }
     println!("  authentication: pairing token required");
 
     let mut workers = Vec::with_capacity(WORKERS);
@@ -202,7 +229,9 @@ fn route(request: &mut Request, state: &AppState) -> Result<PreparedResponse> {
             "Direct network access is disabled",
         ));
     }
-    if !host_is_local(request) || !origin_matches_host(request) {
+    if !host_is_trusted(request, state.tailnet_host.as_deref().map(String::as_str))
+        || !origin_is_trusted(request, state.tailnet_host.as_deref().map(String::as_str))
+    {
         return Ok(PreparedResponse::error(
             403,
             "This local request was not trusted",
@@ -496,23 +525,31 @@ fn remote_is_loopback(remote: Option<&SocketAddr>) -> bool {
     remote.is_some_and(|remote| remote.ip().is_loopback())
 }
 
-fn host_is_local(request: &Request) -> bool {
-    header_value(request, "host").is_some_and(|host| {
-        matches!(
-            host.to_ascii_lowercase().as_str(),
-            "127.0.0.1:47381" | "localhost:47381"
-        )
-    })
+fn host_is_trusted(request: &Request, tailnet_host: Option<&str>) -> bool {
+    header_value(request, "host").is_some_and(|host| host_value_is_trusted(host, tailnet_host))
 }
 
-fn origin_matches_host(request: &Request) -> bool {
+fn origin_is_trusted(request: &Request, tailnet_host: Option<&str>) -> bool {
     let Some(origin) = header_value(request, "origin") else {
         return true;
     };
+    origin_value_is_trusted(origin, tailnet_host)
+}
+
+fn host_value_is_trusted(host: &str, tailnet_host: Option<&str>) -> bool {
+    let host = host.to_ascii_lowercase();
+    matches!(host.as_str(), "127.0.0.1:47381" | "localhost:47381")
+        || tailnet_host.is_some_and(|tailnet_host| {
+            host == tailnet_host || host == format!("{tailnet_host}:443")
+        })
+}
+
+fn origin_value_is_trusted(origin: &str, tailnet_host: Option<&str>) -> bool {
+    let origin = origin.to_ascii_lowercase();
     matches!(
-        origin.to_ascii_lowercase().as_str(),
+        origin.as_str(),
         "http://127.0.0.1:47381" | "http://localhost:47381"
-    )
+    ) || tailnet_host.is_some_and(|tailnet_host| origin == format!("https://{tailnet_host}"))
 }
 
 fn header_value<'a>(request: &'a Request, name: &str) -> Option<&'a str> {
@@ -572,6 +609,62 @@ fn bridge_write_clipboard(text: &str) -> Result<bool> {
         None::<&gio::Cancellable>,
     )?;
     Ok(response.try_get::<(bool,)>()?.0)
+}
+
+fn load_tailnet_host() -> Result<Option<String>> {
+    let path = mobile_tailnet_host_path();
+    let value = match fs::read_to_string(&path) {
+        Ok(value) => value,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    Ok(Some(normalize_tailnet_host(&value)?))
+}
+
+fn save_tailnet_host(host: &str) -> Result<()> {
+    let path = mobile_tailnet_host_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if path.exists() && !fs::symlink_metadata(&path)?.file_type().is_file() {
+        bail!("the trusted tailnet-host path is not a regular file");
+    }
+    let mut options = OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options.open(&path)?;
+    #[cfg(unix)]
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    file.write_all(host.as_bytes())?;
+    file.write_all(b"\n")?;
+    file.sync_all()?;
+    Ok(())
+}
+
+fn normalize_tailnet_host(value: &str) -> Result<String> {
+    let host = value.trim().trim_end_matches('.').to_ascii_lowercase();
+    if host.len() > 253 || !host.ends_with(".ts.net") {
+        bail!("the trusted hostname must be this PC's exact Tailscale .ts.net name");
+    }
+    if host.split('.').any(|label| {
+        label.is_empty()
+            || label.len() > 63
+            || !label
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            || !label
+                .as_bytes()
+                .first()
+                .is_some_and(u8::is_ascii_alphanumeric)
+            || !label
+                .as_bytes()
+                .last()
+                .is_some_and(u8::is_ascii_alphanumeric)
+    }) {
+        bail!("the trusted Tailscale hostname is not valid");
+    }
+    Ok(host)
 }
 
 fn load_or_create_token() -> Result<String> {
@@ -660,5 +753,35 @@ mod tests {
         assert!(mobile_read_allowed(false, true));
         assert!(!mobile_read_allowed(true, false));
         assert!(mobile_read_allowed(true, true));
+    }
+
+    #[test]
+    fn tailnet_host_trust_is_exact_and_https_only() {
+        let host = normalize_tailnet_host("RainbowBright.tail123.ts.net.\n").unwrap();
+        assert_eq!(host, "rainbowbright.tail123.ts.net");
+        assert!(host_value_is_trusted(&host, Some(&host)));
+        assert!(host_value_is_trusted(
+            "rainbowbright.tail123.ts.net:443",
+            Some(&host)
+        ));
+        assert!(!host_value_is_trusted(
+            "another.tail123.ts.net",
+            Some(&host)
+        ));
+        assert!(origin_value_is_trusted(
+            "https://rainbowbright.tail123.ts.net",
+            Some(&host)
+        ));
+        assert!(!origin_value_is_trusted(
+            "http://rainbowbright.tail123.ts.net",
+            Some(&host)
+        ));
+    }
+
+    #[test]
+    fn tailnet_host_configuration_rejects_non_tailscale_names() {
+        assert!(normalize_tailnet_host("example.com").is_err());
+        assert!(normalize_tailnet_host("https://node.example.ts.net").is_err());
+        assert!(normalize_tailnet_host("-node.tail123.ts.net").is_err());
     }
 }
