@@ -132,6 +132,11 @@ input, textarea {
 }
 input:focus, textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
 textarea[readonly] { color: var(--muted); }
+input[type="file"] { padding: 10px; font-size: 0.8rem; }
+input[type="file"]::file-selector-button { margin-right: 10px; border: 0; border-radius: 9px; padding: 8px 10px; background: var(--accent-soft); color: var(--accent); font-weight: 760; }
+.attachment-preview { display: grid; grid-template-columns: 70px 1fr; gap: 11px; align-items: center; padding: 10px; border: 1px solid var(--border); border-radius: 13px; background: var(--surface-soft); }
+.attachment-preview img { width: 70px; height: 70px; border-radius: 10px; object-fit: cover; }
+.attachment-preview p { margin: 0; font-size: 0.78rem; overflow-wrap: anywhere; }
 
 .primary, .secondary, .danger {
   min-height: 46px;
@@ -170,6 +175,7 @@ textarea[readonly] { color: var(--muted); }
 .memory-card .meta { display: flex; justify-content: space-between; gap: 8px; margin-bottom: 6px; color: var(--muted); font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.06em; }
 .memory-card h4 { margin: 0 0 5px; font-size: 0.98rem; }
 .memory-card p { margin: 0; font-size: 0.82rem; }
+.memory-card img { display: block; width: 100%; max-height: 260px; margin: 9px 0; border-radius: 12px; object-fit: contain; background: var(--surface-soft); }
 .empty-list { padding: 18px; border: 1px dashed var(--border); border-radius: 14px; color: var(--muted); text-align: center; }
 
 .bottom-nav {
@@ -205,6 +211,12 @@ textarea[readonly] { color: var(--muted); }
 .pair-card { display: grid; gap: 12px; }
 .brand-mark { display: grid; place-items: center; width: 46px; height: 46px; border-radius: 14px; background: var(--accent-strong); color: white; font-size: 1.25rem; font-weight: 850; }
 .icon-button { width: 38px; height: 38px; border-radius: 50%; font-size: 1.5rem; }
+.usage-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 7px; margin: 15px 0 10px; }
+.usage-grid div { padding: 10px 7px; border-radius: 12px; background: var(--surface-soft); text-align: center; }
+.usage-grid strong, .usage-grid span { display: block; }
+.usage-grid strong { font-size: 1rem; }
+.usage-grid span { margin-top: 3px; color: var(--muted); font-size: 0.64rem; }
+.usage-note { font-size: 0.72rem; }
 .toast { position: fixed; z-index: 40; left: 50%; bottom: calc(86px + env(safe-area-inset-bottom)); max-width: calc(100% - 34px); transform: translate(-50%, 18px); opacity: 0; pointer-events: none; border-radius: 999px; padding: 10px 15px; background: var(--text); color: var(--bg); font-size: 0.8rem; transition: 160ms ease; }
 .toast.show { opacity: 1; transform: translate(-50%, 0); }
 .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; }

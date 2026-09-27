@@ -36,6 +36,19 @@ pub fn mobile_pairing_invitation_path() -> PathBuf {
     data_dir().join("mobile-pairing-invitation")
 }
 
+pub fn attachment_inbox_dir() -> PathBuf {
+    data_dir().join("attachment-inbox")
+}
+
+pub fn attachment_blob_dir() -> PathBuf {
+    data_dir().join("blobs").join("sha256")
+}
+
+pub fn attachment_blob_path(hash: &str) -> PathBuf {
+    let shard = hash.get(..2).unwrap_or("invalid");
+    attachment_blob_dir().join(shard).join(hash)
+}
+
 pub fn screen_spool_dir() -> PathBuf {
     if let Some(path) = env::var_os("XDG_RUNTIME_DIR") {
         return PathBuf::from(path).join("membrie-screen");

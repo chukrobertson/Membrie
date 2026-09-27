@@ -18,6 +18,9 @@ The project is intentionally local-first and self-hosted:
 - Local daemon with a small typed JSON protocol over a Unix socket
 - SQLite schema for Remembries, content, relationships, embeddings, and processing jobs
 - Manual Remembrie capture
+- Image Remembries from the desktop or Mobile Companion by picker, paste, or drag-and-drop
+- Content-addressed attachment storage with byte-level deduplication and retained original evidence
+- Local image description and visible-text extraction through the selected Ollama vision model
 - Day, week, and month activity maps with stable application colors and day-by-day chronology
 - Color-grouped application time ribbon with idle gaps, stable app colors, and exact evidence
 - Timeline filters for observed activity, scheduled events, and manual notes, including upcoming days
@@ -41,7 +44,7 @@ The project is intentionally local-first and self-hosted:
 - Built-in password-manager and private-window exclusions
 - User-managed application exclusion rules
 - Temporary capture pauses and deletion by recent time range
-- Daily integrity-checked local backups with a rolling 14-backup history
+- Daily integrity-checked local backups of the database and referenced attachments, with a rolling 14-backup history
 - Capture-service health reporting in the Privacy screen
 - Rootless Ubuntu installation, app launcher, and automatic user services
 - Restart-safe local summary and embedding jobs
@@ -51,14 +54,15 @@ The project is intentionally local-first and self-hosted:
 - Brie citations open the matching Timeline day, highlight the source, and show its exact evidence
 - Quick Brie compact window for local recall and note capture without leaving the current workflow
 - Opt-in read-only GNOME Calendar integration with recurring-event expansion and local reconciliation
-- Responsive Mobile Companion preview for notes, explicit clipboard transfers, Brie, and compact recall
+- Responsive Mobile Companion for notes, images, explicit clipboard transfers, Brie, and compact recall
 - Independent Mobile Companion pairing plus a fail-closed locked-PC privacy boundary
 - One-use five-minute QR or 8-digit pairing invitations, with the reusable token retained as fallback
 - Truthful `Membrie Companion` provenance for phone notes and source-aware recent-note recall in Brie
+- Coarse, local-only Companion usage totals for the last day, week, and month
 - Local model selection and visible indexing health
 
-Per-calendar controls, Thunderbird evidence, meeting transcripts, individual device revocation,
-and deeper pattern detection are the next implementation milestones.
+Broader file understanding, per-calendar controls, Thunderbird evidence, meeting transcripts,
+individual device revocation, and deeper pattern detection are the next implementation milestones.
 
 ## Install on Ubuntu
 
@@ -92,8 +96,9 @@ ollama pull gemma4:e2b
 ```
 
 The first two models power Brie and hybrid recall. The optional third model powers
-Screen Memory and is not used unless that source is explicitly enabled. Other installed
-vision-capable Ollama models can be selected in Privacy & Capture.
+Screen Memory and image-attachment understanding. Image understanding runs only after a deliberate
+attachment; it does not require automatic Screen Memory to be enabled. Other installed vision-capable
+Ollama models can be selected in Privacy & Capture.
 
 Calendar access is separately opt-in. Membrie reads enabled calendars from Ubuntu's local
 Evolution Data Server, never receives calendar-account credentials, and exposes no calendar write
@@ -109,6 +114,11 @@ An explicitly configured Tailscale Serve proxy can publish that loopback service
 MagicDNS hostname over private tailnet HTTPS; Membrie still opens no LAN or public listener.
 While the PC is locked, paired devices can add notes but cannot read Remembries or clipboard text
 unless the user explicitly relaxes that boundary.
+
+The desktop composer and Mobile Companion accept PNG, JPEG, GIF, and WebP images for retained
+preview plus local understanding. Other image formats, including HEIC when no local conversion is
+available, are still retained exactly but are labeled unsupported for machine analysis. Originals
+remain canonical; Brie sees only clearly labeled, fallible text produced by the local vision model.
 
 To remove the installed application while keeping every Remembrie and backup:
 

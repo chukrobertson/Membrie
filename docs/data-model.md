@@ -6,7 +6,8 @@ not an individual key press or low-level operating-system event.
 ## Canonical records
 
 - `remembries`: identity, time range, source context, importance, and privacy state
-- `remembrie_contents`: original or user-authored text and future blob references
+- `remembrie_contents`: original or user-authored text, attachment references, and labeled local analysis
+- `attachment_blobs`: unique SHA-256 identities, byte sizes, and detected media types for retained files
 - `remembrie_links`: explicit and inferred relationships between Remembries
 - `capture_rules`: exclusions and capture policy
 - `capture_state`: global pause state and opt-in source settings
@@ -17,6 +18,8 @@ not an individual key press or low-level operating-system event.
   application accessibility interfaces, tied to activity sessions and quality-labeled
 - `screen_observations`: explicitly labeled local vision descriptions tied to activity sessions;
   processing state survives session boundaries and temporary source images are not retained
+- `mobile_usage_events`: coarse opening counts and bounded visible-time pulses, stored locally without
+  page-level behavior or device fingerprinting
 
 Semantic observations and completed screen descriptions become labeled sections of the same
 Activity Remembrie when its session closes. They are supporting context rather than independent
@@ -37,3 +40,9 @@ the original evidence remains authoritative.
 - `intelligence_settings`: selected local Ollama models and bounded working context
 
 Deleting or regenerating derived records must never destroy captured evidence.
+
+Attachment bytes are canonical evidence but deliberately live outside SQLite under
+`blobs/sha256/<prefix>/<hash>`. The database owns their references and lifecycle. Identical files
+deduplicate by hash; complete backups contain both the verified database and every referenced blob.
+Image descriptions and extracted visible text are derived, fallible, model-labeled material and can
+be retried or regenerated without changing the retained original.

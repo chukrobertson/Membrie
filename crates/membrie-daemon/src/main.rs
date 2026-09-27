@@ -4,8 +4,8 @@ mod ollama;
 
 use anyhow::{Context, Result, anyhow};
 use membrie_core::{
-    BackupInfo, Repository, Request, Response, ScreenCaptureCandidate, backup_dir, database_path,
-    screen_spool_dir, socket_path,
+    BackupInfo, Repository, Request, Response, ScreenCaptureCandidate, attachment_blob_path,
+    backup_dir, database_path, screen_spool_dir, socket_path,
 };
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -153,6 +153,16 @@ fn dispatch_database(request: Request, repository: &Mutex<Repository>) -> Result
         Request::Create { remembrie } => Ok(Response::Created {
             remembrie: repository.create(remembrie)?,
         }),
+        Request::ImportAttachment { attachment } => {
+            let (remembrie, attachment) = repository.import_attachment(attachment)?;
+            Ok(Response::AttachmentImported {
+                remembrie,
+                attachment,
+            })
+        }
+        Request::ListAttachments { remembrie_id } => Ok(Response::Attachments {
+            attachments: repository.list_attachments(&remembrie_id)?,
+        }),
         Request::Capture { candidate } => Ok(Response::CaptureResult {
             decision: repository.capture(candidate)?,
         }),
@@ -224,6 +234,12 @@ fn dispatch_database(request: Request, repository: &Mutex<Repository>) -> Result
         }),
         Request::SetMobileAllowWhileLocked { allowed } => Ok(Response::CaptureSourceUpdated {
             status: with_capture_health(repository.set_mobile_allow_while_locked(allowed)?),
+        }),
+        Request::RecordMobileUsage { active_ms, opened } => Ok(Response::MobileUsageRecorded {
+            summary: repository.record_mobile_usage(active_ms, opened)?,
+        }),
+        Request::MobileUsageSummary => Ok(Response::MobileUsageSummary {
+            summary: repository.mobile_usage_summary()?,
         }),
         Request::RecordActivity { snapshot } => Ok(Response::ActivityRecorded {
             result: repository.record_activity_snapshot(snapshot)?,
@@ -382,35 +398,116 @@ fn create_backup(repository: &Repository) -> Result<BackupInfo> {
     let directory = backup_dir();
     fs::create_dir_all(&directory)?;
     fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
+    remove_partial_backups(&directory)?;
 
     let mut created_at_ms = now_ms();
     let destination = loop {
-        let candidate = directory.join(format!("membrie-{created_at_ms}.db"));
+        let candidate = directory.join(format!("membrie-{created_at_ms}.backup"));
         if !candidate.exists() {
             break candidate;
         }
         created_at_ms += 1;
     };
-    let partial = destination.with_extension("db.partial");
-    let backup_result = repository.backup_to(&partial);
-    if let Err(error) = backup_result {
-        let _ = fs::remove_file(&partial);
-        return Err(error.into());
-    }
+    let partial = destination.with_extension("backup.partial");
+    fs::create_dir(&partial)?;
+    fs::set_permissions(&partial, fs::Permissions::from_mode(0o700))?;
+    let build_result = (|| -> Result<()> {
+        let database_partial = partial.join("membrie.db.partial");
+        let database_destination = partial.join("membrie.db");
+        repository.backup_to(&database_partial)?;
+        File::open(&database_partial)?.sync_all()?;
+        fs::rename(&database_partial, &database_destination)?;
 
-    File::open(&partial)?.sync_all()?;
+        let attachments = repository.referenced_attachment_blobs()?;
+        for attachment in &attachments {
+            let hash = &attachment.blob_hash;
+            let shard = hash
+                .get(..2)
+                .filter(|_| {
+                    hash.len() == 64
+                        && hash
+                            .bytes()
+                            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                })
+                .ok_or_else(|| anyhow!("attachment backup found an invalid stored hash"))?;
+            let source = attachment_blob_path(hash);
+            let source_metadata = fs::symlink_metadata(&source).with_context(|| {
+                format!(
+                    "backup could not find attachment {}",
+                    attachment.original_name
+                )
+            })?;
+            if !source_metadata.file_type().is_file()
+                || source_metadata.len() != attachment.byte_size
+            {
+                return Err(anyhow!(
+                    "attachment {} failed its backup size or type check",
+                    attachment.original_name
+                ));
+            }
+            let destination_blob = partial.join("blobs").join("sha256").join(shard).join(hash);
+            let destination_parent = destination_blob
+                .parent()
+                .ok_or_else(|| anyhow!("attachment backup path was invalid"))?;
+            fs::create_dir_all(destination_parent)?;
+            fs::set_permissions(destination_parent, fs::Permissions::from_mode(0o700))?;
+            if fs::hard_link(&source, &destination_blob).is_err() {
+                fs::copy(&source, &destination_blob)?;
+            }
+            fs::set_permissions(&destination_blob, fs::Permissions::from_mode(0o600))?;
+            File::open(&destination_blob)?.sync_all()?;
+        }
+
+        let manifest_path = partial.join("manifest.txt");
+        let mut manifest = File::create(&manifest_path)?;
+        writeln!(manifest, "Membrie local backup version 1")?;
+        writeln!(manifest, "created_at_ms={created_at_ms}")?;
+        writeln!(manifest, "attachment_blobs={}", attachments.len())?;
+        for attachment in &attachments {
+            writeln!(
+                manifest,
+                "{} {} {}",
+                attachment.blob_hash, attachment.byte_size, attachment.mime_type
+            )?;
+        }
+        manifest.sync_all()?;
+        File::open(&partial)?.sync_all()?;
+        Ok(())
+    })();
+    if let Err(error) = build_result {
+        let _ = fs::remove_dir_all(&partial);
+        return Err(error);
+    }
     fs::rename(&partial, &destination)?;
     File::open(&directory)?.sync_all()?;
 
     let backup = BackupInfo {
         path: destination.display().to_string(),
         created_at_ms,
-        size_bytes: fs::metadata(&destination)?.len(),
+        size_bytes: backup_size(&destination)?,
     };
     if let Err(error) = prune_backups() {
         eprintln!("could not prune old backups: {error:#}");
     }
     Ok(backup)
+}
+
+fn remove_partial_backups(directory: &Path) -> Result<()> {
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let path = entry.path();
+        let is_partial = entry.file_type()?.is_dir()
+            && path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    name.starts_with("membrie-") && name.ends_with(".backup.partial")
+                });
+        if is_partial {
+            fs::remove_dir_all(path)?;
+        }
+    }
+    Ok(())
 }
 
 fn list_backups() -> Result<Vec<BackupInfo>> {
@@ -422,22 +519,29 @@ fn list_backups() -> Result<Vec<BackupInfo>> {
     let mut backups = Vec::new();
     for entry in fs::read_dir(directory)? {
         let entry = entry?;
-        if !entry.file_type()?.is_file() {
-            continue;
-        }
+        let file_type = entry.file_type()?;
         let name = entry.file_name();
-        let Some(created_at_ms) = name
-            .to_str()
-            .and_then(|name| name.strip_prefix("membrie-"))
-            .and_then(|name| name.strip_suffix(".db"))
-            .and_then(|timestamp| timestamp.parse::<i64>().ok())
-        else {
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let created_at_ms = if file_type.is_file() {
+            name.strip_prefix("membrie-")
+                .and_then(|name| name.strip_suffix(".db"))
+                .and_then(|timestamp| timestamp.parse::<i64>().ok())
+        } else if file_type.is_dir() {
+            name.strip_prefix("membrie-")
+                .and_then(|name| name.strip_suffix(".backup"))
+                .and_then(|timestamp| timestamp.parse::<i64>().ok())
+        } else {
+            None
+        };
+        let Some(created_at_ms) = created_at_ms else {
             continue;
         };
         backups.push(BackupInfo {
             path: entry.path().display().to_string(),
             created_at_ms,
-            size_bytes: entry.metadata()?.len(),
+            size_bytes: backup_size(&entry.path())?,
         });
     }
     backups.sort_by_key(|backup| std::cmp::Reverse(backup.created_at_ms));
@@ -446,10 +550,31 @@ fn list_backups() -> Result<Vec<BackupInfo>> {
 
 fn prune_backups() -> Result<()> {
     for backup in list_backups()?.into_iter().skip(MAX_BACKUPS) {
-        fs::remove_file(&backup.path)
-            .with_context(|| format!("could not prune old backup {}", backup.path))?;
+        let path = Path::new(&backup.path);
+        if fs::symlink_metadata(path)?.file_type().is_dir() {
+            fs::remove_dir_all(path)
+                .with_context(|| format!("could not prune old backup {}", backup.path))?;
+        } else {
+            fs::remove_file(path)
+                .with_context(|| format!("could not prune old backup {}", backup.path))?;
+        }
     }
     Ok(())
+}
+
+fn backup_size(path: &Path) -> Result<u64> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_file() {
+        return Ok(metadata.len());
+    }
+    if !metadata.file_type().is_dir() {
+        return Ok(0);
+    }
+    let mut total = 0_u64;
+    for entry in fs::read_dir(path)? {
+        total = total.saturating_add(backup_size(&entry?.path())?);
+    }
+    Ok(total)
 }
 
 fn now_ms() -> i64 {

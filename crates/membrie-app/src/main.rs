@@ -2,11 +2,11 @@ use adw::prelude::*;
 use gtk::{Align, Orientation};
 use membrie_a11y::{ProbeSummary, WindowTarget};
 use membrie_core::{
-    ActivitySnapshot, BrieAnswer, BrieCitation, CaptureRule, CaptureStatus, DaemonClient,
-    IntelligenceSettings, IntelligenceStatus, LocalModel, NewRemembrie, PauseMode, Remembrie,
-    ScreenCaptureCandidate, ScreenCaptureResult, SearchHit, TimelineActivityObservation,
-    TimelineEntry, TimelineMapSlice, mobile_pairing_invitation_path, mobile_tailnet_host_path,
-    mobile_token_path, socket_path,
+    ActivitySnapshot, AttachmentImport, BrieAnswer, BrieCitation, CaptureRule, CaptureStatus,
+    DaemonClient, IntelligenceSettings, IntelligenceStatus, LocalModel, NewRemembrie, PauseMode,
+    Remembrie, ScreenCaptureCandidate, ScreenCaptureResult, SearchHit, TimelineActivityObservation,
+    TimelineEntry, TimelineMapSlice, attachment_blob_path, attachment_inbox_dir,
+    mobile_pairing_invitation_path, mobile_tailnet_host_path, mobile_token_path, socket_path,
 };
 use qrcode::{Color as QrColor, QrCode};
 use std::cell::{Cell, RefCell};
@@ -15,6 +15,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -39,6 +40,13 @@ enum TimelineFilter {
 }
 
 const TIMELINE_FUTURE_DAYS: i32 = 366;
+
+#[derive(Clone)]
+struct PendingAttachment {
+    staged_path: PathBuf,
+    original_name: String,
+    mime_type: String,
+}
 
 fn main() -> gtk::glib::ExitCode {
     let application = adw::Application::builder()
@@ -1001,30 +1009,194 @@ fn build_timeline_page(state: &Rc<UiState>) -> gtk::Widget {
     body_frame.set_child(Some(&body_view));
     body_frame.set_size_request(-1, 100);
 
+    let pending_attachment = Rc::new(RefCell::new(None::<PendingAttachment>));
+    let attachment_controls = gtk::Box::new(Orientation::Horizontal, 8);
+    let choose_attachment = gtk::Button::with_label("Attach image");
+    choose_attachment.set_icon_name("mail-attachment-symbolic");
+    let paste_attachment = gtk::Button::with_label("Paste image");
+    paste_attachment.set_icon_name("edit-paste-symbolic");
+    let remove_attachment = gtk::Button::with_label("Remove");
+    remove_attachment.set_icon_name("edit-delete-symbolic");
+    let attachment_label = gtk::Label::new(Some("No image attached"));
+    attachment_label.add_css_class("dim-label");
+    attachment_label.set_xalign(0.0);
+    attachment_label.set_hexpand(true);
+    attachment_label.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+    attachment_controls.append(&choose_attachment);
+    attachment_controls.append(&paste_attachment);
+    attachment_controls.append(&remove_attachment);
+    attachment_controls.append(&attachment_label);
+
+    let attachment_preview = gtk::Picture::new();
+    attachment_preview.set_size_request(-1, 180);
+    attachment_preview.set_content_fit(gtk::ContentFit::Contain);
+    attachment_preview.set_visible(false);
+    attachment_preview.add_css_class("attachment-preview");
+
+    let pending_for_remove = Rc::clone(&pending_attachment);
+    let label_for_remove = attachment_label.clone();
+    let preview_for_remove = attachment_preview.clone();
+    remove_attachment.connect_clicked(move |_| {
+        set_pending_attachment(
+            &pending_for_remove,
+            &label_for_remove,
+            &preview_for_remove,
+            None,
+        );
+    });
+
+    let pending_for_choose = Rc::clone(&pending_attachment);
+    let label_for_choose = attachment_label.clone();
+    let preview_for_choose = attachment_preview.clone();
+    let state_for_choose = Rc::clone(state);
+    choose_attachment.connect_clicked(move |_| {
+        let chooser = gtk::FileChooserNative::new(
+            Some("Attach an image to this Remembrie"),
+            None::<&gtk::Window>,
+            gtk::FileChooserAction::Open,
+            Some("Attach"),
+            Some("Cancel"),
+        );
+        let filter = gtk::FileFilter::new();
+        filter.set_name(Some("Images"));
+        filter.add_mime_type("image/*");
+        chooser.set_filter(&filter);
+        let pending = Rc::clone(&pending_for_choose);
+        let label = label_for_choose.clone();
+        let preview = preview_for_choose.clone();
+        let state = Rc::clone(&state_for_choose);
+        chooser.connect_response(move |chooser, response| {
+            if response != gtk::ResponseType::Accept {
+                return;
+            }
+            let result = chooser
+                .file()
+                .and_then(|file| file.path())
+                .ok_or_else(|| "Choose a local image file".to_owned())
+                .and_then(|path| stage_desktop_attachment(&path));
+            match result {
+                Ok(attachment) => {
+                    set_pending_attachment(&pending, &label, &preview, Some(attachment));
+                    toast(&state, "Image ready to remember");
+                }
+                Err(error) => toast(&state, &format!("Could not attach image: {error}")),
+            }
+        });
+        chooser.show();
+    });
+
+    let pending_for_paste = Rc::clone(&pending_attachment);
+    let label_for_paste = attachment_label.clone();
+    let preview_for_paste = attachment_preview.clone();
+    let state_for_paste = Rc::clone(state);
+    paste_attachment.connect_clicked(move |button| {
+        let clipboard = button.display().clipboard();
+        let pending = Rc::clone(&pending_for_paste);
+        let label = label_for_paste.clone();
+        let preview = preview_for_paste.clone();
+        let state = Rc::clone(&state_for_paste);
+        clipboard.read_texture_async(None::<&gtk::gio::Cancellable>, move |result| match result {
+            Ok(Some(texture)) => match stage_pasted_texture(&texture) {
+                Ok(attachment) => {
+                    set_pending_attachment(&pending, &label, &preview, Some(attachment));
+                    toast(&state, "Pasted image ready to remember");
+                }
+                Err(error) => toast(&state, &format!("Could not stage image: {error}")),
+            },
+            Ok(None) => toast(&state, "The clipboard does not contain an image"),
+            Err(error) => toast(&state, &format!("Could not read the image: {error}")),
+        });
+    });
+
+    let drop_target = gtk::DropTarget::new(
+        gtk::gdk::FileList::static_type(),
+        gtk::gdk::DragAction::COPY,
+    );
+    let pending_for_drop = Rc::clone(&pending_attachment);
+    let label_for_drop = attachment_label.clone();
+    let preview_for_drop = attachment_preview.clone();
+    let state_for_drop = Rc::clone(state);
+    drop_target.connect_drop(move |_, value, _, _| {
+        let Ok(files) = value.get::<gtk::gdk::FileList>() else {
+            return false;
+        };
+        let Some(path) = files.files().into_iter().find_map(|file| file.path()) else {
+            return false;
+        };
+        match stage_desktop_attachment(&path) {
+            Ok(attachment) => {
+                set_pending_attachment(
+                    &pending_for_drop,
+                    &label_for_drop,
+                    &preview_for_drop,
+                    Some(attachment),
+                );
+                toast(&state_for_drop, "Dropped image ready to remember");
+                true
+            }
+            Err(error) => {
+                toast(
+                    &state_for_drop,
+                    &format!("Could not attach dropped image: {error}"),
+                );
+                false
+            }
+        }
+    });
+    capture.add_controller(drop_target);
+
     let save = gtk::Button::with_label("Remember this");
     save.add_css_class("suggested-action");
     save.set_halign(Align::End);
     let state_for_save = Rc::clone(state);
     let title_for_save = title_entry.clone();
     let body_for_save = body_view.clone();
+    let pending_for_save = Rc::clone(&pending_attachment);
+    let label_for_save = attachment_label.clone();
+    let preview_for_save = attachment_preview.clone();
     save.connect_clicked(move |_| {
         let buffer = body_for_save.buffer();
         let body = buffer.text(&buffer.start_iter(), &buffer.end_iter(), false);
         let title = title_for_save.text();
-        if title.trim().is_empty() && body.trim().is_empty() {
-            toast(&state_for_save, "Write something to remember first");
+        let attachment = pending_for_save.borrow().clone();
+        let saved_attachment = attachment.is_some();
+        if title.trim().is_empty() && body.trim().is_empty() && attachment.is_none() {
+            toast(&state_for_save, "Write something or attach an image first");
             return;
         }
-        match state_for_save
-            .client
-            .create(NewRemembrie::manual(title.as_str(), body.as_str()))
-        {
+        let result = if let Some(attachment) = attachment {
+            state_for_save
+                .client
+                .import_attachment(AttachmentImport {
+                    staged_path: attachment.staged_path.display().to_string(),
+                    original_name: attachment.original_name,
+                    declared_mime_type: Some(attachment.mime_type),
+                    title: title.to_string(),
+                    note: body.to_string(),
+                    source_app: "Membrie".to_owned(),
+                    window_title: None,
+                })
+                .map(|(remembrie, _)| remembrie)
+        } else {
+            state_for_save
+                .client
+                .create(NewRemembrie::manual(title.as_str(), body.as_str()))
+        };
+        match result {
             Ok(_) => {
                 title_for_save.set_text("");
                 buffer.set_text("");
+                set_pending_attachment(&pending_for_save, &label_for_save, &preview_for_save, None);
                 refresh_timeline(&state_for_save);
                 refresh_status(&state_for_save);
-                toast(&state_for_save, "Remembrie saved locally");
+                toast(
+                    &state_for_save,
+                    if saved_attachment {
+                        "Image Remembrie saved locally; understanding is queued"
+                    } else {
+                        "Remembrie saved locally"
+                    },
+                );
             }
             Err(error) => toast(&state_for_save, &format!("Could not save: {error}")),
         }
@@ -1033,6 +1205,8 @@ fn build_timeline_page(state: &Rc<UiState>) -> gtk::Widget {
     capture.append(&capture_heading);
     capture.append(&title_entry);
     capture.append(&body_frame);
+    capture.append(&attachment_controls);
+    capture.append(&attachment_preview);
     capture.append(&save);
 
     let manual_capture = gtk::Expander::builder()
@@ -1845,7 +2019,7 @@ fn build_privacy_page(state: &Rc<UiState>) -> gtk::Widget {
     backup_heading.add_css_class("heading");
     backup_heading.set_xalign(0.0);
     let backup_detail = gtk::Label::new(Some(
-        "Membrie creates one verified database snapshot per day and keeps the newest 14. Backups stay alongside your local Membrie data on this computer.",
+        "Membrie creates one verified complete backup per day—database plus retained attachments—and keeps the newest 14. Backups stay alongside your local Membrie data on this computer.",
     ));
     backup_detail.add_css_class("dim-label");
     backup_detail.set_xalign(0.0);
@@ -2160,6 +2334,12 @@ fn timeline_render_key(
                 activity.observation_count,
                 activity.semantic_observation_count,
                 activity.screen_observation_count
+            ));
+        }
+        for attachment in &entry.attachments {
+            key.push_str(&format!(
+                ":{}:{}:{}",
+                attachment.content_id, attachment.blob_hash, attachment.analysis_state
             ));
         }
     }
@@ -3076,6 +3256,123 @@ fn display_or_unknown(value: &str) -> &str {
     } else {
         value
     }
+}
+
+fn set_pending_attachment(
+    pending: &Rc<RefCell<Option<PendingAttachment>>>,
+    label: &gtk::Label,
+    preview: &gtk::Picture,
+    attachment: Option<PendingAttachment>,
+) {
+    if let Some(previous) = pending.replace(attachment.clone()) {
+        let _ = fs::remove_file(previous.staged_path);
+    }
+    if let Some(attachment) = attachment {
+        label.set_text(&format!(
+            "{} · {}",
+            attachment.original_name,
+            fs::metadata(&attachment.staged_path)
+                .map(|metadata| format_file_size(metadata.len()))
+                .unwrap_or_else(|_| "local image".to_owned())
+        ));
+        preview.set_filename(Some(&attachment.staged_path));
+        preview.set_visible(true);
+    } else {
+        label.set_text("No image attached");
+        preview.set_filename(None::<&Path>);
+        preview.set_visible(false);
+    }
+}
+
+fn stage_desktop_attachment(source: &Path) -> Result<PendingAttachment, String> {
+    let metadata = fs::symlink_metadata(source)
+        .map_err(|error| format!("the selected file is unavailable: {error}"))?;
+    if !metadata.file_type().is_file() || metadata.len() == 0 {
+        return Err("Choose a non-empty regular image file".to_owned());
+    }
+    if metadata.len() > 100 * 1024 * 1024 {
+        return Err("The first attachment pass accepts images up to 100 MiB".to_owned());
+    }
+    let original_name = source
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.trim().is_empty())
+        .ok_or_else(|| "The selected image does not have a usable filename".to_owned())?
+        .to_owned();
+    let mime_type = desktop_image_mime(source)?;
+    let inbox = attachment_inbox_dir();
+    fs::create_dir_all(&inbox)
+        .map_err(|error| format!("the private attachment inbox is unavailable: {error}"))?;
+    #[cfg(unix)]
+    fs::set_permissions(&inbox, fs::Permissions::from_mode(0o700))
+        .map_err(|error| format!("the private attachment inbox could not be protected: {error}"))?;
+    let staged_path = inbox.join(random_attachment_id()?);
+    fs::copy(source, &staged_path)
+        .map_err(|error| format!("the image could not be staged privately: {error}"))?;
+    #[cfg(unix)]
+    fs::set_permissions(&staged_path, fs::Permissions::from_mode(0o600))
+        .map_err(|error| format!("the staged image could not be protected: {error}"))?;
+    File::open(&staged_path)
+        .and_then(|file| file.sync_all())
+        .map_err(|error| format!("the staged image could not be finished: {error}"))?;
+    Ok(PendingAttachment {
+        staged_path,
+        original_name,
+        mime_type,
+    })
+}
+
+fn stage_pasted_texture(texture: &gtk::gdk::Texture) -> Result<PendingAttachment, String> {
+    let inbox = attachment_inbox_dir();
+    fs::create_dir_all(&inbox)
+        .map_err(|error| format!("the private attachment inbox is unavailable: {error}"))?;
+    #[cfg(unix)]
+    fs::set_permissions(&inbox, fs::Permissions::from_mode(0o700))
+        .map_err(|error| format!("the private attachment inbox could not be protected: {error}"))?;
+    let staged_path = inbox.join(random_attachment_id()?);
+    texture
+        .save_to_png(&staged_path)
+        .map_err(|error| format!("the pasted image could not be encoded: {error}"))?;
+    #[cfg(unix)]
+    fs::set_permissions(&staged_path, fs::Permissions::from_mode(0o600))
+        .map_err(|error| format!("the pasted image could not be protected: {error}"))?;
+    Ok(PendingAttachment {
+        staged_path,
+        original_name: "Pasted image.png".to_owned(),
+        mime_type: "image/png".to_owned(),
+    })
+}
+
+fn desktop_image_mime(path: &Path) -> Result<String, String> {
+    let mut prefix = [0_u8; 16];
+    let count = File::open(path)
+        .and_then(|mut file| file.read(&mut prefix))
+        .map_err(|error| format!("the selected image could not be read: {error}"))?;
+    let prefix = &prefix[..count];
+    let mime = if prefix.starts_with(b"\x89PNG\r\n\x1a\n") {
+        "image/png"
+    } else if prefix.starts_with(b"\xff\xd8\xff") {
+        "image/jpeg"
+    } else if prefix.starts_with(b"GIF87a") || prefix.starts_with(b"GIF89a") {
+        "image/gif"
+    } else if prefix.len() >= 12 && &prefix[..4] == b"RIFF" && &prefix[8..12] == b"WEBP" {
+        "image/webp"
+    } else if prefix.len() >= 12 && &prefix[4..8] == b"ftyp" {
+        "image/heic"
+    } else {
+        return Err(
+            "This first attachment pass accepts PNG, JPEG, GIF, WebP, and HEIC images".to_owned(),
+        );
+    };
+    Ok(mime.to_owned())
+}
+
+fn random_attachment_id() -> Result<String, String> {
+    let mut random = [0_u8; 16];
+    File::open("/dev/urandom")
+        .and_then(|mut file| file.read_exact(&mut random))
+        .map_err(|error| format!("local randomness was unavailable: {error}"))?;
+    Ok(random.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
 fn show_mobile_pairing_token(parent: &gtk::Button, state: &Rc<UiState>) {
@@ -4278,6 +4575,33 @@ fn timeline_entry_row(state: &Rc<UiState>, entry: &TimelineEntry) -> gtk::ListBo
     top.append(&time);
     content.append(&top);
 
+    if let Some(attachment) = entry.attachments.first() {
+        if matches!(
+            attachment.mime_type.as_str(),
+            "image/png" | "image/jpeg" | "image/gif" | "image/webp" | "image/heic"
+        ) {
+            let path = attachment_blob_path(&attachment.blob_hash);
+            if path.is_file() {
+                let picture = gtk::Picture::for_filename(&path);
+                picture.set_size_request(-1, 220);
+                picture.set_content_fit(gtk::ContentFit::Contain);
+                picture.add_css_class("attachment-preview");
+                content.append(&picture);
+            }
+        }
+        let attachment_detail = gtk::Label::new(Some(&format!(
+            "{} · {} · {}",
+            attachment.original_name,
+            format_file_size(attachment.byte_size),
+            attachment_analysis_label(&attachment.analysis_state)
+        )));
+        attachment_detail.add_css_class("caption");
+        attachment_detail.add_css_class("dim-label");
+        attachment_detail.set_xalign(0.0);
+        attachment_detail.set_wrap(true);
+        content.append(&attachment_detail);
+    }
+
     if let Some(activity) = &entry.activity {
         let durations = activity_app_durations(entry);
         if !durations.is_empty() {
@@ -4351,7 +4675,16 @@ fn timeline_entry_row(state: &Rc<UiState>, entry: &TimelineEntry) -> gtk::ListBo
         content.append(&detail);
     }
 
-    if matches!(entry.kind.as_str(), "calendar" | "screen" | "semantic") {
+    if !entry.attachments.is_empty() {
+        let caution = gtk::Label::new(Some(
+            "The retained image is exact evidence. Any description or recognized text is local, machine-generated context and may be mistaken.",
+        ));
+        caution.add_css_class("caption");
+        caution.add_css_class("timeline-evidence-caution");
+        caution.set_xalign(0.0);
+        caution.set_wrap(true);
+        content.append(&caution);
+    } else if matches!(entry.kind.as_str(), "calendar" | "screen" | "semantic") {
         let caution = gtk::Label::new(Some(timeline_evidence_caution(&entry.kind)));
         caution.add_css_class("caption");
         caution.add_css_class("timeline-evidence-caution");
@@ -4402,6 +4735,16 @@ fn timeline_evidence_caution(kind: &str) -> &'static str {
     }
 }
 
+fn attachment_analysis_label(state: &str) -> &'static str {
+    match state {
+        "pending" => "local understanding queued",
+        "complete" => "locally described and searchable",
+        "failed" => "original retained; analysis unavailable",
+        "unsupported" => "original retained; analysis not yet supported",
+        _ => "original retained",
+    }
+}
+
 fn show_remembrance_evidence(
     parent: &impl IsA<gtk::Widget>,
     client: &DaemonClient,
@@ -4409,6 +4752,7 @@ fn show_remembrance_evidence(
 ) {
     match client.get_remembrie(remembrie_id) {
         Ok(Some(remembrie)) => {
+            let attachments = client.list_attachments(&remembrie.id).unwrap_or_default();
             let source = remembrie.source_app.as_deref().unwrap_or("Unknown source");
             let body = if remembrie.body.trim().is_empty() {
                 "No captured text was stored for this Remembrie.".to_owned()
@@ -4434,7 +4778,12 @@ fn show_remembrance_evidence(
             ));
             content.append(&metadata);
 
-            let caution = gtk::Label::new(Some(timeline_evidence_caution(&remembrie.kind)));
+            let caution_text = if attachments.is_empty() {
+                timeline_evidence_caution(&remembrie.kind)
+            } else {
+                "The retained attachment below is exact evidence. Machine-described image text is local interpretation and may be incomplete or mistaken."
+            };
+            let caution = gtk::Label::new(Some(caution_text));
             caution.add_css_class("evidence-interpretation");
             caution.set_xalign(0.0);
             caution.set_wrap(true);
@@ -4455,7 +4804,42 @@ fn show_remembrance_evidence(
                 content.append(&summary);
             }
 
-            let exact_heading = gtk::Label::new(Some("Exact stored evidence"));
+            for attachment in &attachments {
+                let attachment_heading = gtk::Label::new(Some(&attachment.original_name));
+                attachment_heading.add_css_class("heading");
+                attachment_heading.set_xalign(0.0);
+                content.append(&attachment_heading);
+                let attachment_meta = gtk::Label::new(Some(&format!(
+                    "{} · {} · {}",
+                    attachment.mime_type,
+                    format_file_size(attachment.byte_size),
+                    attachment_analysis_label(&attachment.analysis_state)
+                )));
+                attachment_meta.add_css_class("caption");
+                attachment_meta.add_css_class("dim-label");
+                attachment_meta.set_xalign(0.0);
+                attachment_meta.set_wrap(true);
+                content.append(&attachment_meta);
+                if matches!(
+                    attachment.mime_type.as_str(),
+                    "image/png" | "image/jpeg" | "image/gif" | "image/webp" | "image/heic"
+                ) {
+                    let path = attachment_blob_path(&attachment.blob_hash);
+                    if path.is_file() {
+                        let picture = gtk::Picture::for_filename(path);
+                        picture.set_size_request(680, 300);
+                        picture.set_content_fit(gtk::ContentFit::Contain);
+                        picture.add_css_class("attachment-preview");
+                        content.append(&picture);
+                    }
+                }
+            }
+
+            let exact_heading = gtk::Label::new(Some(if attachments.is_empty() {
+                "Exact stored evidence"
+            } else {
+                "Stored note and local interpretation"
+            }));
             exact_heading.add_css_class("heading");
             exact_heading.set_xalign(0.0);
             content.append(&exact_heading);
@@ -5022,6 +5406,12 @@ fn install_css() {
          }
          .manual-capture { padding: 10px 14px; }
          .manual-capture-content { padding: 12px 2px 2px 2px; }
+         .attachment-preview {
+             background: alpha(@window_fg_color, 0.05);
+             border: 1px solid @borders;
+             border-radius: 10px;
+             padding: 8px;
+         }
          .evidence-metadata {
              padding: 10px 12px;
              border-radius: 9px;

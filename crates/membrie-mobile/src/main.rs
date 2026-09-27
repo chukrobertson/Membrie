@@ -4,7 +4,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use gio::prelude::*;
 use glib::variant::ToVariant;
 use membrie_core::{
-    DaemonClient, NewRemembrie, Remembrie, mobile_pairing_invitation_path,
+    AttachmentImport, DaemonClient, MobileUsageSummary, NewRemembrie, Remembrie,
+    attachment_blob_path, attachment_inbox_dir, mobile_pairing_invitation_path,
     mobile_tailnet_host_path, mobile_token_path, socket_path,
 };
 use serde::{Deserialize, Serialize};
@@ -21,6 +22,7 @@ use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 const LISTEN_ADDRESS: &str = "127.0.0.1:47381";
 const WORKERS: usize = 4;
 const MAX_REQUEST_BYTES: u64 = 300 * 1024;
+const MAX_ATTACHMENT_BYTES: u64 = 100 * 1024 * 1024;
 const MAX_NOTE_CHARACTERS: usize = 20_000;
 const MAX_CLIPBOARD_BYTES: usize = 256 * 1024;
 const TOKEN_BYTES: usize = 32;
@@ -46,6 +48,22 @@ struct NoteInput {
     title: String,
     #[serde(default)]
     body: String,
+}
+
+#[derive(Deserialize)]
+struct AttachmentInput {
+    upload_id: String,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    body: String,
+}
+
+#[derive(Deserialize)]
+struct UsageInput {
+    active_ms: u64,
+    #[serde(default)]
+    opened: bool,
 }
 
 #[derive(Deserialize)]
@@ -75,6 +93,7 @@ struct MobileStatus {
     allow_while_locked: bool,
     remembrie_count: u64,
     calendar_event_count: u64,
+    usage: MobileUsageSummary,
 }
 
 #[derive(Serialize)]
@@ -85,6 +104,15 @@ struct MobileRemembrance {
     source: String,
     occurred_at_ms: i64,
     preview: String,
+    attachment: Option<MobileAttachment>,
+}
+
+#[derive(Serialize)]
+struct MobileAttachment {
+    content_id: String,
+    original_name: String,
+    mime_type: String,
+    analysis_state: String,
 }
 
 #[derive(Serialize)]
@@ -119,6 +147,11 @@ struct ClipboardResponse {
 #[derive(Serialize)]
 struct PairingResponse<'a> {
     token: &'a str,
+}
+
+#[derive(Serialize)]
+struct UploadResponse {
+    upload_id: String,
 }
 
 struct PreparedResponse {
@@ -162,7 +195,7 @@ impl PreparedResponse {
             ),
             (
                 "Content-Security-Policy",
-                "default-src 'self'; connect-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
+                "default-src 'self'; connect-src 'self'; img-src 'self' data: blob:; style-src 'self'; script-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
             ),
         ] {
             response.add_header(header(name, value));
@@ -387,9 +420,13 @@ fn route_api(request: &mut Request, state: &AppState, path: &str) -> Result<Prep
                 allow_while_locked: status.mobile_allow_while_locked,
                 remembrie_count: status.remembrie_count,
                 calendar_event_count: status.calendar_event_count,
+                usage: state.client.mobile_usage_summary()?,
             },
         )),
         (&Method::Post, "/api/note") => create_note(request, state),
+        (&Method::Post, "/api/upload") => upload_attachment(request),
+        (&Method::Post, "/api/attachment") => create_attachment(request, state),
+        (&Method::Post, "/api/usage") => record_mobile_usage(request, state),
         _ if !read_allowed => Ok(PreparedResponse::error(
             423,
             "The PC is locked; enable paired-device recall in Membrie to continue",
@@ -398,6 +435,9 @@ fn route_api(request: &mut Request, state: &AppState, path: &str) -> Result<Prep
         (&Method::Post, "/api/brie") => ask_brie(request, state),
         (&Method::Get, "/api/clipboard") => read_clipboard(),
         (&Method::Post, "/api/clipboard") => write_clipboard(request),
+        (&Method::Get, path) if path.starts_with("/api/attachment/") => {
+            read_attachment(state, path)
+        }
         _ => Ok(PreparedResponse::error(404, "Not found")),
     }
 }
@@ -430,22 +470,162 @@ fn create_note(request: &mut Request, state: &AppState) -> Result<PreparedRespon
     ))
 }
 
+fn upload_attachment(request: &mut Request) -> Result<PreparedResponse> {
+    if request
+        .body_length()
+        .is_some_and(|length| length as u64 > MAX_ATTACHMENT_BYTES)
+    {
+        return Ok(PreparedResponse::error(
+            413,
+            "That attachment is larger than 100 MiB",
+        ));
+    }
+    let original_name = header_value(request, "x-membrie-filename")
+        .and_then(percent_decode)
+        .filter(|name| !name.trim().is_empty())
+        .ok_or_else(|| anyhow!("the attachment filename was missing"))?;
+    if original_name.chars().count() > 255 {
+        return Ok(PreparedResponse::error(
+            422,
+            "That attachment filename is too long",
+        ));
+    }
+    if original_name
+        .chars()
+        .any(|character| character.is_control())
+    {
+        return Ok(PreparedResponse::error(
+            422,
+            "That attachment filename contains unsupported characters",
+        ));
+    }
+    let declared_mime_type = header_value(request, "content-type")
+        .map(str::trim)
+        .filter(|value| value.len() <= 127 && !value.chars().any(char::is_control))
+        .unwrap_or("application/octet-stream")
+        .to_owned();
+    let upload_id = random_hex_identifier()?;
+    let inbox = attachment_inbox_dir();
+    fs::create_dir_all(&inbox)?;
+    #[cfg(unix)]
+    fs::set_permissions(&inbox, fs::Permissions::from_mode(0o700))?;
+    let path = inbox.join(&upload_id);
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options.open(&path)?;
+    let copied = std::io::copy(
+        &mut request.as_reader().take(MAX_ATTACHMENT_BYTES + 1),
+        &mut file,
+    )?;
+    if copied == 0 || copied > MAX_ATTACHMENT_BYTES {
+        let _ = fs::remove_file(&path);
+        return Ok(PreparedResponse::error(
+            413,
+            "Attachments must contain data and be no larger than 100 MiB",
+        ));
+    }
+    file.sync_all()?;
+    let metadata_path = inbox.join(format!("{upload_id}.name"));
+    let mut metadata_options = OpenOptions::new();
+    metadata_options.write(true).create_new(true);
+    #[cfg(unix)]
+    metadata_options.mode(0o600);
+    let mut metadata = metadata_options.open(&metadata_path)?;
+    writeln!(metadata, "{original_name}")?;
+    writeln!(metadata, "{declared_mime_type}")?;
+    metadata.sync_all()?;
+    Ok(PreparedResponse::json(201, &UploadResponse { upload_id }))
+}
+
+fn create_attachment(request: &mut Request, state: &AppState) -> Result<PreparedResponse> {
+    let input: AttachmentInput = match read_json(request) {
+        Ok(input) => input,
+        Err(response) => return Ok(response),
+    };
+    if input.upload_id.len() != 32
+        || !input
+            .upload_id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Ok(PreparedResponse::error(
+            422,
+            "That upload identifier is invalid",
+        ));
+    }
+    if input.title.chars().count() > 300 || input.body.chars().count() > MAX_NOTE_CHARACTERS {
+        return Ok(PreparedResponse::error(
+            413,
+            "That attachment note is too large",
+        ));
+    }
+    let inbox = attachment_inbox_dir();
+    let staged_path = inbox.join(&input.upload_id);
+    let metadata_path = inbox.join(format!("{}.name", input.upload_id));
+    let metadata = fs::read_to_string(&metadata_path)
+        .context("the staged attachment metadata was unavailable")?;
+    let mut metadata_lines = metadata.lines();
+    let original_name = metadata_lines.next().unwrap_or("").trim().to_owned();
+    let declared_mime_type = metadata_lines
+        .next()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
+    let imported = state.client.import_attachment(AttachmentImport {
+        staged_path: staged_path.display().to_string(),
+        original_name,
+        declared_mime_type,
+        title: input.title,
+        note: input.body,
+        source_app: "Membrie Companion".to_owned(),
+        window_title: Some("Mobile WebUI".to_owned()),
+    });
+    let _ = fs::remove_file(&metadata_path);
+    match imported {
+        Ok((_remembrie, _)) => Ok(PreparedResponse::json(
+            201,
+            &ApiMessage {
+                message: "Image Remembrie saved; local understanding is queued",
+            },
+        )),
+        Err(error) => {
+            let _ = fs::remove_file(&staged_path);
+            Err(error.into())
+        }
+    }
+}
+
+fn record_mobile_usage(request: &mut Request, state: &AppState) -> Result<PreparedResponse> {
+    let input: UsageInput = match read_json(request) {
+        Ok(input) => input,
+        Err(response) => return Ok(response),
+    };
+    if input.active_ms > 60_000 || (input.active_ms == 0 && !input.opened) {
+        return Ok(PreparedResponse::error(422, "That usage pulse is invalid"));
+    }
+    let summary = state
+        .client
+        .record_mobile_usage(input.active_ms, input.opened)?;
+    Ok(PreparedResponse::json(200, &summary))
+}
+
 fn recall(state: &AppState) -> Result<PreparedResponse> {
     let snapshot = state.client.recall_snapshot(8, 6)?;
+    let recent = snapshot
+        .recent
+        .into_iter()
+        .map(|record| mobile_remembrance(record, state))
+        .collect::<Result<Vec<_>>>()?;
+    let upcoming = snapshot
+        .upcoming
+        .into_iter()
+        .map(|record| mobile_remembrance(record, state))
+        .collect::<Result<Vec<_>>>()?;
     Ok(PreparedResponse::json(
         200,
-        &RecallResponse {
-            recent: snapshot
-                .recent
-                .into_iter()
-                .map(mobile_remembrance)
-                .collect(),
-            upcoming: snapshot
-                .upcoming
-                .into_iter()
-                .map(mobile_remembrance)
-                .collect(),
-        },
+        &RecallResponse { recent, upcoming },
     ))
 }
 
@@ -533,13 +713,87 @@ fn write_clipboard(request: &mut Request) -> Result<PreparedResponse> {
     ))
 }
 
-fn mobile_remembrance(record: Remembrie) -> MobileRemembrance {
+fn read_attachment(state: &AppState, path: &str) -> Result<PreparedResponse> {
+    let mut parts = path
+        .trim_start_matches("/api/attachment/")
+        .split('/')
+        .filter(|part| !part.is_empty());
+    let Some(remembrie_id) = parts.next() else {
+        return Ok(PreparedResponse::error(404, "Attachment not found"));
+    };
+    let Some(content_id) = parts.next() else {
+        return Ok(PreparedResponse::error(404, "Attachment not found"));
+    };
+    if parts.next().is_some() {
+        return Ok(PreparedResponse::error(404, "Attachment not found"));
+    }
+    let Some(attachment) = state
+        .client
+        .list_attachments(remembrie_id)?
+        .into_iter()
+        .find(|attachment| attachment.content_id == content_id)
+    else {
+        return Ok(PreparedResponse::error(404, "Attachment not found"));
+    };
+    let content_type = match attachment.mime_type.as_str() {
+        "image/png" => "image/png",
+        "image/jpeg" => "image/jpeg",
+        "image/gif" => "image/gif",
+        "image/webp" => "image/webp",
+        _ => {
+            return Ok(PreparedResponse::error(
+                415,
+                "This attachment format does not have an inline preview",
+            ));
+        }
+    };
+    if attachment.blob_hash.len() != 64
+        || !attachment
+            .blob_hash
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Ok(PreparedResponse::error(
+            500,
+            "The stored attachment is invalid",
+        ));
+    }
+    let blob_path = attachment_blob_path(&attachment.blob_hash);
+    let metadata = fs::symlink_metadata(&blob_path)?;
+    if !metadata.file_type().is_file()
+        || metadata.len() != attachment.byte_size
+        || metadata.len() > MAX_ATTACHMENT_BYTES
+    {
+        return Ok(PreparedResponse::error(
+            500,
+            "The stored attachment is invalid",
+        ));
+    }
+    Ok(PreparedResponse::text(
+        200,
+        content_type,
+        fs::read(blob_path)?,
+    ))
+}
+
+fn mobile_remembrance(record: Remembrie, state: &AppState) -> Result<MobileRemembrance> {
     let preview = record
         .summary
         .as_deref()
         .filter(|summary| !summary.trim().is_empty())
         .unwrap_or(record.body.as_str());
-    MobileRemembrance {
+    let attachment = state
+        .client
+        .list_attachments(&record.id)?
+        .into_iter()
+        .next()
+        .map(|attachment| MobileAttachment {
+            content_id: attachment.content_id,
+            original_name: attachment.original_name,
+            mime_type: attachment.mime_type,
+            analysis_state: attachment.analysis_state,
+        });
+    Ok(MobileRemembrance {
         id: record.id,
         kind: record.kind,
         title: record.title,
@@ -548,7 +802,8 @@ fn mobile_remembrance(record: Remembrie) -> MobileRemembrance {
             .unwrap_or_else(|| "Unknown local source".to_owned()),
         occurred_at_ms: record.occurred_at_ms,
         preview: truncate(preview, 260),
-    }
+        attachment,
+    })
 }
 
 fn read_json<T: for<'de> Deserialize<'de>>(
@@ -816,6 +1071,39 @@ fn truncate(value: &str, maximum: usize) -> String {
     result
 }
 
+fn random_hex_identifier() -> Result<String> {
+    let mut random = [0_u8; 16];
+    File::open("/dev/urandom")?.read_exact(&mut random)?;
+    Ok(random.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+fn percent_decode(value: &str) -> Option<String> {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let high = *bytes.get(index + 1)?;
+            let low = *bytes.get(index + 2)?;
+            decoded.push(hex_digit(high)? * 16 + hex_digit(low)?);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(decoded).ok()
+}
+
+fn hex_digit(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        b'A'..=b'F' => Some(value - b'A' + 10),
+        _ => None,
+    }
+}
+
 fn current_time_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -849,6 +1137,16 @@ mod tests {
     fn recall_preview_is_bounded() {
         assert_eq!(truncate("remember me", 20), "remember me");
         assert_eq!(truncate("abcdef", 3), "abc…");
+    }
+
+    #[test]
+    fn uploaded_image_names_are_decoded_without_losing_unicode() {
+        assert_eq!(
+            percent_decode("Duke%20notes%20%E2%80%94%20photo.png").as_deref(),
+            Some("Duke notes — photo.png")
+        );
+        assert!(percent_decode("bad%2name.png").is_none());
+        assert!(percent_decode("bad%FFname.png").is_none());
     }
 
     #[test]

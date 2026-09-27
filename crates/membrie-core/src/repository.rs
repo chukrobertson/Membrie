@@ -1,25 +1,29 @@
 use crate::model::{
-    ActivityRecordResult, ActivitySnapshot, CalendarEventSnapshot, CalendarSnapshot,
-    CalendarSyncResult, CaptureCandidate, CaptureDecision, CaptureRule, CaptureStatus,
-    EmbeddedChunk, IntelligenceSettings, IntelligenceStatus, LocalModel, NewRemembrie, PauseMode,
-    ProcessingJob, RecallSnapshot, Remembrie, ScreenAnalysis, ScreenCaptureCandidate,
-    ScreenCaptureResult, SearchHit, SemanticCaptureCandidate, SemanticCaptureResult,
-    TimelineActivityObservation, TimelineActivitySummary, TimelineEntry, TimelineHistorySpan,
-    TimelineMapSlice,
+    ActivityRecordResult, ActivitySnapshot, Attachment, AttachmentImport, AttachmentProcessingJob,
+    CalendarEventSnapshot, CalendarSnapshot, CalendarSyncResult, CaptureCandidate, CaptureDecision,
+    CaptureRule, CaptureStatus, EmbeddedChunk, IntelligenceSettings, IntelligenceStatus,
+    LocalModel, MobileUsageSummary, NewRemembrie, PauseMode, ProcessingJob, RecallSnapshot,
+    Remembrie, ScreenAnalysis, ScreenCaptureCandidate, ScreenCaptureResult, SearchHit,
+    SemanticCaptureCandidate, SemanticCaptureResult, TimelineActivityObservation,
+    TimelineActivitySummary, TimelineEntry, TimelineHistorySpan, TimelineMapSlice,
 };
 use crate::policy::{MAX_AUTOMATIC_CONTENT_BYTES, exclusion_reason, sensitive_reason};
 use rusqlite::{Connection, DatabaseName, OptionalExtension, Row, Transaction, params};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
-use std::fs;
+use std::fs::{self, File};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use uuid::Uuid;
 
-const SCHEMA_VERSION: i64 = 8;
+const SCHEMA_VERSION: i64 = 9;
 const DUPLICATE_WINDOW_MS: i64 = 24 * 60 * 60 * 1000;
 const MIN_SEMANTIC_SIMILARITY: f64 = 0.25;
 const SEMANTIC_SCORE_WINDOW: f64 = 0.20;
+pub const MAX_ATTACHMENT_BYTES: u64 = 100 * 1024 * 1024;
+pub const MAX_ANALYZED_IMAGE_BYTES: u64 = 32 * 1024 * 1024;
 
 const MIGRATION_1: &str = r#"
 CREATE TABLE IF NOT EXISTS remembries (
@@ -370,6 +374,41 @@ INSERT OR IGNORE INTO mobile_state(singleton, enabled, allow_while_locked, updat
 VALUES(1, 0, 0, 0);
 "#;
 
+const MIGRATION_9: &str = r#"
+CREATE TABLE IF NOT EXISTS attachment_blobs (
+    hash                  TEXT PRIMARY KEY NOT NULL,
+    byte_size             INTEGER NOT NULL CHECK(byte_size BETWEEN 1 AND 104857600),
+    mime_type             TEXT NOT NULL,
+    created_at_ms         INTEGER NOT NULL
+);
+
+ALTER TABLE remembrie_contents ADD COLUMN original_name TEXT;
+ALTER TABLE remembrie_contents ADD COLUMN analysis_state TEXT NOT NULL DEFAULT 'not_applicable'
+    CHECK(analysis_state IN ('not_applicable', 'pending', 'complete', 'failed', 'unsupported'));
+ALTER TABLE remembrie_contents ADD COLUMN analysis_model TEXT;
+ALTER TABLE remembrie_contents ADD COLUMN analysis_confidence TEXT
+    CHECK(analysis_confidence IS NULL OR analysis_confidence IN ('low', 'medium', 'high'));
+ALTER TABLE remembrie_contents ADD COLUMN analysis_error TEXT;
+
+CREATE INDEX IF NOT EXISTS idx_contents_blob_hash
+    ON remembrie_contents(blob_hash) WHERE blob_hash IS NOT NULL;
+
+DROP INDEX IF EXISTS idx_jobs_remembrie_kind;
+CREATE INDEX IF NOT EXISTS idx_jobs_remembrie_kind
+    ON processing_jobs(remembrie_id, kind)
+    WHERE remembrie_id IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS mobile_usage_events (
+    id                    TEXT PRIMARY KEY NOT NULL,
+    occurred_at_ms        INTEGER NOT NULL,
+    active_ms             INTEGER NOT NULL CHECK(active_ms BETWEEN 0 AND 60000),
+    opened                INTEGER NOT NULL DEFAULT 0 CHECK(opened IN (0, 1))
+);
+
+CREATE INDEX IF NOT EXISTS idx_mobile_usage_time
+    ON mobile_usage_events(occurred_at_ms DESC);
+"#;
+
 #[derive(Debug, Error)]
 pub enum RepositoryError {
     #[error("database error: {0}")]
@@ -468,6 +507,13 @@ impl Repository {
         if version < 8 {
             let transaction = connection.unchecked_transaction()?;
             transaction.execute_batch(MIGRATION_8)?;
+            transaction.pragma_update(None, "user_version", 8)?;
+            transaction.commit()?;
+            version = 8;
+        }
+        if version < 9 {
+            let transaction = connection.unchecked_transaction()?;
+            transaction.execute_batch(MIGRATION_9)?;
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             transaction.commit()?;
         }
@@ -572,6 +618,200 @@ impl Repository {
         self.get(&id)?.ok_or_else(|| {
             RepositoryError::Validation("created Remembrie could not be loaded".to_owned())
         })
+    }
+
+    pub fn import_attachment(
+        &mut self,
+        input: AttachmentImport,
+    ) -> Result<(Remembrie, Attachment), RepositoryError> {
+        let original_name = sanitize_attachment_name(&input.original_name)?;
+        let source_app = input.source_app.trim();
+        if source_app.is_empty() || source_app.chars().count() > 256 {
+            return Err(RepositoryError::Validation(
+                "an attachment needs a valid local source".to_owned(),
+            ));
+        }
+        if input.title.chars().count() > 300 || input.note.chars().count() > 20_000 {
+            return Err(RepositoryError::Validation(
+                "the attachment title or note is too large".to_owned(),
+            ));
+        }
+
+        let staged_path = PathBuf::from(&input.staged_path);
+        let data_directory = self.path.parent().unwrap_or_else(|| Path::new("."));
+        let (blob_hash, byte_size, mime_type, newly_stored) = store_staged_attachment(
+            &staged_path,
+            input.declared_mime_type.as_deref(),
+            data_directory,
+        )?;
+        let analysis_state =
+            if supported_image_mime(&mime_type) && byte_size <= MAX_ANALYZED_IMAGE_BYTES {
+                "pending"
+            } else {
+                "unsupported"
+            };
+        let now = now_ms()?;
+        let occurred_at_ms = now;
+        let remembrie_id = Uuid::now_v7().to_string();
+        let captured_content_id = Uuid::now_v7().to_string();
+        let note_content_id = Uuid::now_v7().to_string();
+        let attachment_content_id = Uuid::now_v7().to_string();
+        let display_title = if input.title.trim().is_empty() {
+            original_name.clone()
+        } else {
+            input.title.trim().to_owned()
+        };
+        let captured_body = attachment_body(
+            input.note.trim(),
+            &[AttachmentBodyPart {
+                name: &original_name,
+                mime_type: &mime_type,
+                byte_size,
+                analysis_state,
+                analysis_text: None,
+            }],
+        );
+
+        let database_result = (|| -> Result<(), rusqlite::Error> {
+            let transaction = self.connection.transaction()?;
+            transaction.execute(
+                "INSERT OR IGNORE INTO attachment_blobs(hash, byte_size, mime_type, created_at_ms)
+             VALUES(?1, ?2, ?3, ?4)",
+                params![blob_hash, byte_size, mime_type, now],
+            )?;
+            transaction.execute(
+                "INSERT INTO remembries(
+                id, kind, occurred_at_ms, source_app, window_title, title,
+                sensitivity, importance, pinned, created_at_ms, updated_at_ms
+             ) VALUES(?1, 'note', ?2, ?3, ?4, ?5, 'normal', 0.5, 0, ?2, ?2)",
+                params![
+                    remembrie_id,
+                    occurred_at_ms,
+                    source_app,
+                    input.window_title,
+                    display_title
+                ],
+            )?;
+            transaction.execute(
+                "INSERT INTO remembrie_contents(
+                id, remembrie_id, role, mime_type, text_content, created_at_ms
+             ) VALUES(?1, ?2, 'captured', 'text/plain', ?3, ?4)",
+                params![captured_content_id, remembrie_id, captured_body, now],
+            )?;
+            transaction.execute(
+                "INSERT INTO remembrie_contents(
+                id, remembrie_id, role, mime_type, text_content, created_at_ms
+             ) VALUES(?1, ?2, 'attachment_note', 'text/plain', ?3, ?4)",
+                params![note_content_id, remembrie_id, input.note.trim(), now],
+            )?;
+            transaction.execute(
+                "INSERT INTO remembrie_contents(
+                id, remembrie_id, role, mime_type, blob_hash, created_at_ms,
+                original_name, analysis_state
+             ) VALUES(?1, ?2, 'attachment', ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    attachment_content_id,
+                    remembrie_id,
+                    mime_type,
+                    blob_hash,
+                    now,
+                    original_name,
+                    analysis_state
+                ],
+            )?;
+            transaction.execute(
+                "INSERT INTO remembrie_fts(remembrie_id, title, body, summary)
+             VALUES(?1, ?2, ?3, '')",
+                params![remembrie_id, display_title, captured_body],
+            )?;
+            transaction.execute(
+                "INSERT INTO processing_jobs(
+                id, remembrie_id, kind, state, attempts,
+                available_at_ms, created_at_ms, updated_at_ms
+             ) VALUES(?1, ?2, 'enrich', 'pending', 0, 0, ?3, ?3)",
+                params![format!("enrich:{remembrie_id}"), remembrie_id, now],
+            )?;
+            if analysis_state == "pending" {
+                transaction.execute(
+                    "INSERT INTO processing_jobs(
+                    id, remembrie_id, kind, state, attempts,
+                    available_at_ms, created_at_ms, updated_at_ms
+                 ) VALUES(?1, ?2, 'attachment_image', 'pending', 0, 0, ?3, ?3)",
+                    params![
+                        format!("attachment:{attachment_content_id}"),
+                        remembrie_id,
+                        now
+                    ],
+                )?;
+            }
+            transaction.commit()?;
+            Ok(())
+        })();
+        if let Err(error) = database_result {
+            if newly_stored {
+                let _ = fs::remove_file(attachment_path_in(data_directory, &blob_hash));
+            }
+            return Err(error.into());
+        }
+
+        let remembrie = self.get(&remembrie_id)?.ok_or_else(|| {
+            RepositoryError::Validation("imported Remembrie could not be loaded".to_owned())
+        })?;
+        let attachment = self
+            .get_attachment(&attachment_content_id)?
+            .ok_or_else(|| {
+                RepositoryError::Validation("attachment could not be loaded".to_owned())
+            })?;
+        Ok((remembrie, attachment))
+    }
+
+    pub fn list_attachments(&self, remembrie_id: &str) -> Result<Vec<Attachment>, RepositoryError> {
+        let mut statement = self.connection.prepare(
+            "SELECT c.id, c.remembrie_id, COALESCE(c.original_name, 'Attachment'),
+                    b.mime_type, b.byte_size, b.hash, c.analysis_state,
+                    c.text_content, c.analysis_model, c.analysis_confidence, c.created_at_ms
+             FROM remembrie_contents c
+             JOIN attachment_blobs b ON b.hash = c.blob_hash
+             JOIN remembries r ON r.id = c.remembrie_id
+             WHERE c.remembrie_id = ?1 AND c.role = 'attachment'
+               AND r.deleted_at_ms IS NULL
+             ORDER BY c.created_at_ms, c.id",
+        )?;
+        let rows = statement.query_map([remembrie_id], map_attachment)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn get_attachment(&self, content_id: &str) -> Result<Option<Attachment>, RepositoryError> {
+        self.connection
+            .query_row(
+                "SELECT c.id, c.remembrie_id, COALESCE(c.original_name, 'Attachment'),
+                        b.mime_type, b.byte_size, b.hash, c.analysis_state,
+                        c.text_content, c.analysis_model, c.analysis_confidence, c.created_at_ms
+                 FROM remembrie_contents c
+                 JOIN attachment_blobs b ON b.hash = c.blob_hash
+                 JOIN remembries r ON r.id = c.remembrie_id
+                 WHERE c.id = ?1 AND c.role = 'attachment' AND r.deleted_at_ms IS NULL",
+                [content_id],
+                map_attachment,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn referenced_attachment_blobs(&self) -> Result<Vec<Attachment>, RepositoryError> {
+        let mut statement = self.connection.prepare(
+            "SELECT MIN(c.id), MIN(c.remembrie_id), MIN(COALESCE(c.original_name, 'Attachment')),
+                    b.mime_type, b.byte_size, b.hash, 'complete', NULL, NULL, NULL,
+                    MIN(c.created_at_ms)
+             FROM attachment_blobs b
+             JOIN remembrie_contents c ON c.blob_hash = b.hash
+             JOIN remembries r ON r.id = c.remembrie_id AND r.deleted_at_ms IS NULL
+             WHERE c.role = 'attachment'
+             GROUP BY b.hash, b.mime_type, b.byte_size
+             ORDER BY b.hash",
+        )?;
+        let rows = statement.query_map([], map_attachment)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
     pub fn capture(
@@ -861,6 +1101,7 @@ impl Repository {
                     title: row.get(6)?,
                     summary: row.get(7)?,
                     activity: None,
+                    attachments: Vec::new(),
                 })
             })?;
             rows.collect::<Result<Vec<_>, _>>()?
@@ -871,6 +1112,7 @@ impl Repository {
             if entry.kind == "activity" {
                 entry.activity = self.timeline_activity_summary(&entry.id)?;
             }
+            entry.attachments = self.list_attachments(&entry.id)?;
             entries.push(entry);
         }
         Ok(entries)
@@ -1174,6 +1416,171 @@ impl Repository {
         Ok(())
     }
 
+    pub fn claim_attachment_processing_job(
+        &mut self,
+    ) -> Result<Option<AttachmentProcessingJob>, RepositoryError> {
+        let now = now_ms()?;
+        let transaction = self.connection.transaction()?;
+        let candidate = transaction
+            .query_row(
+                "SELECT p.id, p.attempts, c.id
+                 FROM processing_jobs p
+                 JOIN remembrie_contents c
+                   ON p.id = 'attachment:' || c.id
+                 WHERE p.kind = 'attachment_image' AND p.state = 'pending'
+                   AND p.available_at_ms <= ?1 AND c.analysis_state = 'pending'
+                 ORDER BY p.available_at_ms, p.created_at_ms
+                 LIMIT 1",
+                [now],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, u32>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((job_id, attempts, content_id)) = candidate else {
+            transaction.commit()?;
+            return Ok(None);
+        };
+        transaction.execute(
+            "UPDATE processing_jobs
+             SET state = 'running', attempts = attempts + 1,
+                 last_error = NULL, updated_at_ms = ?2
+             WHERE id = ?1",
+            params![job_id, now],
+        )?;
+        transaction.commit()?;
+
+        let Some(attachment) = self.get_attachment(&content_id)? else {
+            self.connection
+                .execute("DELETE FROM processing_jobs WHERE id = ?1", [&job_id])?;
+            return Ok(None);
+        };
+        let model = self.connection.query_row(
+            "SELECT screen_model FROM capture_state WHERE singleton = 1",
+            [],
+            |row| row.get::<_, String>(0),
+        )?;
+        Ok(Some(AttachmentProcessingJob {
+            id: job_id,
+            attachment,
+            model,
+            attempts: attempts + 1,
+        }))
+    }
+
+    pub fn complete_attachment_analysis(
+        &mut self,
+        job_id: &str,
+        analysis: &ScreenAnalysis,
+    ) -> Result<(), RepositoryError> {
+        validate_screen_analysis(analysis)?;
+        let content_id = job_id.strip_prefix("attachment:").ok_or_else(|| {
+            RepositoryError::Validation("invalid attachment job identifier".to_owned())
+        })?;
+        let mut analysis_text = format!(
+            "Machine-described image attachment (unverified).\nDescription: {}",
+            analysis.description.trim()
+        );
+        if !analysis.visible_text.trim().is_empty() {
+            analysis_text.push_str("\nVisible text: ");
+            analysis_text.push_str(analysis.visible_text.trim());
+        }
+        if let Some(reason) = sensitive_reason(&analysis_text) {
+            analysis_text = format!(
+                "Local image analysis was withheld because its text resembled {reason}. Inspect the original attachment directly."
+            );
+        }
+        let now = now_ms()?;
+        let transaction = self.connection.transaction()?;
+        let remembrie_id: String = transaction.query_row(
+            "SELECT remembrie_id FROM remembrie_contents
+             WHERE id = ?1 AND role = 'attachment'",
+            [content_id],
+            |row| row.get(0),
+        )?;
+        transaction.execute(
+            "UPDATE remembrie_contents
+             SET text_content = ?2, analysis_state = 'complete', analysis_model = ?3,
+                 analysis_confidence = ?4, analysis_error = NULL
+             WHERE id = ?1 AND role = 'attachment'",
+            params![
+                content_id,
+                analysis_text,
+                analysis.model,
+                analysis.confidence
+            ],
+        )?;
+        rebuild_attachment_captured_body(&transaction, &remembrie_id)?;
+        transaction.execute(
+            "UPDATE processing_jobs
+             SET state = 'complete', last_error = NULL, updated_at_ms = ?2
+             WHERE id = ?1",
+            params![job_id, now],
+        )?;
+        transaction.execute(
+            "UPDATE processing_jobs
+             SET state = 'pending', attempts = 0, last_error = NULL,
+                 available_at_ms = 0, updated_at_ms = ?2
+             WHERE id = ?1",
+            params![format!("enrich:{remembrie_id}"), now],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn fail_attachment_processing_job(
+        &mut self,
+        job_id: &str,
+        error: &str,
+    ) -> Result<(), RepositoryError> {
+        let content_id = job_id.strip_prefix("attachment:").ok_or_else(|| {
+            RepositoryError::Validation("invalid attachment job identifier".to_owned())
+        })?;
+        let now = now_ms()?;
+        let safe_error: String = error.chars().take(1000).collect();
+        let transaction = self.connection.transaction()?;
+        let (attempts, remembrie_id): (u32, String) = transaction.query_row(
+            "SELECT p.attempts, c.remembrie_id
+             FROM processing_jobs p
+             JOIN remembrie_contents c ON c.id = ?2
+             WHERE p.id = ?1",
+            params![job_id, content_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let terminal = attempts >= 5;
+        transaction.execute(
+            "UPDATE processing_jobs
+             SET state = CASE WHEN attempts >= 5 THEN 'failed' ELSE 'pending' END,
+                 last_error = ?2,
+                 available_at_ms = ?3 + MIN(attempts * 60000, 600000),
+                 updated_at_ms = ?3
+             WHERE id = ?1",
+            params![job_id, safe_error, now],
+        )?;
+        if terminal {
+            transaction.execute(
+                "UPDATE remembrie_contents
+                 SET analysis_state = 'failed', analysis_error = ?2
+                 WHERE id = ?1 AND role = 'attachment'",
+                params![content_id, safe_error],
+            )?;
+            rebuild_attachment_captured_body(&transaction, &remembrie_id)?;
+            transaction.execute(
+                "UPDATE processing_jobs
+                 SET state = 'pending', attempts = 0, last_error = NULL,
+                     available_at_ms = 0, updated_at_ms = ?2
+                 WHERE id = ?1",
+                params![format!("enrich:{remembrie_id}"), now],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub fn claim_processing_job(&mut self) -> Result<Option<ProcessingJob>, RepositoryError> {
         let now = now_ms()?;
         let transaction = self.connection.transaction()?;
@@ -1182,6 +1589,12 @@ impl Repository {
                 "SELECT id, remembrie_id, attempts
                  FROM processing_jobs
                  WHERE kind = 'enrich' AND state = 'pending' AND available_at_ms <= ?1
+                   AND NOT EXISTS (
+                       SELECT 1 FROM processing_jobs attachment_job
+                       WHERE attachment_job.remembrie_id = processing_jobs.remembrie_id
+                         AND attachment_job.kind = 'attachment_image'
+                         AND attachment_job.state IN ('pending', 'running')
+                   )
                  ORDER BY available_at_ms, created_at_ms
                  LIMIT 1",
                 [now],
@@ -1344,14 +1757,29 @@ impl Repository {
         Ok(())
     }
 
-    pub fn retry_failed_processing(&self) -> Result<u64, RepositoryError> {
-        Ok(self.connection.execute(
+    pub fn retry_failed_processing(&mut self) -> Result<u64, RepositoryError> {
+        let now = now_ms()?;
+        let transaction = self.connection.transaction()?;
+        let attachment_count = transaction.execute(
+            "UPDATE remembrie_contents
+             SET analysis_state = 'pending', analysis_error = NULL
+             WHERE role = 'attachment' AND analysis_state = 'failed'
+               AND id IN (
+                   SELECT SUBSTR(id, LENGTH('attachment:') + 1)
+                   FROM processing_jobs
+                   WHERE kind = 'attachment_image' AND state = 'failed'
+               )",
+            [],
+        )? as u64;
+        let job_count = transaction.execute(
             "UPDATE processing_jobs
              SET state = 'pending', attempts = 0, last_error = NULL,
                  available_at_ms = 0, updated_at_ms = ?1
-             WHERE kind = 'enrich' AND state = 'failed'",
-            [now_ms()?],
-        )? as u64)
+             WHERE kind IN ('enrich', 'attachment_image') AND state = 'failed'",
+            [now],
+        )? as u64;
+        transaction.commit()?;
+        Ok(job_count.max(attachment_count))
     }
 
     pub fn intelligence_status(
@@ -1379,7 +1807,7 @@ impl Repository {
                 COALESCE(SUM(state = 'pending'), 0),
                 COALESCE(SUM(state = 'running'), 0),
                 COALESCE(SUM(state = 'failed'), 0)
-             FROM processing_jobs WHERE kind = 'enrich'",
+             FROM processing_jobs WHERE kind IN ('enrich', 'attachment_image')",
             [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
@@ -1403,6 +1831,53 @@ impl Repository {
             running_jobs,
             failed_jobs,
             last_error,
+        })
+    }
+
+    pub fn record_mobile_usage(
+        &self,
+        active_ms: u64,
+        opened: bool,
+    ) -> Result<MobileUsageSummary, RepositoryError> {
+        if active_ms > 60_000 {
+            return Err(RepositoryError::Validation(
+                "a Companion usage pulse cannot exceed one minute".to_owned(),
+            ));
+        }
+        let now = now_ms()?;
+        self.connection.execute(
+            "INSERT INTO mobile_usage_events(id, occurred_at_ms, active_ms, opened)
+             VALUES(?1, ?2, ?3, ?4)",
+            params![Uuid::now_v7().to_string(), now, active_ms, opened],
+        )?;
+        self.connection.execute(
+            "DELETE FROM mobile_usage_events WHERE occurred_at_ms < ?1",
+            [now - 120 * 24 * 60 * 60 * 1000_i64],
+        )?;
+        self.mobile_usage_summary()
+    }
+
+    pub fn mobile_usage_summary(&self) -> Result<MobileUsageSummary, RepositoryError> {
+        let now = now_ms()?;
+        let summarize = |cutoff: i64| -> Result<(u64, u64), rusqlite::Error> {
+            self.connection.query_row(
+                "SELECT COALESCE(SUM(active_ms), 0), COALESCE(SUM(opened), 0)
+                 FROM mobile_usage_events WHERE occurred_at_ms >= ?1",
+                [cutoff],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+        };
+        let (last_24_hours_active_ms, last_24_hours_opens) = summarize(now - 24 * 60 * 60 * 1000)?;
+        let (last_7_days_active_ms, last_7_days_opens) = summarize(now - 7 * 24 * 60 * 60 * 1000)?;
+        let (last_30_days_active_ms, last_30_days_opens) =
+            summarize(now - 30 * 24 * 60 * 60 * 1000)?;
+        Ok(MobileUsageSummary {
+            last_24_hours_active_ms,
+            last_24_hours_opens,
+            last_7_days_active_ms,
+            last_7_days_opens,
+            last_30_days_active_ms,
+            last_30_days_opens,
         })
     }
 
@@ -2980,9 +3455,36 @@ impl Repository {
             [timestamp_ms],
         )?;
         transaction.commit()?;
+        self.prune_orphaned_attachment_blobs()?;
         self.connection
             .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
         Ok(count)
+    }
+
+    fn prune_orphaned_attachment_blobs(&self) -> Result<(), RepositoryError> {
+        let hashes = {
+            let mut statement = self.connection.prepare(
+                "SELECT hash FROM attachment_blobs
+                 WHERE hash NOT IN (
+                     SELECT DISTINCT blob_hash FROM remembrie_contents
+                     WHERE blob_hash IS NOT NULL
+                 )",
+            )?;
+            let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        for hash in hashes {
+            let data_directory = self.path.parent().unwrap_or_else(|| Path::new("."));
+            let path = attachment_path_in(data_directory, &hash);
+            match fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+            self.connection
+                .execute("DELETE FROM attachment_blobs WHERE hash = ?1", [&hash])?;
+        }
+        Ok(())
     }
 
     fn finish_active_activity_session(
@@ -3820,6 +4322,303 @@ fn activity_end_reason(reason: &str) -> &'static str {
         "daemon_restart" => "the Membrie daemon restarted",
         "manual" => "the session was finished manually",
         _ => "the activity boundary was reached",
+    }
+}
+
+struct AttachmentBodyPart<'a> {
+    name: &'a str,
+    mime_type: &'a str,
+    byte_size: u64,
+    analysis_state: &'a str,
+    analysis_text: Option<&'a str>,
+}
+
+fn attachment_body(note: &str, attachments: &[AttachmentBodyPart<'_>]) -> String {
+    let mut body = String::new();
+    if !note.trim().is_empty() {
+        body.push_str(note.trim());
+        body.push_str("\n\n");
+    }
+    for (index, attachment) in attachments.iter().enumerate() {
+        if index > 0 {
+            body.push('\n');
+        }
+        body.push_str(&format!(
+            "Attachment: {} ({}; {}).",
+            attachment.name,
+            attachment.mime_type,
+            format_attachment_size(attachment.byte_size)
+        ));
+        match attachment.analysis_state {
+            "pending" => {
+                body.push_str("\nLocal image description and text recognition are pending.")
+            }
+            "failed" => body.push_str(
+                "\nLocal image analysis was unavailable; the original attachment is retained.",
+            ),
+            "unsupported" => body.push_str(
+                "\nThe original is retained. This format does not yet have local content analysis.",
+            ),
+            "complete" => {
+                if let Some(text) = attachment
+                    .analysis_text
+                    .filter(|text| !text.trim().is_empty())
+                {
+                    body.push('\n');
+                    body.push_str(text.trim());
+                }
+            }
+            _ => {}
+        }
+        body.push('\n');
+    }
+    body.trim().to_owned()
+}
+
+fn rebuild_attachment_captured_body(
+    transaction: &Transaction<'_>,
+    remembrie_id: &str,
+) -> Result<(), RepositoryError> {
+    let note = transaction
+        .query_row(
+            "SELECT text_content FROM remembrie_contents
+             WHERE remembrie_id = ?1 AND role = 'attachment_note' LIMIT 1",
+            [remembrie_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten()
+        .unwrap_or_default();
+    let records = {
+        let mut statement = transaction.prepare(
+            "SELECT COALESCE(c.original_name, 'Attachment'), b.mime_type, b.byte_size,
+                    c.analysis_state, c.text_content
+             FROM remembrie_contents c
+             JOIN attachment_blobs b ON b.hash = c.blob_hash
+             WHERE c.remembrie_id = ?1 AND c.role = 'attachment'
+             ORDER BY c.created_at_ms, c.id",
+        )?;
+        let rows = statement.query_map([remembrie_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, u64>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(4)?,
+            ))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    let parts: Vec<AttachmentBodyPart<'_>> = records
+        .iter()
+        .map(|record| AttachmentBodyPart {
+            name: &record.0,
+            mime_type: &record.1,
+            byte_size: record.2,
+            analysis_state: &record.3,
+            analysis_text: record.4.as_deref(),
+        })
+        .collect();
+    let body = attachment_body(&note, &parts);
+    let now = now_ms()?;
+    transaction.execute(
+        "UPDATE remembrie_contents SET text_content = ?2
+         WHERE remembrie_id = ?1 AND role = 'captured'",
+        params![remembrie_id, body],
+    )?;
+    transaction.execute(
+        "UPDATE remembrie_fts SET body = ?2 WHERE remembrie_id = ?1",
+        params![remembrie_id, body],
+    )?;
+    transaction.execute(
+        "UPDATE remembries SET updated_at_ms = ?2 WHERE id = ?1",
+        params![remembrie_id, now],
+    )?;
+    Ok(())
+}
+
+fn map_attachment(row: &Row<'_>) -> rusqlite::Result<Attachment> {
+    Ok(Attachment {
+        content_id: row.get(0)?,
+        remembrie_id: row.get(1)?,
+        original_name: row.get(2)?,
+        mime_type: row.get(3)?,
+        byte_size: row.get(4)?,
+        blob_hash: row.get(5)?,
+        analysis_state: row.get(6)?,
+        analysis_text: row.get(7)?,
+        analysis_model: row.get(8)?,
+        analysis_confidence: row.get(9)?,
+        created_at_ms: row.get(10)?,
+    })
+}
+
+fn sanitize_attachment_name(value: &str) -> Result<String, RepositoryError> {
+    let value = value.trim();
+    let name = Path::new(value)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("")
+        .trim();
+    if name.is_empty()
+        || name.chars().count() > 255
+        || name.chars().any(|character| character.is_control())
+    {
+        return Err(RepositoryError::Validation(
+            "the attachment filename is not valid".to_owned(),
+        ));
+    }
+    Ok(name.to_owned())
+}
+
+fn store_staged_attachment(
+    staged_path: &Path,
+    declared_mime_type: Option<&str>,
+    data_directory: &Path,
+) -> Result<(String, u64, String, bool), RepositoryError> {
+    let inbox = data_directory.join("attachment-inbox");
+    fs::create_dir_all(&inbox)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&inbox, fs::Permissions::from_mode(0o700))?;
+    }
+    let canonical_inbox = fs::canonicalize(&inbox)?;
+    let canonical_staged = fs::canonicalize(staged_path)?;
+    if canonical_staged.parent() != Some(canonical_inbox.as_path()) {
+        return Err(RepositoryError::Validation(
+            "the staged attachment is outside Membrie's private inbox".to_owned(),
+        ));
+    }
+    let metadata = fs::symlink_metadata(&canonical_staged)?;
+    if !metadata.file_type().is_file()
+        || metadata.len() == 0
+        || metadata.len() > MAX_ATTACHMENT_BYTES
+    {
+        return Err(RepositoryError::Validation(
+            "attachments must be regular files between 1 byte and 100 MiB".to_owned(),
+        ));
+    }
+
+    let mut file = File::open(&canonical_staged)?;
+    let mut hasher = Sha256::new();
+    let mut prefix = Vec::with_capacity(64);
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        if prefix.len() < 64 {
+            let remaining = 64 - prefix.len();
+            prefix.extend_from_slice(&buffer[..count.min(remaining)]);
+        }
+        hasher.update(&buffer[..count]);
+    }
+    let hash = hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let mime_type = sniff_attachment_mime(&prefix, declared_mime_type);
+    let blob_directory = data_directory.join("blobs").join("sha256");
+    let destination = attachment_path_in(data_directory, &hash);
+    let destination_parent = destination.parent().ok_or_else(|| {
+        RepositoryError::Validation("attachment storage path is invalid".to_owned())
+    })?;
+    fs::create_dir_all(destination_parent)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&blob_directory, fs::Permissions::from_mode(0o700))?;
+        fs::set_permissions(destination_parent, fs::Permissions::from_mode(0o700))?;
+    }
+    let newly_stored = if destination.exists() {
+        if fs::metadata(&destination)?.len() != metadata.len() {
+            return Err(RepositoryError::Validation(
+                "an attachment hash collision was detected".to_owned(),
+            ));
+        }
+        fs::remove_file(&canonical_staged)?;
+        false
+    } else if fs::rename(&canonical_staged, &destination).is_err() {
+        fs::copy(&canonical_staged, &destination)?;
+        File::open(&destination)?.sync_all()?;
+        fs::remove_file(&canonical_staged)?;
+        true
+    } else {
+        true
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&destination, fs::Permissions::from_mode(0o600))?;
+    }
+    File::open(&destination)?.sync_all()?;
+    File::open(destination_parent)?.sync_all()?;
+    Ok((hash, metadata.len(), mime_type, newly_stored))
+}
+
+fn attachment_path_in(data_directory: &Path, hash: &str) -> PathBuf {
+    data_directory
+        .join("blobs")
+        .join("sha256")
+        .join(hash.get(..2).unwrap_or("invalid"))
+        .join(hash)
+}
+
+fn sniff_attachment_mime(prefix: &[u8], declared: Option<&str>) -> String {
+    if prefix.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return "image/png".to_owned();
+    }
+    if prefix.starts_with(b"\xff\xd8\xff") {
+        return "image/jpeg".to_owned();
+    }
+    if prefix.starts_with(b"GIF87a") || prefix.starts_with(b"GIF89a") {
+        return "image/gif".to_owned();
+    }
+    if prefix.len() >= 12 && &prefix[..4] == b"RIFF" && &prefix[8..12] == b"WEBP" {
+        return "image/webp".to_owned();
+    }
+    if prefix.starts_with(b"%PDF-") {
+        return "application/pdf".to_owned();
+    }
+    if prefix.len() >= 12
+        && &prefix[4..8] == b"ftyp"
+        && matches!(
+            &prefix[8..12],
+            b"heic" | b"heix" | b"hevc" | b"hevx" | b"mif1"
+        )
+    {
+        return "image/heic".to_owned();
+    }
+    declared
+        .map(str::trim)
+        .filter(|value| {
+            !value.is_empty()
+                && value.len() <= 127
+                && value.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'+' | b'.' | b'-')
+                })
+        })
+        .unwrap_or("application/octet-stream")
+        .to_ascii_lowercase()
+}
+
+fn supported_image_mime(mime_type: &str) -> bool {
+    matches!(
+        mime_type,
+        "image/png" | "image/jpeg" | "image/gif" | "image/webp"
+    )
+}
+
+fn format_attachment_size(bytes: u64) -> String {
+    if bytes >= 1024 * 1024 {
+        format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
+    } else if bytes >= 1024 {
+        format!("{:.1} KiB", bytes as f64 / 1024.0)
+    } else {
+        format!("{bytes} bytes")
     }
 }
 
@@ -4796,6 +5595,72 @@ mod tests {
     }
 
     #[test]
+    fn upgrades_a_version_eight_database_for_attachments_and_mobile_usage() {
+        let directory =
+            std::env::temp_dir().join(format!("membrie-migration-v8-{}", Uuid::now_v7()));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("membrie.db");
+        let connection = Connection::open(&path).unwrap();
+        for migration in [
+            MIGRATION_1,
+            MIGRATION_2,
+            MIGRATION_3,
+            MIGRATION_4,
+            MIGRATION_5,
+            MIGRATION_6,
+            MIGRATION_7,
+            MIGRATION_8,
+        ] {
+            connection.execute_batch(migration).unwrap();
+        }
+        connection.pragma_update(None, "user_version", 8).unwrap();
+        let now = now_ms().unwrap();
+        connection
+            .execute(
+                "INSERT INTO remembries(
+                    id, kind, occurred_at_ms, title, sensitivity, importance,
+                    pinned, created_at_ms, updated_at_ms
+                 ) VALUES('existing-v8', 'note', ?1, 'Existing v8 note',
+                          'normal', 0.5, 0, ?1, ?1)",
+                [now],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO remembrie_contents(
+                    id, remembrie_id, role, mime_type, text_content, created_at_ms
+                 ) VALUES('existing-v8-content', 'existing-v8', 'captured',
+                          'text/plain', 'Preserved text', ?1)",
+                [now],
+            )
+            .unwrap();
+        drop(connection);
+
+        let repository = Repository::open(&path).unwrap();
+        let existing = repository.get("existing-v8").unwrap().unwrap();
+        assert_eq!(existing.body, "Preserved text");
+        let analysis_state: String = repository
+            .connection
+            .query_row(
+                "SELECT analysis_state FROM remembrie_contents
+                 WHERE id = 'existing-v8-content'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(analysis_state, "not_applicable");
+        assert_eq!(
+            repository
+                .record_mobile_usage(1_000, true)
+                .unwrap()
+                .last_24_hours_opens,
+            1
+        );
+        drop(repository);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn creates_an_integrity_checked_backup() {
         let path = temporary_database("backup-source");
         let backup_path = temporary_database("backup-destination");
@@ -4815,6 +5680,95 @@ mod tests {
 
         let _ = fs::remove_file(path);
         let _ = fs::remove_file(backup_path);
+    }
+
+    #[test]
+    fn imports_deduplicates_analyzes_and_deletes_image_attachments() {
+        let directory =
+            std::env::temp_dir().join(format!("membrie-attachment-test-{}", Uuid::now_v7()));
+        let inbox = directory.join("attachment-inbox");
+        fs::create_dir_all(&inbox).unwrap();
+        let path = directory.join("membrie.db");
+        let first_staged = inbox.join("first");
+        let second_staged = inbox.join("second");
+        let image_bytes = b"\x89PNG\r\n\x1a\nlocal-image-test";
+        fs::write(&first_staged, image_bytes).unwrap();
+        fs::write(&second_staged, image_bytes).unwrap();
+
+        let mut repository = Repository::open(&path).unwrap();
+        let (first_remembrie, first_attachment) = repository
+            .import_attachment(AttachmentImport {
+                staged_path: first_staged.display().to_string(),
+                original_name: "research.png".to_owned(),
+                declared_mime_type: Some("image/png".to_owned()),
+                title: "Research image".to_owned(),
+                note: "Saved from the attachment test".to_owned(),
+                source_app: "Membrie".to_owned(),
+                window_title: None,
+            })
+            .unwrap();
+        let (_, second_attachment) = repository
+            .import_attachment(AttachmentImport {
+                staged_path: second_staged.display().to_string(),
+                original_name: "duplicate.png".to_owned(),
+                declared_mime_type: Some("image/png".to_owned()),
+                title: String::new(),
+                note: String::new(),
+                source_app: "Membrie Companion".to_owned(),
+                window_title: Some("Mobile WebUI".to_owned()),
+            })
+            .unwrap();
+
+        assert_eq!(first_attachment.blob_hash, second_attachment.blob_hash);
+        assert_eq!(repository.referenced_attachment_blobs().unwrap().len(), 1);
+        let blob_path = attachment_path_in(&directory, &first_attachment.blob_hash);
+        assert_eq!(fs::read(&blob_path).unwrap(), image_bytes);
+
+        let job = repository
+            .claim_attachment_processing_job()
+            .unwrap()
+            .unwrap();
+        repository
+            .complete_attachment_analysis(
+                &job.id,
+                &ScreenAnalysis {
+                    description: "A research diagram is open.".to_owned(),
+                    visible_text: "Local evidence".to_owned(),
+                    confidence: "high".to_owned(),
+                    model: job.model,
+                },
+            )
+            .unwrap();
+        let remembered = repository.get(&first_remembrie.id).unwrap().unwrap();
+        assert!(remembered.body.contains("A research diagram is open"));
+        assert!(remembered.body.contains("Local evidence"));
+
+        let now = now_ms().unwrap();
+        let timeline = repository.timeline_day(now - 60_000, now + 60_000).unwrap();
+        let entry = timeline
+            .iter()
+            .find(|entry| entry.id == first_remembrie.id)
+            .unwrap();
+        assert_eq!(entry.attachments.len(), 1);
+        assert_eq!(entry.attachments[0].analysis_state, "complete");
+
+        assert_eq!(repository.delete_since(0).unwrap(), 2);
+        assert!(!blob_path.exists());
+        drop(repository);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn records_only_coarse_local_companion_usage() {
+        let path = temporary_database("mobile-usage");
+        let repository = Repository::open(&path).unwrap();
+        let summary = repository.record_mobile_usage(30_000, true).unwrap();
+        assert_eq!(summary.last_24_hours_active_ms, 30_000);
+        assert_eq!(summary.last_24_hours_opens, 1);
+        assert_eq!(summary.last_7_days_active_ms, 30_000);
+        assert_eq!(summary.last_30_days_opens, 1);
+        assert!(repository.record_mobile_usage(60_001, false).is_err());
+        let _ = fs::remove_file(path);
     }
 
     #[test]

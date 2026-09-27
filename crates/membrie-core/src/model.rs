@@ -66,6 +66,8 @@ pub struct TimelineEntry {
     pub title: String,
     pub summary: Option<String>,
     pub activity: Option<TimelineActivitySummary>,
+    #[serde(default)]
+    pub attachments: Vec<Attachment>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -100,6 +102,50 @@ impl NewRemembrie {
             occurred_at_ms: None,
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AttachmentImport {
+    pub staged_path: String,
+    pub original_name: String,
+    pub declared_mime_type: Option<String>,
+    pub title: String,
+    pub note: String,
+    pub source_app: String,
+    pub window_title: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Attachment {
+    pub content_id: String,
+    pub remembrie_id: String,
+    pub original_name: String,
+    pub mime_type: String,
+    pub byte_size: u64,
+    pub blob_hash: String,
+    pub analysis_state: String,
+    pub analysis_text: Option<String>,
+    pub analysis_model: Option<String>,
+    pub analysis_confidence: Option<String>,
+    pub created_at_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AttachmentProcessingJob {
+    pub id: String,
+    pub attachment: Attachment,
+    pub model: String,
+    pub attempts: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MobileUsageSummary {
+    pub last_24_hours_active_ms: u64,
+    pub last_24_hours_opens: u64,
+    pub last_7_days_active_ms: u64,
+    pub last_7_days_opens: u64,
+    pub last_30_days_active_ms: u64,
+    pub last_30_days_opens: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

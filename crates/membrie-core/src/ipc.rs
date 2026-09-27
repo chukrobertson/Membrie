@@ -1,9 +1,10 @@
 use crate::model::{
-    ActivityRecordResult, ActivitySnapshot, BackupInfo, BrieAnswer, CalendarSyncResult,
-    CaptureCandidate, CaptureDecision, CaptureRule, CaptureStatus, IntelligenceSettings,
-    IntelligenceStatus, NewRemembrie, PauseMode, RecallSnapshot, Remembrie, ScreenCaptureCandidate,
-    ScreenCaptureResult, SearchHit, SemanticCaptureCandidate, SemanticCaptureResult, TimelineEntry,
-    TimelineHistorySpan, TimelineMapSlice,
+    ActivityRecordResult, ActivitySnapshot, Attachment, AttachmentImport, BackupInfo, BrieAnswer,
+    CalendarSyncResult, CaptureCandidate, CaptureDecision, CaptureRule, CaptureStatus,
+    IntelligenceSettings, IntelligenceStatus, MobileUsageSummary, NewRemembrie, PauseMode,
+    RecallSnapshot, Remembrie, ScreenCaptureCandidate, ScreenCaptureResult, SearchHit,
+    SemanticCaptureCandidate, SemanticCaptureResult, TimelineEntry, TimelineHistorySpan,
+    TimelineMapSlice,
 };
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -20,6 +21,12 @@ pub enum Request {
     Status,
     Create {
         remembrie: NewRemembrie,
+    },
+    ImportAttachment {
+        attachment: AttachmentImport,
+    },
+    ListAttachments {
+        remembrie_id: String,
     },
     Capture {
         candidate: CaptureCandidate,
@@ -86,6 +93,11 @@ pub enum Request {
     SetMobileAllowWhileLocked {
         allowed: bool,
     },
+    RecordMobileUsage {
+        active_ms: u64,
+        opened: bool,
+    },
+    MobileUsageSummary,
     SyncCalendarNow,
     RecordActivity {
         snapshot: ActivitySnapshot,
@@ -127,35 +139,104 @@ pub enum Request {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Response {
-    Status { status: CaptureStatus },
-    Created { remembrie: Remembrie },
-    CaptureResult { decision: CaptureDecision },
-    Remembries { remembries: Vec<Remembrie> },
-    RecallSnapshot { snapshot: RecallSnapshot },
-    Remembrie { remembrie: Option<Remembrie> },
-    TimelineHistory { spans: Vec<TimelineHistorySpan> },
-    TimelineDay { entries: Vec<TimelineEntry> },
-    TimelineMap { slices: Vec<TimelineMapSlice> },
-    SearchResults { hits: Vec<SearchHit> },
-    PauseUpdated { status: CaptureStatus },
-    CaptureSourceUpdated { status: CaptureStatus },
-    ActivityRecorded { result: ActivityRecordResult },
-    SemanticRecorded { result: SemanticCaptureResult },
-    ScreenAnalyzed { result: ScreenCaptureResult },
+    Status {
+        status: CaptureStatus,
+    },
+    Created {
+        remembrie: Remembrie,
+    },
+    AttachmentImported {
+        remembrie: Remembrie,
+        attachment: Attachment,
+    },
+    Attachments {
+        attachments: Vec<Attachment>,
+    },
+    CaptureResult {
+        decision: CaptureDecision,
+    },
+    Remembries {
+        remembries: Vec<Remembrie>,
+    },
+    RecallSnapshot {
+        snapshot: RecallSnapshot,
+    },
+    Remembrie {
+        remembrie: Option<Remembrie>,
+    },
+    TimelineHistory {
+        spans: Vec<TimelineHistorySpan>,
+    },
+    TimelineDay {
+        entries: Vec<TimelineEntry>,
+    },
+    TimelineMap {
+        slices: Vec<TimelineMapSlice>,
+    },
+    SearchResults {
+        hits: Vec<SearchHit>,
+    },
+    PauseUpdated {
+        status: CaptureStatus,
+    },
+    CaptureSourceUpdated {
+        status: CaptureStatus,
+    },
+    MobileUsageRecorded {
+        summary: MobileUsageSummary,
+    },
+    MobileUsageSummary {
+        summary: MobileUsageSummary,
+    },
+    ActivityRecorded {
+        result: ActivityRecordResult,
+    },
+    SemanticRecorded {
+        result: SemanticCaptureResult,
+    },
+    ScreenAnalyzed {
+        result: ScreenCaptureResult,
+    },
     ActivitySessionEnded,
-    CaptureRules { rules: Vec<CaptureRule> },
-    CaptureRuleAdded { rule: CaptureRule },
-    CaptureRuleDeleted { id: String },
-    Deleted { count: u64 },
-    CaptureAgentHeartbeatRecorded { status: CaptureStatus },
-    BackupCreated { backup: BackupInfo },
-    Backups { backups: Vec<BackupInfo> },
-    IntelligenceStatus { status: IntelligenceStatus },
-    IntelligenceSettingsUpdated { status: IntelligenceStatus },
-    IntelligenceRetryQueued { count: u64 },
-    BrieAnswered { answer: BrieAnswer },
-    CalendarSynced { result: CalendarSyncResult },
-    Error { message: String },
+    CaptureRules {
+        rules: Vec<CaptureRule>,
+    },
+    CaptureRuleAdded {
+        rule: CaptureRule,
+    },
+    CaptureRuleDeleted {
+        id: String,
+    },
+    Deleted {
+        count: u64,
+    },
+    CaptureAgentHeartbeatRecorded {
+        status: CaptureStatus,
+    },
+    BackupCreated {
+        backup: BackupInfo,
+    },
+    Backups {
+        backups: Vec<BackupInfo>,
+    },
+    IntelligenceStatus {
+        status: IntelligenceStatus,
+    },
+    IntelligenceSettingsUpdated {
+        status: IntelligenceStatus,
+    },
+    IntelligenceRetryQueued {
+        count: u64,
+    },
+    BrieAnswered {
+        answer: BrieAnswer,
+    },
+    CalendarSynced {
+        result: CalendarSyncResult,
+    },
+    Error {
+        message: String,
+    },
 }
 
 #[derive(Debug, Error)]
@@ -239,6 +320,38 @@ impl DaemonClient {
     pub fn create(&self, remembrie: NewRemembrie) -> Result<Remembrie, ClientError> {
         match self.request(&Request::Create { remembrie })? {
             Response::Created { remembrie } => Ok(remembrie),
+            other => Err(ClientError::Rejected(format!(
+                "unexpected response: {other:?}"
+            ))),
+        }
+    }
+
+    pub fn import_attachment(
+        &self,
+        attachment: AttachmentImport,
+    ) -> Result<(Remembrie, Attachment), ClientError> {
+        match self.request_with_timeout(
+            &Request::ImportAttachment { attachment },
+            Duration::from_secs(120),
+        )? {
+            Response::AttachmentImported {
+                remembrie,
+                attachment,
+            } => Ok((remembrie, attachment)),
+            other => Err(ClientError::Rejected(format!(
+                "unexpected response: {other:?}"
+            ))),
+        }
+    }
+
+    pub fn list_attachments(
+        &self,
+        remembrie_id: impl Into<String>,
+    ) -> Result<Vec<Attachment>, ClientError> {
+        match self.request(&Request::ListAttachments {
+            remembrie_id: remembrie_id.into(),
+        })? {
+            Response::Attachments { attachments } => Ok(attachments),
             other => Err(ClientError::Rejected(format!(
                 "unexpected response: {other:?}"
             ))),
@@ -462,6 +575,28 @@ impl DaemonClient {
     ) -> Result<CaptureStatus, ClientError> {
         match self.request(&Request::SetMobileAllowWhileLocked { allowed })? {
             Response::CaptureSourceUpdated { status } => Ok(status),
+            other => Err(ClientError::Rejected(format!(
+                "unexpected response: {other:?}"
+            ))),
+        }
+    }
+
+    pub fn record_mobile_usage(
+        &self,
+        active_ms: u64,
+        opened: bool,
+    ) -> Result<MobileUsageSummary, ClientError> {
+        match self.request(&Request::RecordMobileUsage { active_ms, opened })? {
+            Response::MobileUsageRecorded { summary } => Ok(summary),
+            other => Err(ClientError::Rejected(format!(
+                "unexpected response: {other:?}"
+            ))),
+        }
+    }
+
+    pub fn mobile_usage_summary(&self) -> Result<MobileUsageSummary, ClientError> {
+        match self.request(&Request::MobileUsageSummary)? {
+            Response::MobileUsageSummary { summary } => Ok(summary),
             other => Err(ClientError::Rejected(format!(
                 "unexpected response: {other:?}"
             ))),

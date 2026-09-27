@@ -25,7 +25,7 @@ workers. Every API request requires a 256-bit token stored in Membrie's private 
 tailnet membership does not replace that application-level pairing.
 
 The gateway checks GNOME's lock state before every reading operation and fails closed when that
-state cannot be read. A paired device may still submit a deliberate note while the PC is locked,
+state cannot be read. A paired device may still submit a deliberate note or image while the PC is locked,
 but Recall, Brie, and clipboard reads or writes return a locked response unless the user separately
 enables locked-session access. Response previews are bounded, likely secrets are blocked from
 clipboard transfer, request bodies have hard limits, and private API responses are never cached.
@@ -50,6 +50,10 @@ user-authored recollections rather than observations. Their source is recorded a
 and their window provenance as `Mobile WebUI`. Brie uses that exact provenance when a question names
 mobile, phone, iPhone, Companion, or WebUI notes, and combines it with explicit recency language. Older
 notes created before provenance existed are never retroactively relabeled by guesswork.
+
+The companion records only coarse local usage events: an opening count and bounded active-time
+pulses while the page is visible. It records no navigation path, device fingerprint, analytics
+identifier, or remote telemetry. Rolling day, week, and month totals stay in the canonical database.
 
 Quick Brie is a second, compact GTK application window in the same single-instance desktop client.
 The GNOME bridge owns only its global shortcut and launches the app through GNOME's normal
@@ -173,12 +177,24 @@ remembered events.
 ## Storage
 
 SQLite owns identity, timestamps, metadata, captured text, processing state, and
-relationships. FTS5 maintains a lexical index. Binary attachments will live in a
-content-addressed directory and be referenced by hash.
+relationships. FTS5 maintains a lexical index. Binary attachments live outside SQLite in a private
+SHA-256 content-addressed directory and are referenced by hash. Repeated identical files share one
+stored blob. A deliberate attachment retains the original bytes as canonical evidence while its
+filename, media type, processing state, model, confidence, and generated interpretation remain
+attached to the Remembrie in SQLite.
+
+The first attachment analyzer accepts PNG, JPEG, GIF, and WebP images up to 32 MiB. It sends the
+retained bytes only to the selected loopback Ollama vision model, stores the result as explicitly
+unverified machine description, and queues ordinary summary and embedding work afterward. Secret-like
+model output is withheld. Other formats and larger retained images remain available as originals but
+are labeled unsupported rather than silently interpreted. Deleting the last Remembrie that references
+a blob deletes that blob as well.
 
 The daemon creates backups with SQLite's online backup API, verifies them with
-`integrity_check`, syncs the completed file before publishing it, and retains a rolling
-set of 14 snapshots. A partial or failed snapshot is never presented as a backup.
+`integrity_check`, copies or hard-links every referenced attachment, writes a manifest, syncs the
+completed private directory before publishing it, and retains a rolling set of 14 backups. A partial
+or failed backup is removed and never presented as complete. Legacy database-only snapshots remain
+visible alongside the new complete backup directories.
 
 Embeddings are modeled as derived artifacts with model provenance. Vector retrieval
 is isolated behind the search service so its implementation can change without

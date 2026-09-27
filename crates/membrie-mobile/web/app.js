@@ -4,6 +4,9 @@ const TOKEN_KEY = "membrie-pairing-token";
 let token = localStorage.getItem(TOKEN_KEY) || "";
 let statusState = null;
 let toastTimer = null;
+let selectedAttachment = null;
+let attachmentPreviewUrl = "";
+let usageStarted = false;
 
 const $ = (selector) => document.querySelector(selector);
 const pairScreen = $("#pair-screen");
@@ -36,6 +39,27 @@ async function exchangePairingCode(code) {
   if (!response.ok) throw new Error(data.message || "This device could not be paired");
   if (!/^[0-9a-f]{64}$/.test(data.token || "")) throw new Error("Membrie returned an invalid pairing response");
   return data.token;
+}
+
+async function uploadAttachment(file) {
+  const response = await fetch("/api/upload", {
+    method: "POST",
+    headers: {
+      "X-Membrie-Token": token,
+      "X-Membrie-Filename": encodeURIComponent(file.name || "Pasted image.png"),
+      "Content-Type": file.type || "application/octet-stream",
+    },
+    body: file,
+    cache: "no-store",
+  });
+  const data = await response.json().catch(() => ({message: "Membrie returned an unreadable response"}));
+  if (response.status === 401) {
+    token = "";
+    localStorage.removeItem(TOKEN_KEY);
+    showPairing();
+  }
+  if (!response.ok) throw new Error(data.message || "The attachment could not be uploaded");
+  return data.upload_id;
 }
 
 function showPairing() {
@@ -72,7 +96,42 @@ async function refreshStatus() {
       ? "The PC is locked, and this paired device is allowed to use recall."
       : "The PC is locked. New notes are accepted, while recall and clipboard access remain private."
     : `${statusState.remembrie_count} Remembries are available on your PC.`;
+  renderUsage(statusState.usage);
   return statusState;
+}
+
+function renderUsage(usage) {
+  if (!usage) return;
+  $("#usage-day").textContent = formatUsage(usage.last_24_hours_active_ms, usage.last_24_hours_opens);
+  $("#usage-week").textContent = formatUsage(usage.last_7_days_active_ms, usage.last_7_days_opens);
+  $("#usage-month").textContent = formatUsage(usage.last_30_days_active_ms, usage.last_30_days_opens);
+}
+
+function formatUsage(milliseconds, opens) {
+  const minutes = Math.round((milliseconds || 0) / 60000);
+  return `${minutes} min · ${opens || 0} open${opens === 1 ? "" : "s"}`;
+}
+
+async function recordUsage(activeMs, opened = false) {
+  if (!token) return;
+  try {
+    const usage = await api("/api/usage", {
+      method: "POST",
+      body: JSON.stringify({active_ms: activeMs, opened}),
+    });
+    renderUsage(usage);
+  } catch (_error) {
+    // Usage measurement never interrupts capture or recall.
+  }
+}
+
+function startUsageTracking() {
+  if (usageStarted) return;
+  usageStarted = true;
+  recordUsage(0, true);
+  setInterval(() => {
+    if (document.visibilityState === "visible" && token) recordUsage(30000, false);
+  }, 30000);
 }
 
 $("#pair-form").addEventListener("submit", async (event) => {
@@ -90,6 +149,7 @@ $("#pair-form").addEventListener("submit", async (event) => {
     hidePairing();
     setResult(result, "");
     await refreshRecall();
+    startUsageTracking();
   } catch (error) {
     token = "";
     setResult(result, error.message, false);
@@ -110,14 +170,32 @@ $("#note-form").addEventListener("submit", async (event) => {
   const button = event.submitter;
   const result = $("#note-result");
   button.disabled = true;
-  button.textContent = "Remembering…";
+  const title = $("#note-title").value;
+  const body = $("#note-body").value;
+  if (!selectedAttachment && !title.trim() && !body.trim()) {
+    setResult(result, "Write something or attach an image first.", false);
+    button.disabled = false;
+    return;
+  }
+  button.textContent = selectedAttachment ? "Sending privately…" : "Remembering…";
   try {
-    const response = await api("/api/note", {
-      method: "POST",
-      body: JSON.stringify({title: $("#note-title").value, body: $("#note-body").value}),
-    });
+    let response;
+    if (selectedAttachment) {
+      const uploadId = await uploadAttachment(selectedAttachment);
+      response = await api("/api/attachment", {
+        method: "POST",
+        body: JSON.stringify({upload_id: uploadId, title, body}),
+      });
+    } else {
+      response = await api("/api/note", {
+        method: "POST",
+        body: JSON.stringify({title, body}),
+      });
+    }
     $("#note-title").value = "";
     $("#note-body").value = "";
+    $("#note-attachment").value = "";
+    setSelectedAttachment(null);
     setResult(result, response.message);
     toast("Saved on your PC");
   } catch (error) {
@@ -125,6 +203,58 @@ $("#note-form").addEventListener("submit", async (event) => {
   } finally {
     button.disabled = false;
     button.textContent = "Remember on my PC";
+  }
+});
+
+function setSelectedAttachment(file) {
+  selectedAttachment = file;
+  if (attachmentPreviewUrl) URL.revokeObjectURL(attachmentPreviewUrl);
+  attachmentPreviewUrl = "";
+  const preview = $("#attachment-preview");
+  preview.replaceChildren();
+  if (!file) {
+    preview.hidden = true;
+    return;
+  }
+  if (!file.type.startsWith("image/")) {
+    setResult($("#note-result"), "This first attachment pass accepts images.", false);
+    selectedAttachment = null;
+    preview.hidden = true;
+    return;
+  }
+  if (file.size > 100 * 1024 * 1024) {
+    setResult($("#note-result"), "That image is larger than 100 MiB.", false);
+    selectedAttachment = null;
+    preview.hidden = true;
+    return;
+  }
+  attachmentPreviewUrl = URL.createObjectURL(file);
+  const image = document.createElement("img");
+  image.src = attachmentPreviewUrl;
+  image.alt = "Selected image preview";
+  preview.append(image, textElement("p", `${file.name || "Pasted image"} · ${formatBytes(file.size)}`));
+  preview.hidden = false;
+  setResult($("#note-result"), "Image ready to remember.");
+}
+
+$("#note-attachment").addEventListener("change", (event) => {
+  setSelectedAttachment(event.currentTarget.files[0] || null);
+});
+
+$("#note-form").addEventListener("paste", (event) => {
+  const image = Array.from(event.clipboardData?.files || []).find((file) => file.type.startsWith("image/"));
+  if (image) {
+    event.preventDefault();
+    setSelectedAttachment(image);
+  }
+});
+
+$("#note-form").addEventListener("dragover", (event) => event.preventDefault());
+$("#note-form").addEventListener("drop", (event) => {
+  const image = Array.from(event.dataTransfer?.files || []).find((file) => file.type.startsWith("image/"));
+  if (image) {
+    event.preventDefault();
+    setSelectedAttachment(image);
   }
 });
 
@@ -235,10 +365,39 @@ function renderMemoryList(container, records, emptyMessage) {
     meta.className = "meta";
     meta.append(textElement("span", record.kind), textElement("time", formatDate(record.occurred_at_ms)));
     card.append(meta, textElement("h4", record.title));
+    if (record.attachment && record.attachment.mime_type.startsWith("image/")) {
+      const image = document.createElement("img");
+      image.alt = record.attachment.original_name;
+      image.loading = "lazy";
+      card.append(image);
+      loadAttachmentPreview(record, image);
+    }
     if (record.preview) card.append(textElement("p", record.preview));
     card.append(textElement("p", record.source, "model-label"));
     container.append(card);
   });
+}
+
+async function loadAttachmentPreview(record, image) {
+  try {
+    const response = await fetch(`/api/attachment/${encodeURIComponent(record.id)}/${encodeURIComponent(record.attachment.content_id)}`, {
+      headers: {"X-Membrie-Token": token},
+      cache: "no-store",
+    });
+    if (!response.ok) throw new Error("preview unavailable");
+    const blob = await response.blob();
+    const url = URL.createObjectURL(blob);
+    image.addEventListener("load", () => URL.revokeObjectURL(url), {once: true});
+    image.src = url;
+  } catch (_error) {
+    image.remove();
+  }
+}
+
+function formatBytes(bytes) {
+  if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
+  if (bytes >= 1024) return `${(bytes / 1024).toFixed(1)} KiB`;
+  return `${bytes} bytes`;
 }
 
 function textElement(tag, text, className = "") {
@@ -273,6 +432,7 @@ $("#forget-device").addEventListener("click", () => {
       hidePairing();
       await refreshStatus();
       await refreshRecall();
+      startUsageTracking();
       toast("This device is paired");
       return;
     } catch (error) {
@@ -289,6 +449,7 @@ $("#forget-device").addEventListener("click", () => {
   try {
     await refreshStatus();
     await refreshRecall();
+    startUsageTracking();
   } catch (error) {
     showPairing();
     setResult($("#pair-result"), error.message, false);

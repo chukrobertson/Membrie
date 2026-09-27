@@ -87,11 +87,17 @@ clipboard directions. **Allow recall while this PC is locked** is a separate exp
 Tailscale access does not weaken this rule: tailnet membership and pairing are required before the
 locked-session boundary is evaluated.
 
+The Timeline composer and Mobile Companion can create an image Remembrie from a file picker, pasted
+image, or dropped file. PNG, JPEG, GIF, and WebP receive a retained preview and are interpreted by
+the selected local vision model; no image is sent to a remote API. Other formats are retained exactly
+but labeled unsupported for local understanding. Companion usage shown in its status sheet is only a
+local opening count and visible-time total, not telemetry.
+
 ## Backups
 
-Membrie creates a verified SQLite snapshot when the daemon starts if the latest backup
+Membrie creates a verified complete backup when the daemon starts if the latest backup
 is more than 24 hours old. It checks again hourly while running and keeps the newest 14
-snapshots. The Privacy & Capture screen also has a **Create backup now** button.
+backups. The Privacy & Capture screen also has a **Create backup now** button.
 
 The live database is normally:
 
@@ -99,16 +105,20 @@ The live database is normally:
 ~/.local/share/membrie/membrie.db
 ```
 
-Backups are normally:
+New complete backups are normally directories:
 
 ```text
-~/.local/share/membrie/backups/membrie-<timestamp>.db
+~/.local/share/membrie/backups/membrie-<timestamp>.backup/
+  membrie.db
+  manifest.txt
+  blobs/sha256/...
 ```
 
-If `XDG_DATA_HOME` is set, both locations move beneath that directory instead. Each
-snapshot is created with SQLite's online backup mechanism, checked with SQLite's
-integrity check, synced to disk, and made private to the current user before it is
-counted as a successful backup.
+If `XDG_DATA_HOME` is set, both locations move beneath that directory instead. Each database is
+created with SQLite's online backup mechanism and checked with SQLite's integrity check. Every
+referenced attachment is included, a manifest records its hash and size, and the complete private
+directory is synced before it is counted as successful. Older `membrie-<timestamp>.db` snapshots
+remain recognized, but they predate attachment-inclusive backups.
 
 These backups protect against database corruption and accidental local changes. They
 are still on the same physical disk. For protection against disk loss or another
