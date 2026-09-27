@@ -229,7 +229,7 @@ impl PreparedResponse {
             ),
             (
                 "Content-Security-Policy",
-                "default-src 'self'; connect-src 'self'; img-src 'self' data: blob:; style-src 'self'; script-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
+                "default-src 'self'; connect-src 'self'; img-src 'self' data: blob:; media-src 'self' blob:; style-src 'self'; script-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
             ),
         ] {
             response.add_header(header(name, value));
@@ -1428,6 +1428,24 @@ fn header(name: &str, value: &str) -> Header {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn companion_policy_allows_only_local_and_private_blob_audio() {
+        let response = PreparedResponse::text(200, "text/plain", b"ok".to_vec()).into_http();
+        let policy = response
+            .headers()
+            .iter()
+            .find(|header| {
+                header
+                    .field
+                    .as_str()
+                    .as_str()
+                    .eq_ignore_ascii_case("content-security-policy")
+            })
+            .map(|header| header.value.as_str());
+
+        assert!(policy.is_some_and(|policy| policy.contains("media-src 'self' blob:")));
+    }
 
     #[test]
     fn pairing_tokens_are_compared_exactly() {
