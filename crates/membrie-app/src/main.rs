@@ -1112,6 +1112,7 @@ fn build_timeline_page(state: &Rc<UiState>) -> gtk::Widget {
         gtk::gdk::FileList::static_type(),
         gtk::gdk::DragAction::COPY,
     );
+    drop_target.set_propagation_phase(gtk::PropagationPhase::Capture);
     let pending_for_drop = Rc::clone(&pending_attachment);
     let label_for_drop = attachment_label.clone();
     let preview_for_drop = attachment_preview.clone();
