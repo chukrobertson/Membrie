@@ -89,6 +89,17 @@ impl NewRemembrie {
             occurred_at_ms: None,
         }
     }
+
+    pub fn mobile_note(title: impl Into<String>, body: impl Into<String>) -> Self {
+        Self {
+            kind: "note".to_owned(),
+            title: title.into(),
+            body: body.into(),
+            source_app: Some("Membrie Companion".to_owned()),
+            window_title: Some("Mobile WebUI".to_owned()),
+            occurred_at_ms: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

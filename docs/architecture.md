@@ -29,12 +29,27 @@ state cannot be read. A paired device may still submit a deliberate note while t
 but Recall, Brie, and clipboard reads or writes return a locked response unless the user separately
 enables locked-session access. Response previews are bounded, likely secrets are blocked from
 clipboard transfer, request bodies have hard limits, and private API responses are never cached.
+
+Normal device setup uses a private invitation file created by the desktop app. It contains a random
+8-digit code and a five-minute expiry, is mode `0600`, and is protected by a process-wide pairing
+lock plus a delay on every failed attempt. The code is removed after one successful exchange. A QR
+encodes the tailnet URL and temporary code; the WebUI removes that fragment from browser history
+before exchanging it for the 256-bit reusable token. The full token remains available only as a
+deliberate fallback. A browser tab and an installed home-screen WebUI are separate browser storage
+containers and therefore pair independently.
+
 The service accepts only a local Host and Origin until an exact `.ts.net` hostname has been written
 to its private configuration. It then accepts that hostname only over an HTTPS Origin. Tailscale
 Serve terminates tailnet HTTPS and forwards to the same loopback listener; the companion still
 rejects non-loopback peers, and the database daemon remains behind its Unix-socket boundary.
 Tailscale identity and ACLs are an outer boundary, while Membrie's independent pairing token and
 locked-session policy remain the application boundary. Tailscale Funnel is never used.
+
+Notes submitted through the companion remain evidence kind `note`, because they are deliberate
+user-authored recollections rather than observations. Their source is recorded as `Membrie Companion`
+and their window provenance as `Mobile WebUI`. Brie uses that exact provenance when a question names
+mobile, phone, iPhone, Companion, or WebUI notes, and combines it with explicit recency language. Older
+notes created before provenance existed are never retroactively relabeled by guesswork.
 
 Quick Brie is a second, compact GTK application window in the same single-instance desktop client.
 The GNOME bridge owns only its global shortcut and launches the app through GNOME's normal

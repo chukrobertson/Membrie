@@ -60,8 +60,13 @@ to call the calendar library; the installer reports an ordinary-language reminde
 
 Mobile Companion is off by default. Its service listens only on `127.0.0.1:47381`, so installing it
 does not make Membrie reachable from the LAN or tailnet. Enable it in **Privacy & Capture**, open the
-local preview, and use **Show pairing token** to pair that browser. The token file is private to the
+local preview, and use **Pair another device** to pair that browser. The token file is private to the
 current Ubuntu user and is retained with the rest of Membrie's data during uninstall.
+
+**Pair another device** creates a QR code and temporary 8-digit code that expire after five minutes
+and one successful use. Scanning the QR pairs a normal browser directly; the short code is convenient
+when an iPhone home-screen installation has its own separate storage. **Copy fallback token** remains
+available for recovery. Pairing invitations and tokens are never sent to a cloud service.
 
 For tailnet access, first record this PC's exact MagicDNS name with the installed companion binary,
 then point Tailscale Serve at the loopback listener:

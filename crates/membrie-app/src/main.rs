@@ -5,11 +5,16 @@ use membrie_core::{
     ActivitySnapshot, BrieAnswer, BrieCitation, CaptureRule, CaptureStatus, DaemonClient,
     IntelligenceSettings, IntelligenceStatus, LocalModel, NewRemembrie, PauseMode, Remembrie,
     ScreenCaptureCandidate, ScreenCaptureResult, SearchHit, TimelineActivityObservation,
-    TimelineEntry, TimelineMapSlice, mobile_tailnet_host_path, mobile_token_path, socket_path,
+    TimelineEntry, TimelineMapSlice, mobile_pairing_invitation_path, mobile_tailnet_host_path,
+    mobile_token_path, socket_path,
 };
+use qrcode::{Color as QrColor, QrCode};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::fs;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Write};
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::rc::Rc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -1758,7 +1763,7 @@ fn build_privacy_page(state: &Rc<UiState>) -> gtk::Widget {
 
     let mobile_actions = gtk::Box::new(Orientation::Horizontal, 8);
     let mobile_open_button = gtk::Button::with_label("Open local preview");
-    let mobile_token_button = gtk::Button::with_label("Show pairing token");
+    let mobile_token_button = gtk::Button::with_label("Pair another device");
     mobile_actions.append(&mobile_open_button);
     mobile_actions.append(&mobile_token_button);
     mobile_card.append(&mobile_actions);
@@ -3089,27 +3094,132 @@ fn show_mobile_pairing_token(parent: &gtk::Button, state: &Rc<UiState>) {
         return;
     }
 
-    let token_label = gtk::Label::new(Some(&token));
-    token_label.add_css_class("monospace");
-    token_label.set_selectable(true);
-    token_label.set_wrap(true);
-    token_label.set_xalign(0.0);
+    let (pairing_code, pairing_url) = match create_mobile_pairing_invitation() {
+        Ok(invitation) => invitation,
+        Err(error) => {
+            toast(state, &format!("Could not create a pairing code: {error}"));
+            return;
+        }
+    };
+    let qr_code = match QrCode::new(pairing_url.as_bytes()) {
+        Ok(qr_code) => qr_code,
+        Err(error) => {
+            toast(
+                state,
+                &format!("Could not create the pairing QR code: {error}"),
+            );
+            return;
+        }
+    };
+    let qr_width = qr_code.width();
+    let qr_modules = qr_code.to_colors();
+    let qr = gtk::DrawingArea::builder()
+        .content_width(260)
+        .content_height(260)
+        .halign(Align::Center)
+        .build();
+    qr.set_draw_func(move |_, context, width, height| {
+        context.set_source_rgb(1.0, 1.0, 1.0);
+        let _ = context.paint();
+        context.set_source_rgb(0.05, 0.04, 0.08);
+        let quiet_zone = 4.0;
+        let scale = f64::from(width.min(height)) / (qr_width as f64 + quiet_zone * 2.0);
+        for y in 0..qr_width {
+            for x in 0..qr_width {
+                if qr_modules[y * qr_width + x] == QrColor::Dark {
+                    context.rectangle(
+                        (x as f64 + quiet_zone) * scale,
+                        (y as f64 + quiet_zone) * scale,
+                        scale.ceil(),
+                        scale.ceil(),
+                    );
+                }
+            }
+        }
+        let _ = context.fill();
+    });
+
+    let pairing_code_label = gtk::Label::new(Some(&pairing_code));
+    pairing_code_label.add_css_class("title-1");
+    pairing_code_label.add_css_class("monospace");
+    pairing_code_label.set_selectable(true);
+    let pairing_hint = gtk::Label::new(Some(
+        "Scan the QR code, or enter this 8-digit code in the Companion. It expires in five minutes and is accepted once.",
+    ));
+    pairing_hint.add_css_class("dim-label");
+    pairing_hint.set_wrap(true);
+    pairing_hint.set_justify(gtk::Justification::Center);
+    let pairing_box = gtk::Box::new(Orientation::Vertical, 10);
+    pairing_box.append(&qr);
+    pairing_box.append(&pairing_code_label);
+    pairing_box.append(&pairing_hint);
+
     let dialog = adw::AlertDialog::builder()
         .heading("Pair another device")
-        .body("Enter this pairing token in Membrie Companion on a device you trust. Tailscale membership alone does not grant access. Treat the reusable token like a password.")
-        .extra_child(&token_label)
+        .body("Pair only a device you trust. Tailscale membership alone does not grant access, and the reusable fallback token remains private.")
+        .extra_child(&pairing_box)
         .build();
     dialog.add_response("close", "Close");
-    dialog.add_response("copy", "Copy token");
-    dialog.set_default_response(Some("copy"));
-    dialog.set_response_appearance("copy", adw::ResponseAppearance::Suggested);
+    dialog.add_response("copy-token", "Copy fallback token");
+    dialog.add_response("copy-code", "Copy 8-digit code");
+    dialog.set_default_response(Some("copy-code"));
+    dialog.set_response_appearance("copy-code", adw::ResponseAppearance::Suggested);
     let clipboard = parent.display().clipboard();
+    let code_clipboard = clipboard.clone();
+    let state_for_code = Rc::clone(state);
+    dialog.connect_response(Some("copy-code"), move |_, _| {
+        code_clipboard.set_text(&pairing_code);
+        toast(&state_for_code, "Temporary pairing code copied");
+    });
     let state_for_copy = Rc::clone(state);
-    dialog.connect_response(Some("copy"), move |_, _| {
+    dialog.connect_response(Some("copy-token"), move |_, _| {
         clipboard.set_text(&token);
-        toast(&state_for_copy, "Pairing token copied");
+        toast(&state_for_copy, "Reusable fallback token copied");
     });
     dialog.present(Some(parent));
+}
+
+fn create_mobile_pairing_invitation() -> Result<(String, String), String> {
+    let mut random = [0_u8; 4];
+    File::open("/dev/urandom")
+        .and_then(|mut file| file.read_exact(&mut random))
+        .map_err(|error| format!("local randomness was unavailable: {error}"))?;
+    let code = format!("{:08}", u32::from_le_bytes(random) % 100_000_000);
+    let expires_at_ms = current_time_ms() + 5 * 60 * 1000;
+    let path = mobile_pairing_invitation_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("the private data directory was unavailable: {error}"))?;
+    }
+    if path.exists()
+        && !fs::symlink_metadata(&path)
+            .map_err(|error| error.to_string())?
+            .file_type()
+            .is_file()
+    {
+        return Err("the pairing invitation path is not a regular file".to_owned());
+    }
+    let mut options = OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options
+        .open(&path)
+        .map_err(|error| format!("the invitation could not be saved: {error}"))?;
+    #[cfg(unix)]
+    file.set_permissions(fs::Permissions::from_mode(0o600))
+        .map_err(|error| format!("the invitation could not be made private: {error}"))?;
+    write!(file, "{code}\n{expires_at_ms}\n")
+        .and_then(|_| file.sync_all())
+        .map_err(|error| format!("the invitation could not be finished: {error}"))?;
+
+    let base_url = fs::read_to_string(mobile_tailnet_host_path())
+        .ok()
+        .map(|host| host.trim().trim_end_matches('.').to_ascii_lowercase())
+        .filter(|host| host.ends_with(".ts.net"))
+        .map(|host| format!("https://{host}"))
+        .unwrap_or_else(|| "http://127.0.0.1:47381".to_owned());
+    Ok((code.clone(), format!("{base_url}/#pair-code={code}")))
 }
 
 fn refresh_status(state: &Rc<UiState>) {

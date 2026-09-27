@@ -4,7 +4,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use gio::prelude::*;
 use glib::variant::ToVariant;
 use membrie_core::{
-    DaemonClient, NewRemembrie, Remembrie, mobile_tailnet_host_path, mobile_token_path, socket_path,
+    DaemonClient, NewRemembrie, Remembrie, mobile_pairing_invitation_path,
+    mobile_tailnet_host_path, mobile_token_path, socket_path,
 };
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
@@ -12,9 +13,9 @@ use std::io::{Cursor, Read, Write};
 use std::net::SocketAddr;
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 const LISTEN_ADDRESS: &str = "127.0.0.1:47381";
@@ -36,6 +37,7 @@ struct AppState {
     client: DaemonClient,
     token: Arc<String>,
     tailnet_host: Option<Arc<String>>,
+    pairing_lock: Arc<Mutex<()>>,
 }
 
 #[derive(Deserialize)]
@@ -54,6 +56,11 @@ struct BrieInput {
 #[derive(Deserialize)]
 struct ClipboardInput {
     text: String,
+}
+
+#[derive(Deserialize)]
+struct PairingInput {
+    code: String,
 }
 
 #[derive(Serialize)]
@@ -107,6 +114,11 @@ struct BrieResponse {
 #[derive(Serialize)]
 struct ClipboardResponse {
     text: String,
+}
+
+#[derive(Serialize)]
+struct PairingResponse<'a> {
+    token: &'a str,
 }
 
 struct PreparedResponse {
@@ -183,6 +195,7 @@ fn main() -> Result<()> {
         client: DaemonClient::new(socket_path()),
         token,
         tailnet_host,
+        pairing_lock: Arc::new(Mutex::new(())),
     };
     let server = Arc::new(
         Server::http(LISTEN_ADDRESS)
@@ -254,9 +267,93 @@ fn route(request: &mut Request, state: &AppState) -> Result<PreparedResponse> {
             "text/javascript; charset=utf-8",
             APP_JS.as_bytes().to_vec(),
         )),
+        (&Method::Post, "/api/pair") => pair_device(request, state),
         (_, path) if path.starts_with("/api/") => route_api(request, state, path),
         _ => Ok(PreparedResponse::error(404, "Not found")),
     }
+}
+
+fn pair_device(request: &mut Request, state: &AppState) -> Result<PreparedResponse> {
+    match state.client.status() {
+        Ok(status) if status.mobile_enabled => {}
+        Ok(_) => {
+            return Ok(PreparedResponse::error(
+                403,
+                "Mobile Companion access is disabled on the PC",
+            ));
+        }
+        Err(_) => return Ok(PreparedResponse::error(503, "Membrie is not available")),
+    }
+    let input: PairingInput = match read_json(request) {
+        Ok(input) => input,
+        Err(response) => return Ok(response),
+    };
+    let code = input.code.trim();
+    if code.len() != 8 || !code.bytes().all(|byte| byte.is_ascii_digit()) {
+        thread::sleep(Duration::from_millis(500));
+        return Ok(PreparedResponse::error(
+            401,
+            "That temporary pairing code is not valid",
+        ));
+    }
+
+    let _pairing_guard = state
+        .pairing_lock
+        .lock()
+        .map_err(|_| anyhow!("the pairing lock was poisoned"))?;
+    let path = mobile_pairing_invitation_path();
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_file() && metadata.len() <= 128 => {}
+        _ => {
+            thread::sleep(Duration::from_millis(500));
+            return Ok(PreparedResponse::error(
+                401,
+                "Create a fresh pairing code in Membrie on the PC",
+            ));
+        }
+    }
+    let invitation = fs::read_to_string(&path)?;
+    let Some((expected_code, expires_at_ms)) = parse_pairing_invitation(&invitation) else {
+        let _ = fs::remove_file(&path);
+        return Ok(PreparedResponse::error(
+            401,
+            "Create a fresh pairing code in Membrie on the PC",
+        ));
+    };
+    if expires_at_ms < current_time_ms() {
+        let _ = fs::remove_file(&path);
+        return Ok(PreparedResponse::error(
+            401,
+            "That pairing code expired; create a fresh code on the PC",
+        ));
+    }
+    if !constant_time_equal(code.as_bytes(), expected_code.as_bytes()) {
+        thread::sleep(Duration::from_millis(500));
+        return Ok(PreparedResponse::error(
+            401,
+            "That temporary pairing code is not valid",
+        ));
+    }
+    fs::remove_file(&path)?;
+    Ok(PreparedResponse::json(
+        200,
+        &PairingResponse {
+            token: state.token.as_str(),
+        },
+    ))
+}
+
+fn parse_pairing_invitation(value: &str) -> Option<(&str, i64)> {
+    let mut lines = value.lines();
+    let code = lines.next()?.trim();
+    let expires_at_ms = lines.next()?.trim().parse().ok()?;
+    if code.len() != 8
+        || !code.bytes().all(|byte| byte.is_ascii_digit())
+        || lines.any(|line| !line.trim().is_empty())
+    {
+        return None;
+    }
+    Some((code, expires_at_ms))
 }
 
 fn route_api(request: &mut Request, state: &AppState, path: &str) -> Result<PreparedResponse> {
@@ -323,7 +420,7 @@ fn create_note(request: &mut Request, state: &AppState) -> Result<PreparedRespon
     }
     state
         .client
-        .create(NewRemembrie::manual(title, body))
+        .create(NewRemembrie::mobile_note(title, body))
         .context("could not store the mobile note")?;
     Ok(PreparedResponse::json(
         201,
@@ -719,6 +816,13 @@ fn truncate(value: &str, maximum: usize) -> String {
     result
 }
 
+fn current_time_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 fn header(name: &str, value: &str) -> Header {
     Header::from_bytes(name.as_bytes(), value.as_bytes()).expect("static HTTP header is valid")
 }
@@ -783,5 +887,16 @@ mod tests {
         assert!(normalize_tailnet_host("example.com").is_err());
         assert!(normalize_tailnet_host("https://node.example.ts.net").is_err());
         assert!(normalize_tailnet_host("-node.tail123.ts.net").is_err());
+    }
+
+    #[test]
+    fn pairing_invitations_have_a_strict_shape() {
+        assert_eq!(
+            parse_pairing_invitation("01234567\n1790000000000\n"),
+            Some(("01234567", 1_790_000_000_000))
+        );
+        assert!(parse_pairing_invitation("1234\n1790000000000\n").is_none());
+        assert!(parse_pairing_invitation("01234567\nnot-time\n").is_none());
+        assert!(parse_pairing_invitation("01234567\n1790000000000\nextra").is_none());
     }
 }

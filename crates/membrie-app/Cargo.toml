@@ -16,3 +16,4 @@ gtk = { package = "gtk4", version = "0.9.7" }
 adw = { package = "libadwaita", version = "0.7.2", features = ["v1_5"] }
 membrie-a11y = { path = "../membrie-a11y" }
 membrie-core = { path = "../membrie-core" }
+qrcode = { version = "0.14.1", default-features = false }

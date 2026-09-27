@@ -25,6 +25,19 @@ async function api(path, options = {}) {
   return data;
 }
 
+async function exchangePairingCode(code) {
+  const response = await fetch("/api/pair", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({code}),
+    cache: "no-store",
+  });
+  const data = await response.json().catch(() => ({message: "Membrie returned an unreadable response"}));
+  if (!response.ok) throw new Error(data.message || "This device could not be paired");
+  if (!/^[0-9a-f]{64}$/.test(data.token || "")) throw new Error("Membrie returned an invalid pairing response");
+  return data.token;
+}
+
 function showPairing() {
   pairScreen.hidden = false;
   statusDot.className = "status-dot";
@@ -66,12 +79,12 @@ $("#pair-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   const result = $("#pair-result");
   const candidate = $("#pair-token").value.trim().toLowerCase();
-  if (!/^[0-9a-f]{64}$/.test(candidate)) {
-    setResult(result, "The token should contain 64 letters and numbers.", false);
+  if (!/^\d{8}$/.test(candidate) && !/^[0-9a-f]{64}$/.test(candidate)) {
+    setResult(result, "Enter the temporary 8-digit code shown on your PC.", false);
     return;
   }
-  token = candidate;
   try {
+    token = /^\d{8}$/.test(candidate) ? await exchangePairingCode(candidate) : candidate;
     await refreshStatus();
     localStorage.setItem(TOKEN_KEY, token);
     hidePairing();
@@ -250,6 +263,25 @@ $("#forget-device").addEventListener("click", () => {
 });
 
 (async () => {
+  const fragment = new URLSearchParams(window.location.hash.slice(1));
+  const pairingCode = fragment.get("pair-code") || "";
+  if (window.location.hash) history.replaceState(null, "", `${window.location.pathname}${window.location.search}`);
+  if (/^\d{8}$/.test(pairingCode)) {
+    try {
+      token = await exchangePairingCode(pairingCode);
+      localStorage.setItem(TOKEN_KEY, token);
+      hidePairing();
+      await refreshStatus();
+      await refreshRecall();
+      toast("This device is paired");
+      return;
+    } catch (error) {
+      token = "";
+      showPairing();
+      setResult($("#pair-result"), error.message, false);
+      return;
+    }
+  }
   if (!token) {
     showPairing();
     return;

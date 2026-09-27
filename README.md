@@ -53,9 +53,11 @@ The project is intentionally local-first and self-hosted:
 - Opt-in read-only GNOME Calendar integration with recurring-event expansion and local reconciliation
 - Responsive Mobile Companion preview for notes, explicit clipboard transfers, Brie, and compact recall
 - Independent Mobile Companion pairing plus a fail-closed locked-PC privacy boundary
+- One-use five-minute QR or 8-digit pairing invitations, with the reusable token retained as fallback
+- Truthful `Membrie Companion` provenance for phone notes and source-aware recent-note recall in Brie
 - Local model selection and visible indexing health
 
-Per-calendar controls, Thunderbird evidence, meeting transcripts, per-device pairing revocation,
+Per-calendar controls, Thunderbird evidence, meeting transcripts, individual device revocation,
 and deeper pattern detection are the next implementation milestones.
 
 ## Install on Ubuntu

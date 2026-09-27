@@ -681,6 +681,29 @@ impl Repository {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    pub fn list_recent_by_source(
+        &self,
+        source: &str,
+        limit: u32,
+    ) -> Result<Vec<Remembrie>, RepositoryError> {
+        let source = source.trim();
+        if source.is_empty() {
+            return Ok(Vec::new());
+        }
+        let limit = limit.clamp(1, 100);
+        let sql = format!(
+            "{} WHERE r.deleted_at_ms IS NULL
+               AND r.source_app = ?1 COLLATE NOCASE
+             GROUP BY r.id
+             ORDER BY r.occurred_at_ms DESC
+             LIMIT ?2",
+            remembrie_select()
+        );
+        let mut statement = self.connection.prepare(&sql)?;
+        let rows = statement.query_map(params![source, limit], map_remembrie)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
     pub fn recall_snapshot(
         &self,
         recent_limit: u32,
@@ -4218,7 +4241,10 @@ mod tests {
         let mut repository = Repository::open(&path).unwrap();
         let now = now_ms().unwrap();
         let note = repository
-            .create(NewRemembrie::manual("Recent note", "Observed locally"))
+            .create(NewRemembrie::mobile_note(
+                "Recent phone note",
+                "Saved through the companion",
+            ))
             .unwrap();
         repository
             .create(NewRemembrie {
@@ -4258,6 +4284,13 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![upcoming.id.as_str()]
         );
+        let mobile = repository
+            .list_recent_by_source("membrie companion", 5)
+            .unwrap();
+        assert_eq!(mobile.len(), 1);
+        assert_eq!(mobile[0].id, note.id);
+        assert_eq!(mobile[0].source_app.as_deref(), Some("Membrie Companion"));
+        assert_eq!(mobile[0].window_title.as_deref(), Some("Mobile WebUI"));
 
         let _ = fs::remove_file(path);
     }

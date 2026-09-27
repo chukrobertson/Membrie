@@ -32,6 +32,10 @@ pub fn mobile_tailnet_host_path() -> PathBuf {
     data_dir().join("mobile-tailnet-host")
 }
 
+pub fn mobile_pairing_invitation_path() -> PathBuf {
+    data_dir().join("mobile-pairing-invitation")
+}
+
 pub fn screen_spool_dir() -> PathBuf {
     if let Some(path) = env::var_os("XDG_RUNTIME_DIR") {
         return PathBuf::from(path).join("membrie-screen");
