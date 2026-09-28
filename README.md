@@ -34,6 +34,7 @@ The project is intentionally local-first and self-hosted:
 - Optional focused-application and window-title activity sessions with idle boundaries
 - Opt-in Semantic Context capture using bounded, read-only GNOME accessibility data
 - First-class LibreOffice Writer, Calc, Impress, Draw, Base, and Math context with focused-document identity and bounded text excerpts
+- First-class Thunderbird mailbox, message, and compose context with truthful Sent, Drafts, Outbox, and delivery boundaries
 - Adaptive semantic-first capture: rich application context avoids redundant screenshots,
   while sparse or unavailable context falls back to Screen Memory when it is enabled
 - A consent-gated, store-nothing Semantic Context compatibility test
@@ -64,7 +65,7 @@ The project is intentionally local-first and self-hosted:
 - Coarse, local-only Companion usage totals for the last day, week, and month
 - Local model selection and visible indexing health
 
-Broader file-format understanding, per-calendar controls, deeper Thunderbird evidence, meeting transcripts,
+Broader file-format understanding, per-calendar controls, meeting transcripts,
 individual device revocation, and deeper pattern detection are the next implementation milestones.
 
 ## Install on Ubuntu
@@ -173,7 +174,10 @@ text through GNOME's accessibility interface. In a focused LibreOffice window it
 Writer, Calc, Impress, Draw, Base, and Math, records the document identity from the active window,
 and reads at most a small bounded excerpt exposed by read-only text interfaces, normally around
 the caret. It never opens another document, reads files from disk, or calls LibreOffice editing
-actions. Rich semantic observations replace a
+actions. Focused Thunderbird windows similarly expose only bounded accessibility context from the
+mailbox, message, or compose view; Membrie never receives Gmail credentials or reads Thunderbird's
+profile database. Compose, Drafts, Outbox, Inbox, and Sent are labeled with distinct evidence limits
+so Brie does not confuse drafting with sending or a Sent copy with delivery. Rich semantic observations replace a
 redundant screenshot; partial or unavailable observations allow Screen Memory to fill the
 gap when that separate source is enabled. Screen Memory takes one-shot samples of the
 active window, filters unchanged frames locally, removes each PNG from disk before local

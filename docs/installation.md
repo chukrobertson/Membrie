@@ -61,6 +61,13 @@ read-only excerpt supplied by LibreOffice, normally near the caret. It does not 
 open inactive documents, or invoke editing actions. Use **Compatibility test** while a LibreOffice
 document is focused to preview exactly what that window provides without storing the result.
 
+Thunderbird mail uses Semantic Context as well. Membrie does not connect to Gmail or receive account
+credentials; Thunderbird continues its own ordinary synchronization, and Membrie reads only the
+focused window's bounded accessibility context. Compose, Drafts, Outbox, Inbox, and Sent are labeled
+with different evidence limits so Brie cannot mistake an open draft for a sent message or a Sent copy
+for proof of delivery. Use **Compatibility test** while a Thunderbird mailbox, message, or compose
+window is focused to preview what it exposes without storing anything.
+
 Calendar access is also off by default. When enabled, Membrie reads the calendars already exposed by
 Ubuntu's Evolution Data Server every 15 minutes. It imports a bounded one-year history and one-year
 look-ahead, expands recurring events, and makes them locally searchable by Brie. The connector does

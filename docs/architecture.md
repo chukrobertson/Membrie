@@ -174,6 +174,16 @@ document contents through UNO, or invoke EditableText, Action, or any selection-
 A useful document excerpt marks the semantic sample rich enough to avoid redundant local vision
 work. Downstream exclusions and secret detection remain unchanged.
 
+Thunderbird uses the same focused-window boundary and remains an accessibility integration—not a
+Gmail login or mail-protocol client. Thunderbird owns its configured accounts and performs its normal
+network synchronization; Membrie receives no credentials and reads no Thunderbird profile database.
+The probe recognizes the Thunderbird snap and desktop identities, records bounded accessible names
+and message text, and follows at most 16 selected descendants in virtualized message lists. Compose,
+Drafts, Outbox, Inbox, and Sent contexts receive explicit evidence labels: a compose or draft window
+does not prove sending; Outbox may mean queued; a message visibly listed in Sent supports that
+Thunderbird submitted it or stored a sent copy, but does not prove delivery or reading. Brie's local
+system prompt repeats these boundaries before answering from the resulting Remembries.
+
 Semantic and Screen Memory cooperate rather than blindly duplicating work. Rich semantic context
 suppresses Screen Memory until the next semantic interval. Partial context is stored but permits
 a visual fallback on the next desktop sample. Applications that do not expose usable AT-SPI data

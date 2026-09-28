@@ -17,7 +17,7 @@ const MAX_DOCUMENT_TEXT_CHARACTERS: usize = 6_000;
 const MAX_DOCUMENT_TEXT_PER_NODE: usize = 2_000;
 const MAX_DOCUMENT_PREVIEW_LINE_CHARACTERS: usize = 600;
 const MAX_SELECTED_DESCENDANTS: usize = 16;
-const LIBREOFFICE_DOCUMENT_RESERVED_LINES: usize = 16;
+const INTEGRATION_CONTEXT_RESERVED_LINES: usize = 16;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct WindowTarget {
@@ -350,10 +350,62 @@ async fn inspect_tree(
                         }
                     }
                 }
+            } else if is_thunderbird(&summary.application, &summary.window, &target_identity) {
+                summary.integration = Some("Thunderbird".to_owned());
+                let focused_window = target
+                    .map(|target| target.window_title.trim())
+                    .filter(|window| !window.is_empty())
+                    .unwrap_or(summary.window.as_str());
+                summary.document = thunderbird_focused_context(focused_window);
+                if show_text {
+                    for line in thunderbird_identity_lines(summary.document.as_deref()) {
+                        if summary.preview.len() >= MAX_PREVIEW_LINES {
+                            break;
+                        }
+                        if preview_seen.insert(line.clone()) {
+                            summary.preview.push(line);
+                        }
+                    }
+                }
+            }
+        }
+        if show_text
+            && summary.integration.as_deref() == Some("Thunderbird")
+            && (states.contains(State::Selected) || states.contains(State::Focused))
+            && matches!(role, Role::TreeItem | Role::ListItem | Role::TableRow)
+        {
+            let selected_name = normalize(&name);
+            if !selected_name.is_empty() {
+                let selected_line = format!("selected mail item ({role}): {selected_name}");
+                if summary.preview.len() < MAX_PREVIEW_LINES
+                    && preview_seen.insert(selected_line.clone())
+                {
+                    summary.preview.push(selected_line);
+                }
+                if role == Role::TreeItem
+                    && let Some(folder) = thunderbird_folder(&selected_name)
+                {
+                    if summary
+                        .document
+                        .as_deref()
+                        .and_then(thunderbird_folder)
+                        .is_none()
+                    {
+                        summary.document = Some(format!("{folder} folder"));
+                    }
+                    for line in thunderbird_folder_lines(folder) {
+                        if summary.preview.len() >= MAX_PREVIEW_LINES {
+                            break;
+                        }
+                        if preview_seen.insert(line.clone()) {
+                            summary.preview.push(line);
+                        }
+                    }
+                }
             }
         }
         let semantic_label_limit = if summary.integration.is_some() {
-            MAX_PREVIEW_LINES - LIBREOFFICE_DOCUMENT_RESERVED_LINES
+            MAX_PREVIEW_LINES - INTEGRATION_CONTEXT_RESERVED_LINES
         } else {
             MAX_PREVIEW_LINES
         };
@@ -368,7 +420,10 @@ async fn inspect_tree(
             && summary.integration.is_some()
             && summary.document_text_nodes < MAX_DOCUMENT_TEXT_NODES
             && summary.document_text_characters < MAX_DOCUMENT_TEXT_CHARACTERS
-            && should_read_libreoffice_text(role)
+            && should_read_integration_text(
+                summary.integration.as_deref().unwrap_or_default(),
+                role,
+            )
             && interfaces.contains(Interface::Text)
             && let Ok(proxies) = accessible.proxies().await
             && let Ok(text) = proxies.text().await
@@ -384,8 +439,9 @@ async fn inspect_tree(
                 if !excerpt.is_empty() {
                     summary.document_text_nodes += 1;
                     summary.document_text_characters += excerpt.chars().count();
-                    let label = libreoffice_content_label(
-                        summary.integration.as_deref().unwrap_or("LibreOffice"),
+                    let label = integration_content_label(
+                        summary.integration.as_deref().unwrap_or_default(),
+                        summary.document.as_deref(),
                     );
                     for line in chunk_document_text(label, &excerpt) {
                         if summary.preview.len() >= MAX_PREVIEW_LINES {
@@ -497,37 +553,167 @@ fn libreoffice_identity_lines(component: &str, document: Option<&str>) -> Vec<St
     lines
 }
 
-fn libreoffice_content_label(component: &str) -> &'static str {
-    if component.ends_with("Writer") {
-        "writer text"
-    } else if component.ends_with("Calc") {
-        "sheet content"
-    } else if component.ends_with("Impress") {
-        "slide content"
-    } else if component.ends_with("Draw") {
-        "drawing content"
-    } else if component.ends_with("Base") {
-        "database content"
-    } else if component.ends_with("Math") {
-        "formula content"
+fn is_thunderbird(application: &str, window: &str, target_identity: &str) -> bool {
+    format!("{application} {window} {target_identity}")
+        .to_ascii_lowercase()
+        .contains("thunderbird")
+}
+
+fn thunderbird_focused_context(window: &str) -> Option<String> {
+    let normalized = normalize(window);
+    let lower = normalized.to_ascii_lowercase();
+    let mut end = normalized.len();
+    for suffix in [
+        " - mozilla thunderbird",
+        " — mozilla thunderbird",
+        " – mozilla thunderbird",
+        " - thunderbird",
+        " — thunderbird",
+        " – thunderbird",
+    ] {
+        if let Some(index) = lower.rfind(suffix) {
+            end = end.min(index);
+        }
+    }
+    let context = normalized[..end].trim();
+    if context.is_empty()
+        || context.eq_ignore_ascii_case("thunderbird")
+        || context.eq_ignore_ascii_case("mozilla thunderbird")
+    {
+        None
     } else {
-        "office content"
+        Some(context.to_owned())
     }
 }
 
-fn should_read_libreoffice_text(role: Role) -> bool {
-    matches!(
-        role,
-        Role::DocumentText
-            | Role::DocumentSpreadsheet
-            | Role::DocumentPresentation
-            | Role::DocumentFrame
-            | Role::Paragraph
-            | Role::Text
-            | Role::TableCell
-            | Role::Heading
-            | Role::Comment
-    )
+fn thunderbird_folder(context: &str) -> Option<&'static str> {
+    for segment in context
+        .to_ascii_lowercase()
+        .split(['-', '—', '–', '|'])
+        .map(str::trim)
+    {
+        match segment {
+            "inbox" => return Some("Inbox"),
+            "sent" | "sent mail" => return Some("Sent"),
+            "drafts" => return Some("Drafts"),
+            "outbox" => return Some("Outbox"),
+            "archive" | "archives" => return Some("Archive"),
+            "trash" | "deleted" | "deleted items" => return Some("Trash"),
+            "junk" | "spam" => return Some("Junk"),
+            "all mail" => return Some("All Mail"),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn thunderbird_is_compose(context: &str) -> bool {
+    let context = context.to_ascii_lowercase();
+    context.contains("write:") || context.contains("compose") || context.contains("new message")
+}
+
+fn thunderbird_identity_lines(context: Option<&str>) -> Vec<String> {
+    let context = context.unwrap_or_default();
+    let mut lines = vec!["mail application: Thunderbird".to_owned()];
+    if thunderbird_is_compose(context) {
+        lines.push("mail view: Compose window".to_owned());
+        lines.push(
+            "evidence boundary: compose or draft context is not proof that the message was sent"
+                .to_owned(),
+        );
+    } else if let Some(folder) = thunderbird_folder(context) {
+        lines.extend(thunderbird_folder_lines(folder));
+    } else {
+        lines.push("mail view: Message or mailbox".to_owned());
+        lines.push(
+            "evidence boundary: visible mail context does not by itself prove a reply, send, delivery, or reading"
+                .to_owned(),
+        );
+    }
+    if !context.is_empty() {
+        lines.insert(2, format!("focused mail context: {context}"));
+    }
+    lines
+}
+
+fn thunderbird_folder_lines(folder: &str) -> Vec<String> {
+    let boundary = match folder {
+        "Sent" => {
+            "visible Sent-folder context can support that Thunderbird submitted or stored a sent copy; it does not prove delivery or reading"
+        }
+        "Drafts" => "Drafts context is not proof that the message was sent",
+        "Outbox" => {
+            "Outbox context may indicate queued mail; it is not proof of sending or delivery"
+        }
+        "Inbox" => {
+            "visible Inbox context supports that Thunderbird displayed locally synced mail; it does not prove that a response was sent"
+        }
+        _ => {
+            "visible mail-folder context does not by itself prove a reply, send, delivery, or reading"
+        }
+    };
+    vec![
+        format!("mail view: {folder} folder"),
+        format!("evidence boundary: {boundary}"),
+    ]
+}
+
+fn integration_content_label(integration: &str, context: Option<&str>) -> &'static str {
+    if integration == "Thunderbird" {
+        let context = context.unwrap_or_default();
+        if thunderbird_is_compose(context) {
+            "draft email content"
+        } else if thunderbird_folder(context) == Some("Sent") {
+            "sent-folder content"
+        } else {
+            "email content"
+        }
+    } else if integration.ends_with("Writer") {
+        "writer text"
+    } else if integration.ends_with("Calc") {
+        "sheet content"
+    } else if integration.ends_with("Impress") {
+        "slide content"
+    } else if integration.ends_with("Draw") {
+        "drawing content"
+    } else if integration.ends_with("Base") {
+        "database content"
+    } else if integration.ends_with("Math") {
+        "formula content"
+    } else {
+        "application content"
+    }
+}
+
+fn should_read_integration_text(integration: &str, role: Role) -> bool {
+    if integration == "Thunderbird" {
+        matches!(
+            role,
+            Role::DocumentEmail
+                | Role::DocumentWeb
+                | Role::DocumentFrame
+                | Role::Paragraph
+                | Role::Text
+                | Role::TableCell
+                | Role::ListItem
+                | Role::Heading
+                | Role::Comment
+                | Role::Entry
+        )
+    } else {
+        matches!(
+            role,
+            Role::DocumentText
+                | Role::DocumentSpreadsheet
+                | Role::DocumentPresentation
+                | Role::DocumentFrame
+                | Role::Paragraph
+                | Role::Text
+                | Role::TableCell
+                | Role::Heading
+                | Role::Comment
+        )
+    }
 }
 
 fn document_text_range(
@@ -658,6 +844,36 @@ mod tests {
         );
         assert_eq!(chunks[1], "writer text: é");
         assert_eq!(truncate_characters("éclair", 2), "éc");
+    }
+
+    #[test]
+    fn thunderbird_windows_have_truthful_mail_evidence_boundaries() {
+        assert!(is_thunderbird(
+            "Thunderbird",
+            "Inbox - Gmail — Mozilla Thunderbird",
+            "thunderbird_thunderbird.desktop"
+        ));
+        assert_eq!(
+            thunderbird_focused_context("Sent - Gmail — Mozilla Thunderbird").as_deref(),
+            Some("Sent - Gmail")
+        );
+        let sent = thunderbird_identity_lines(Some("Sent - Gmail"));
+        assert!(sent.iter().any(|line| line == "mail view: Sent folder"));
+        assert!(
+            sent.iter()
+                .any(|line| line.contains("does not prove delivery"))
+        );
+        let compose = thunderbird_identity_lines(Some("Write: Care plan update"));
+        assert!(
+            compose
+                .iter()
+                .any(|line| line == "mail view: Compose window")
+        );
+        assert!(compose.iter().any(|line| line.contains("not proof")));
+        assert_eq!(
+            integration_content_label("Thunderbird", Some("Write: Care plan update")),
+            "draft email content"
+        );
     }
 
     #[test]

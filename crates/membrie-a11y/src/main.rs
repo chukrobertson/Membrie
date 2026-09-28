@@ -28,7 +28,7 @@ fn main() -> Result<()> {
         println!("Integration: {integration}");
     }
     if let Some(document) = &summary.document {
-        println!("Focused document: {document}");
+        println!("Focused context: {document}");
     }
     println!(
         "Coverage: {} · {} visible nodes · {} text-capable · {} document-capable",
@@ -39,7 +39,7 @@ fn main() -> Result<()> {
     );
     if summary.document_text_nodes > 0 {
         println!(
-            "Document excerpt: {} characters from {} accessible items",
+            "Context excerpt: {} characters from {} accessible items",
             summary.document_text_characters, summary.document_text_nodes
         );
     }

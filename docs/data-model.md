@@ -19,6 +19,8 @@ not an individual key press or low-level operating-system event.
   application accessibility interfaces, tied to activity sessions and quality-labeled
 - LibreOffice context remains in `semantic_observations`, with explicit suite, component, and
   focused-document labels plus a bounded read-only excerpt in `text_content`
+- Thunderbird context also remains in `semantic_observations`; its mailbox/message labels encode
+  Compose, Drafts, Outbox, Inbox, and Sent evidence boundaries without storing account credentials
 - `screen_observations`: explicitly labeled local vision descriptions tied to activity sessions;
   processing state survives session boundaries and temporary source images are not retained
 - `mobile_usage_events`: coarse opening counts and bounded visible-time pulses, stored locally without
