@@ -56,12 +56,25 @@ pub fn sync(repository: &Mutex<Repository>) -> Result<CalendarSyncResult> {
     let day_ms = 24 * 60 * 60 * 1000_i64;
     let start_ms = now.saturating_sub(HISTORY_DAYS * day_ms);
     let end_ms = now.saturating_add(FUTURE_DAYS * day_ms);
-    let helper = calendar_helper_path()?;
-    let output = Command::new(&helper)
+    let (helper, disabled_sources) = {
+        let repository = repository
+            .lock()
+            .map_err(|_| anyhow!("database lock was poisoned"))?;
+        (
+            calendar_helper_path()?,
+            repository.disabled_calendar_source_uids()?,
+        )
+    };
+    let mut command = Command::new(&helper);
+    command
         .arg("--start-ms")
         .arg(start_ms.to_string())
         .arg("--end-ms")
-        .arg(end_ms.to_string())
+        .arg(end_ms.to_string());
+    for source_uid in disabled_sources {
+        command.arg("--exclude-source").arg(source_uid);
+    }
+    let output = command
         .output()
         .with_context(|| format!("could not start {}", helper.display()))?;
     if !output.status.success() {

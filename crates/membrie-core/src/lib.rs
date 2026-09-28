@@ -13,7 +13,7 @@ pub use ipc::{DaemonClient, Request, Response};
 pub use model::{
     ActivityRecordResult, ActivitySnapshot, Attachment, AttachmentBatchImport, AttachmentImport,
     AttachmentProcessingJob, AudioTranscription, BackupInfo, BrieAnswer, BrieCitation,
-    CalendarSnapshot, CalendarSourceSnapshot, CalendarSyncResult, CaptureCandidate,
+    CalendarSnapshot, CalendarSource, CalendarSourceSnapshot, CalendarSyncResult, CaptureCandidate,
     CaptureDecision, CaptureRule, CaptureStatus, EmbeddedChunk, EvidencePattern,
     IntelligenceSettings, IntelligenceStatus, LocalModel, MobileUsageSummary, NewRemembrie,
     NotificationCaptureCandidate, NotificationSource, PatternEvidence, PauseMode, ProcessingJob,

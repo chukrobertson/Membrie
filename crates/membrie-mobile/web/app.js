@@ -647,9 +647,15 @@ async function fetchPcClipboardImage() {
     showPairing();
     return false;
   }
-  if (!response.ok) return false;
+  if (response.status === 404) return false;
+  if (!response.ok) {
+    const data = await response.json().catch(() => ({message: "The PC image could not be fetched"}));
+    throw new Error(data.message || "The PC image could not be fetched");
+  }
   const blob = await response.blob();
-  if (!blob.type.startsWith("image/") || !blob.size) return false;
+  if (!blob.type.startsWith("image/") || !blob.size) {
+    throw new Error("The PC returned an empty or unsupported clipboard image");
+  }
   clearFetchedPcImage();
   const extension = {"image/png": "png", "image/jpeg": "jpg", "image/webp": "webp"}[blob.type] || "img";
   const stamp = new Date().toISOString().replace(/[:.]/g, "-");

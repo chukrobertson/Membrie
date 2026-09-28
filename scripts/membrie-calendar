@@ -63,7 +63,7 @@ def status_name(component):
     return ""
 
 
-def read_snapshot(start_ms, end_ms):
+def read_snapshot(start_ms, end_ms, excluded_sources):
     ECal, EDataServer, ICalGLib = load_calendar_runtime()
     registry = EDataServer.SourceRegistry.new_sync(None)
     sources = []
@@ -80,8 +80,13 @@ def read_snapshot(start_ms, end_ms):
             "source_uid": source_uid,
             "name": source_name,
             "error": None,
+            "skipped": source_uid in excluded_sources,
         }
         source_event_count = 0
+        if source_result["skipped"]:
+            source_result["event_count"] = 0
+            sources.append(source_result)
+            continue
         try:
             client = ECal.Client.connect_sync(
                 source, ECal.ClientSourceType.EVENTS, 10, None
@@ -155,6 +160,7 @@ def parse_arguments():
     parser = argparse.ArgumentParser(description="Read local GNOME calendars")
     parser.add_argument("--start-ms", type=int, default=now_ms - 365 * day_ms)
     parser.add_argument("--end-ms", type=int, default=now_ms + 365 * day_ms)
+    parser.add_argument("--exclude-source", action="append", default=[])
     return parser.parse_args()
 
 
@@ -163,7 +169,11 @@ def main():
     if arguments.start_ms < 0 or arguments.end_ms <= arguments.start_ms:
         raise RuntimeError("calendar range is invalid")
     json.dump(
-        read_snapshot(arguments.start_ms, arguments.end_ms),
+        read_snapshot(
+            arguments.start_ms,
+            arguments.end_ms,
+            set(arguments.exclude_source),
+        ),
         sys.stdout,
         ensure_ascii=False,
         separators=(",", ":"),

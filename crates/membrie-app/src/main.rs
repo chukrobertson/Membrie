@@ -2,9 +2,9 @@ use adw::prelude::*;
 use gtk::{Align, Orientation};
 use membrie_a11y::{ProbeSummary, WindowTarget};
 use membrie_core::{
-    ActivitySnapshot, AttachmentImport, BrieAnswer, BrieCitation, CaptureRule, CaptureStatus,
-    DaemonClient, EvidencePattern, IntelligenceSettings, IntelligenceStatus, LocalModel,
-    NewRemembrie, NotificationSource, PauseMode, Remembrie, ScreenCaptureCandidate,
+    ActivitySnapshot, AttachmentImport, BrieAnswer, BrieCitation, CalendarSource, CaptureRule,
+    CaptureStatus, DaemonClient, EvidencePattern, IntelligenceSettings, IntelligenceStatus,
+    LocalModel, NewRemembrie, NotificationSource, PauseMode, Remembrie, ScreenCaptureCandidate,
     ScreenCaptureResult, SearchHit, TimelineActivityObservation, TimelineEntry, TimelineMapSlice,
     attachment_blob_path, attachment_inbox_dir, mobile_pairing_invitation_path,
     mobile_tailnet_host_path, mobile_token_path, socket_path,
@@ -137,6 +137,7 @@ struct UiState {
     calendar_button: gtk::Button,
     calendar_sync_button: gtk::Button,
     calendar_syncing: Cell<bool>,
+    calendar_sources: gtk::ListBox,
     mobile_status: gtk::Label,
     mobile_button: gtk::Button,
     mobile_locked_button: gtk::Button,
@@ -281,6 +282,7 @@ fn build_ui(application: &adw::Application) {
     let calendar_sync_button = gtk::Button::with_label("Sync local calendars now");
     calendar_sync_button.set_halign(Align::Start);
     calendar_sync_button.set_sensitive(false);
+    let calendar_sources = memory_list();
     let mobile_status = gtk::Label::new(Some("Mobile Companion · Checking…"));
     mobile_status.set_xalign(0.0);
     mobile_status.set_wrap(true);
@@ -368,6 +370,7 @@ fn build_ui(application: &adw::Application) {
         calendar_button,
         calendar_sync_button,
         calendar_syncing: Cell::new(false),
+        calendar_sources,
         mobile_status,
         mobile_button,
         mobile_locked_button,
@@ -426,6 +429,7 @@ fn build_ui(application: &adw::Application) {
     refresh_timeline(&state);
     refresh_capture_rules(&state);
     refresh_notification_sources(&state);
+    refresh_calendar_sources(&state);
     refresh_intelligence(&state);
     let state_for_live_capture = Rc::clone(&state);
     gtk::glib::timeout_add_seconds_local(2, move || {
@@ -439,6 +443,7 @@ fn build_ui(application: &adw::Application) {
         refresh_semantic_status(&state_for_timer);
         refresh_status(&state_for_timer);
         refresh_notification_sources(&state_for_timer);
+        refresh_calendar_sources(&state_for_timer);
         refresh_backups(&state_for_timer);
         gtk::glib::ControlFlow::Continue
     });
@@ -1947,6 +1952,19 @@ fn build_privacy_page(state: &Rc<UiState>) -> gtk::Widget {
     calendar_card.append(&calendar_sync_detail);
     calendar_card.append(&state.calendar_button);
     calendar_card.append(&state.calendar_sync_button);
+    let calendar_source_heading = gtk::Label::new(Some("Calendar controls"));
+    calendar_source_heading.add_css_class("heading");
+    calendar_source_heading.set_xalign(0.0);
+    calendar_source_heading.set_margin_top(8);
+    let calendar_source_detail = gtk::Label::new(Some(
+        "Calendars appear here after discovery. Ignored calendars are not read on later syncs. Their existing Remembries stay available until you explicitly delete them.",
+    ));
+    calendar_source_detail.add_css_class("dim-label");
+    calendar_source_detail.set_xalign(0.0);
+    calendar_source_detail.set_wrap(true);
+    calendar_card.append(&calendar_source_heading);
+    calendar_card.append(&calendar_source_detail);
+    calendar_card.append(&state.calendar_sources);
     let state_for_calendar = Rc::clone(state);
     state.calendar_button.connect_clicked(move |_| {
         let enabled = state_for_calendar
@@ -1966,6 +1984,7 @@ fn build_privacy_page(state: &Rc<UiState>) -> gtk::Widget {
                 } else {
                     toast(&state_for_calendar, "Calendar access disabled");
                 }
+                refresh_calendar_sources(&state_for_calendar);
             }
             Err(error) => toast(
                 &state_for_calendar,
@@ -3775,6 +3794,7 @@ fn begin_calendar_sync(state: &Rc<UiState>) {
                     .calendar_sync_button
                     .set_label("Sync local calendars now");
                 refresh_status(&state);
+                refresh_calendar_sources(&state);
                 refresh_timeline(&state);
                 refresh_intelligence(&state);
                 let changes = result.added + result.updated + result.removed;
@@ -3793,6 +3813,7 @@ fn begin_calendar_sync(state: &Rc<UiState>) {
                     .calendar_sync_button
                     .set_label("Sync local calendars now");
                 refresh_status(&state);
+                refresh_calendar_sources(&state);
                 toast(&state, &format!("Calendar sync needs attention: {error}"));
                 gtk::glib::ControlFlow::Break
             }
@@ -3803,6 +3824,7 @@ fn begin_calendar_sync(state: &Rc<UiState>) {
                     .calendar_sync_button
                     .set_label("Sync local calendars now");
                 refresh_status(&state);
+                refresh_calendar_sources(&state);
                 toast(&state, "The local calendar worker stopped unexpectedly");
                 gtk::glib::ControlFlow::Break
             }
@@ -4519,7 +4541,7 @@ fn apply_status_ui(state: &UiState, status: &CaptureStatus) {
             )
         } else if let Some(timestamp) = status.calendar_last_sync_ms {
             format!(
-                "On · {} enabled calendars · {} searchable events\nLast local sync: {}",
+                "On · {} local calendars found · {} searchable events\nLast local sync: {}",
                 status.calendar_source_count,
                 status.calendar_event_count,
                 format_timestamp(timestamp)
@@ -4608,6 +4630,111 @@ fn refresh_notification_sources(state: &Rc<UiState>) {
             "Application controls unavailable",
             &error.to_string(),
         ),
+    }
+}
+
+fn refresh_calendar_sources(state: &Rc<UiState>) {
+    match state.client.list_calendar_sources() {
+        Ok(sources) => render_calendar_sources(&state.calendar_sources, state, &sources),
+        Err(error) => render_error(
+            &state.calendar_sources,
+            "Calendar controls unavailable",
+            &error.to_string(),
+        ),
+    }
+}
+
+fn render_calendar_sources(list: &gtk::ListBox, state: &Rc<UiState>, sources: &[CalendarSource]) {
+    clear_list(list);
+    if sources.is_empty() {
+        let row = gtk::ListBoxRow::new();
+        let label = gtk::Label::new(Some(
+            "No calendars discovered yet. Enable calendar access and sync once to choose individual calendars.",
+        ));
+        label.add_css_class("dim-label");
+        label.set_xalign(0.0);
+        label.set_wrap(true);
+        label.set_margin_top(10);
+        label.set_margin_bottom(10);
+        label.set_margin_start(12);
+        label.set_margin_end(12);
+        row.set_child(Some(&label));
+        list.append(&row);
+        return;
+    }
+
+    for source in sources {
+        let row = gtk::ListBoxRow::new();
+        let content = gtk::Box::new(Orientation::Horizontal, 10);
+        content.set_margin_top(9);
+        content.set_margin_bottom(9);
+        content.set_margin_start(12);
+        content.set_margin_end(12);
+        let labels = gtk::Box::new(Orientation::Vertical, 2);
+        labels.set_hexpand(true);
+        let title = gtk::Label::new(Some(&source.name));
+        title.add_css_class("heading");
+        title.set_xalign(0.0);
+        let detail_text = if !source.enabled {
+            format!(
+                "Ignored · {} existing events remain remembered",
+                source.remembered_event_count
+            )
+        } else if let Some(error) = source.last_error.as_deref() {
+            format!(
+                "{} remembered events · last read needs attention: {}",
+                source.remembered_event_count,
+                truncate_display_text(error, 180)
+            )
+        } else if let Some(timestamp) = source.last_sync_ms {
+            format!(
+                "{} remembered events · last read {}",
+                source.remembered_event_count,
+                format_timestamp(timestamp)
+            )
+        } else {
+            "Allowed · waiting for its first read".to_owned()
+        };
+        let detail = gtk::Label::new(Some(&detail_text));
+        detail.add_css_class("caption");
+        detail.add_css_class("dim-label");
+        detail.set_xalign(0.0);
+        detail.set_wrap(true);
+        labels.append(&title);
+        labels.append(&detail);
+        content.append(&labels);
+
+        let control = gtk::Button::with_label(if source.enabled { "Ignore" } else { "Allow" });
+        let state = Rc::clone(state);
+        let source_uid = source.source_uid.clone();
+        let enable = !source.enabled;
+        control.connect_clicked(move |_| {
+            match state
+                .client
+                .set_calendar_source_enabled(&source_uid, enable)
+            {
+                Ok(source) => toast(
+                    &state,
+                    &format!(
+                        "{} calendar {}",
+                        source.name,
+                        if source.enabled { "allowed" } else { "ignored" }
+                    ),
+                ),
+                Err(error) => toast(&state, &format!("Could not update calendar: {error}")),
+            }
+            refresh_calendar_sources(&state);
+            if state
+                .client
+                .status()
+                .is_ok_and(|status| status.calendar_enabled && !status.paused)
+            {
+                begin_calendar_sync(&state);
+            }
+        });
+        content.append(&control);
+        row.set_child(Some(&content));
+        list.append(&row);
     }
 }
 

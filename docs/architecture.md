@@ -213,10 +213,17 @@ modify, delete, or refresh operation and never receives account credentials. Cal
 already configured in GNOME remain owned by the desktop and may perform their normal synchronization
 independently; Membrie reads only the local EDS view.
 
+The daemon stores an allow/ignore preference for every discovered source and passes ignored source
+identifiers to the helper before event expansion. The helper still returns bounded source metadata
+so the control remains visible, but it does not connect to or enumerate events from ignored
+calendars. The repository repeats that filter at its persistence boundary to remain safe if the
+helper output is stale or a preference changes during a sync.
+
 The daemon validates and bounds every helper field, applies application/content exclusions and
 high-confidence secret detection before persistence, and reconciles changed or removed instances
 transactionally. Successful sources can be reconciled even when another source fails; a failed
-source's existing records are preserved. Calendar instances become explicitly typed `calendar`
+source's existing records are preserved. Ignoring a source likewise preserves its existing records
+while preventing new or changed instances from entering Membrie. Calendar instances become explicitly typed `calendar`
 Remembries so FTS, local embeddings, Timeline evidence, and Brie citations use the same canonical
 path as other evidence. Disabling access stops future reads without silently deleting previously
 remembered events.

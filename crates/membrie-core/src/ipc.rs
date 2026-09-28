@@ -1,10 +1,11 @@
 use crate::model::{
     ActivityRecordResult, ActivitySnapshot, Attachment, AttachmentBatchImport, AttachmentImport,
-    BackupInfo, BrieAnswer, CalendarSyncResult, CaptureCandidate, CaptureDecision, CaptureRule,
-    CaptureStatus, EvidencePattern, IntelligenceSettings, IntelligenceStatus, MobileUsageSummary,
-    NewRemembrie, NotificationCaptureCandidate, NotificationSource, PauseMode, RecallSnapshot,
-    Remembrie, ScreenCaptureCandidate, ScreenCaptureResult, SearchHit, SemanticCaptureCandidate,
-    SemanticCaptureResult, TimelineEntry, TimelineHistorySpan, TimelineMapSlice,
+    BackupInfo, BrieAnswer, CalendarSource, CalendarSyncResult, CaptureCandidate, CaptureDecision,
+    CaptureRule, CaptureStatus, EvidencePattern, IntelligenceSettings, IntelligenceStatus,
+    MobileUsageSummary, NewRemembrie, NotificationCaptureCandidate, NotificationSource, PauseMode,
+    RecallSnapshot, Remembrie, ScreenCaptureCandidate, ScreenCaptureResult, SearchHit,
+    SemanticCaptureCandidate, SemanticCaptureResult, TimelineEntry, TimelineHistorySpan,
+    TimelineMapSlice,
 };
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -119,6 +120,11 @@ pub enum Request {
     SetCalendarEnabled {
         enabled: bool,
     },
+    ListCalendarSources,
+    SetCalendarSourceEnabled {
+        source_uid: String,
+        enabled: bool,
+    },
     SetMobileEnabled {
         enabled: bool,
     },
@@ -205,6 +211,12 @@ pub enum Response {
     },
     NotificationSourceUpdated {
         source: NotificationSource,
+    },
+    CalendarSources {
+        sources: Vec<CalendarSource>,
+    },
+    CalendarSourceUpdated {
+        source: CalendarSource,
     },
     Remembries {
         remembries: Vec<Remembrie>,
@@ -740,6 +752,31 @@ impl DaemonClient {
     pub fn set_calendar_enabled(&self, enabled: bool) -> Result<CaptureStatus, ClientError> {
         match self.request(&Request::SetCalendarEnabled { enabled })? {
             Response::CaptureSourceUpdated { status } => Ok(status),
+            other => Err(ClientError::Rejected(format!(
+                "unexpected response: {other:?}"
+            ))),
+        }
+    }
+
+    pub fn list_calendar_sources(&self) -> Result<Vec<CalendarSource>, ClientError> {
+        match self.request(&Request::ListCalendarSources)? {
+            Response::CalendarSources { sources } => Ok(sources),
+            other => Err(ClientError::Rejected(format!(
+                "unexpected response: {other:?}"
+            ))),
+        }
+    }
+
+    pub fn set_calendar_source_enabled(
+        &self,
+        source_uid: impl Into<String>,
+        enabled: bool,
+    ) -> Result<CalendarSource, ClientError> {
+        match self.request(&Request::SetCalendarSourceEnabled {
+            source_uid: source_uid.into(),
+            enabled,
+        })? {
+            Response::CalendarSourceUpdated { source } => Ok(source),
             other => Err(ClientError::Rejected(format!(
                 "unexpected response: {other:?}"
             ))),

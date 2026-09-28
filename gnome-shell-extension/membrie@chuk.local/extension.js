@@ -260,18 +260,24 @@ class ClipboardBridge {
             return;
         }
         const available = this._clipboard.get_mimetypes(St.ClipboardType.CLIPBOARD);
-        const mimetype = [
-            'image/png',
-            'image/jpeg',
-            'image/webp',
-        ].find(type => available.includes(type));
-        if (!mimetype) {
+        const offeredMimetype = available.find(type => {
+            const normalized = String(type).split(';', 1)[0].trim().toLowerCase();
+            return ['image/png', 'image/jpeg', 'image/jpg', 'image/webp'].includes(normalized);
+        });
+        if (!offeredMimetype) {
             invocation.return_dbus_error(
                 'com.chuk.Membrie.Error.NoImage',
                 'The clipboard does not contain a supported image'
             );
             return;
         }
+        const normalizedMimetype = String(offeredMimetype)
+            .split(';', 1)[0]
+            .trim()
+            .toLowerCase();
+        const mimetype = normalizedMimetype === 'image/jpg'
+            ? 'image/jpeg'
+            : normalizedMimetype;
 
         this._imageReading = true;
         let finished = false;
@@ -292,14 +298,18 @@ class ClipboardBridge {
         );
         this._clipboard.get_content(
             St.ClipboardType.CLIPBOARD,
-            mimetype,
+            offeredMimetype,
             (_clipboard, bytes) => {
                 if (finished)
                     return;
                 finished = true;
                 GLib.source_remove(timeoutId);
                 this._imageReading = false;
-                const content = bytes?.get_data();
+                // GJS may expose GBytes either as GLib.Bytes or as a byte array,
+                // depending on the Shell/GJS generation. Both are valid.
+                const content = bytes instanceof GLib.Bytes
+                    ? bytes.get_data()
+                    : bytes;
                 if (!content || content.length === 0 || content.length > MAX_IMAGE_BYTES) {
                     invocation.return_dbus_error(
                         'com.chuk.Membrie.Error.InvalidImage',

@@ -83,6 +83,8 @@ not receive account credentials and contains no calendar write or forced-refresh
 calendar providers may continue their own configured synchronization independently of Membrie.
 The `gir1.2-ecal-2.0` package in the install command supplies the small runtime description needed
 to call the calendar library; the installer reports an ordinary-language reminder when it is absent.
+After the first sync, **Privacy & Capture** lists each discovered calendar. **Ignore** prevents that
+calendar from being read on later syncs without deleting Remembries already created from it.
 
 Mobile Companion is off by default. Its service listens only on `127.0.0.1:47381`, so installing it
 does not make Membrie reachable from the LAN or tailnet. Enable it in **Privacy & Capture**, open the
@@ -128,6 +130,8 @@ holds the recording until it is reviewed and explicitly remembered. Recall provi
 timestamped local transcript, a separate user correction, retry, and deletion controls. **Fetch** in
 the Clipboard view can retrieve a current PNG, JPEG, or WebP clipboard image from the GNOME bridge;
 the image stays temporary until it is explicitly remembered, saved, or shared.
+If no image is present, the text fetch remains the fallback; bridge failures and timeouts are shown
+as distinct errors instead of being mistaken for an empty clipboard.
 
 ## Backups
 

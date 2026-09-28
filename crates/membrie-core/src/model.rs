@@ -428,12 +428,24 @@ pub struct BackupInfo {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CalendarSource {
+    pub source_uid: String,
+    pub name: String,
+    pub enabled: bool,
+    pub remembered_event_count: u64,
+    pub last_sync_ms: Option<i64>,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CalendarSourceSnapshot {
     pub source_uid: String,
     pub name: String,
     pub error: Option<String>,
     #[serde(default)]
     pub event_count: u64,
+    #[serde(default)]
+    pub skipped: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

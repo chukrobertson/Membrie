@@ -285,6 +285,15 @@ fn dispatch_database(request: Request, repository: &Mutex<Repository>) -> Result
         Request::SetCalendarEnabled { enabled } => Ok(Response::CaptureSourceUpdated {
             status: with_capture_health(repository.set_calendar_enabled(enabled)?),
         }),
+        Request::ListCalendarSources => Ok(Response::CalendarSources {
+            sources: repository.list_calendar_sources()?,
+        }),
+        Request::SetCalendarSourceEnabled {
+            source_uid,
+            enabled,
+        } => Ok(Response::CalendarSourceUpdated {
+            source: repository.set_calendar_source_enabled(&source_uid, enabled)?,
+        }),
         Request::SetMobileEnabled { enabled } => Ok(Response::CaptureSourceUpdated {
             status: with_capture_health(repository.set_mobile_enabled(enabled)?),
         }),

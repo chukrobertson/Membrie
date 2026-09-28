@@ -802,10 +802,8 @@ fn read_clipboard_image() -> Result<PreparedResponse> {
         Ok(image) => image,
         Err(error) => {
             eprintln!("Mobile clipboard image fetch unavailable: {error:#}");
-            return Ok(PreparedResponse::error(
-                404,
-                "The PC clipboard does not contain a supported image",
-            ));
+            let (status, message) = clipboard_image_bridge_error(&error.to_string());
+            return Ok(PreparedResponse::error(status, message));
         }
     };
     if content.is_empty() || content.len() > MAX_CLIPBOARD_IMAGE_BYTES {
@@ -821,6 +819,35 @@ fn read_clipboard_image() -> Result<PreparedResponse> {
         ));
     };
     Ok(PreparedResponse::text(200, content_type, content))
+}
+
+fn clipboard_image_bridge_error(error: &str) -> (u16, &'static str) {
+    let lower = error.to_ascii_lowercase();
+    if lower.contains("noimage") || lower.contains("does not contain a supported image") {
+        return (
+            404,
+            "The PC clipboard currently contains no supported image; copy the image itself, not only its file",
+        );
+    }
+    if lower.contains("busy") || lower.contains("already being read") {
+        return (409, "The PC clipboard is busy; wait a moment and try again");
+    }
+    if lower.contains("timeout") || lower.contains("timed out") {
+        return (504, "The PC took too long to provide that clipboard image");
+    }
+    if lower.contains("invalidimage") || lower.contains("empty or too large") {
+        return (422, "The PC clipboard image is empty or larger than 32 MiB");
+    }
+    if lower.contains("unavailable")
+        || lower.contains("serviceunknown")
+        || lower.contains("namehasnoowner")
+    {
+        return (
+            503,
+            "The Membrie Desktop Bridge is not responding on the PC",
+        );
+    }
+    (502, "The PC clipboard image could not be read")
 }
 
 fn verified_clipboard_image_type(mime_type: &str, content: &[u8]) -> Option<&'static str> {
@@ -1503,6 +1530,28 @@ mod tests {
         let variant = ("image/png", vec![1_u8, 2, 3]).to_variant();
         let decoded = variant.try_get::<(String, Vec<u8>)>().unwrap();
         assert_eq!(decoded, ("image/png".to_owned(), vec![1, 2, 3]));
+    }
+
+    #[test]
+    fn pc_clipboard_image_errors_remain_actionable() {
+        assert_eq!(
+            clipboard_image_bridge_error("GDBus.Error:com.chuk.Membrie.Error.NoImage"),
+            (
+                404,
+                "The PC clipboard currently contains no supported image; copy the image itself, not only its file"
+            )
+        );
+        assert_eq!(
+            clipboard_image_bridge_error("GDBus.Error:com.chuk.Membrie.Error.Timeout"),
+            (504, "The PC took too long to provide that clipboard image")
+        );
+        assert_eq!(
+            clipboard_image_bridge_error("the GNOME Desktop Bridge is unavailable"),
+            (
+                503,
+                "The Membrie Desktop Bridge is not responding on the PC"
+            )
+        );
     }
 
     #[test]

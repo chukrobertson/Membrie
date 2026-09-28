@@ -1,9 +1,9 @@
 use crate::model::{
     ActivityRecordResult, ActivitySnapshot, Attachment, AttachmentBatchImport, AttachmentImport,
     AttachmentProcessingJob, AudioTranscription, CalendarEventSnapshot, CalendarSnapshot,
-    CalendarSyncResult, CaptureCandidate, CaptureDecision, CaptureRule, CaptureStatus,
-    EmbeddedChunk, EvidencePattern, IntelligenceSettings, IntelligenceStatus, LocalModel,
-    MobileUsageSummary, NewRemembrie, NotificationCaptureCandidate, NotificationSource,
+    CalendarSource, CalendarSyncResult, CaptureCandidate, CaptureDecision, CaptureRule,
+    CaptureStatus, EmbeddedChunk, EvidencePattern, IntelligenceSettings, IntelligenceStatus,
+    LocalModel, MobileUsageSummary, NewRemembrie, NotificationCaptureCandidate, NotificationSource,
     PatternEvidence, PauseMode, ProcessingJob, RecallSnapshot, Remembrie, ScreenAnalysis,
     ScreenCaptureCandidate, ScreenCaptureResult, SearchHit, SemanticCaptureCandidate,
     SemanticCaptureResult, StagedAttachmentImport, TimelineActivityObservation,
@@ -23,7 +23,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use uuid::Uuid;
 
-const SCHEMA_VERSION: i64 = 13;
+const SCHEMA_VERSION: i64 = 14;
 const DUPLICATE_WINDOW_MS: i64 = 24 * 60 * 60 * 1000;
 const MIN_SEMANTIC_SIMILARITY: f64 = 0.25;
 const SEMANTIC_SCORE_WINDOW: f64 = 0.20;
@@ -468,6 +468,11 @@ CREATE INDEX IF NOT EXISTS idx_notification_sources_last_seen
     ON notification_sources(last_seen_at_ms DESC);
 "#;
 
+const MIGRATION_14: &str = r#"
+ALTER TABLE calendar_sources ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1
+    CHECK(enabled IN (0, 1));
+"#;
+
 #[derive(Debug, Error)]
 pub enum RepositoryError {
     #[error("database error: {0}")]
@@ -631,6 +636,13 @@ impl Repository {
         if version < 13 {
             let transaction = connection.unchecked_transaction()?;
             transaction.execute_batch(MIGRATION_13)?;
+            transaction.pragma_update(None, "user_version", 13)?;
+            transaction.commit()?;
+            version = 13;
+        }
+        if version < 14 {
+            let transaction = connection.unchecked_transaction()?;
+            transaction.execute_batch(MIGRATION_14)?;
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             transaction.commit()?;
         }
@@ -2930,6 +2942,64 @@ impl Repository {
         self.status()
     }
 
+    pub fn disabled_calendar_source_uids(&self) -> Result<Vec<String>, RepositoryError> {
+        let mut statement = self.connection.prepare(
+            "SELECT source_uid FROM calendar_sources WHERE enabled = 0 ORDER BY source_uid",
+        )?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn list_calendar_sources(&self) -> Result<Vec<CalendarSource>, RepositoryError> {
+        let mut statement = self.connection.prepare(
+            "SELECT cs.source_uid, cs.name, cs.enabled,
+                    COUNT(CASE WHEN r.deleted_at_ms IS NULL THEN 1 END),
+                    cs.last_sync_ms, cs.last_error
+             FROM calendar_sources cs
+             LEFT JOIN calendar_events ce ON ce.source_uid = cs.source_uid
+             LEFT JOIN remembries r ON r.id = ce.remembrie_id
+             GROUP BY cs.source_uid
+             ORDER BY cs.name COLLATE NOCASE, cs.source_uid",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok(CalendarSource {
+                source_uid: row.get(0)?,
+                name: row.get(1)?,
+                enabled: row.get(2)?,
+                remembered_event_count: row.get(3)?,
+                last_sync_ms: row.get(4)?,
+                last_error: row.get(5)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn set_calendar_source_enabled(
+        &self,
+        source_uid: &str,
+        enabled: bool,
+    ) -> Result<CalendarSource, RepositoryError> {
+        let source_uid = source_uid.trim();
+        if source_uid.is_empty() {
+            return Err(RepositoryError::Validation(
+                "a calendar must be selected".to_owned(),
+            ));
+        }
+        let changed = self.connection.execute(
+            "UPDATE calendar_sources SET enabled = ?2, updated_at_ms = ?3 WHERE source_uid = ?1",
+            params![source_uid, enabled, now_ms()?],
+        )?;
+        if changed == 0 {
+            return Err(RepositoryError::Validation(
+                "the calendar was not found".to_owned(),
+            ));
+        }
+        self.list_calendar_sources()?
+            .into_iter()
+            .find(|source| source.source_uid == source_uid)
+            .ok_or_else(|| RepositoryError::Validation("the calendar was not found".to_owned()))
+    }
+
     pub fn record_calendar_error(&self, error: &str) -> Result<(), RepositoryError> {
         let safe_error: String = error.chars().take(1000).collect();
         let now = now_ms()?;
@@ -2949,10 +3019,16 @@ impl Repository {
         validate_calendar_snapshot(snapshot)?;
         let rules = self.list_capture_rules()?;
         let sync_marker = now_ms()?;
+        let disabled_sources: HashSet<String> =
+            self.disabled_calendar_source_uids()?.into_iter().collect();
         let successful_sources: HashSet<&str> = snapshot
             .sources
             .iter()
-            .filter(|source| source.error.is_none())
+            .filter(|source| {
+                source.error.is_none()
+                    && !source.skipped
+                    && !disabled_sources.contains(&source.source_uid)
+            })
             .map(|source| source.source_uid.as_str())
             .collect();
         let mut added = 0_u64;
@@ -2968,13 +3044,14 @@ impl Repository {
                  ) VALUES(?1, ?2, ?3, ?4, ?5)
                  ON CONFLICT(source_uid) DO UPDATE SET
                     name = excluded.name,
-                    last_sync_ms = excluded.last_sync_ms,
-                    last_error = excluded.last_error,
+                    last_sync_ms = COALESCE(excluded.last_sync_ms, calendar_sources.last_sync_ms),
+                    last_error = CASE WHEN ?6 THEN calendar_sources.last_error
+                                      ELSE excluded.last_error END,
                     updated_at_ms = excluded.updated_at_ms",
                 params![
                     source.source_uid.trim(),
                     source.name.trim(),
-                    if source.error.is_none() {
+                    if source.error.is_none() && !source.skipped {
                         Some(sync_marker)
                     } else {
                         None
@@ -2984,6 +3061,7 @@ impl Repository {
                         .as_deref()
                         .map(|error| truncate_owned(error, 1000)),
                     sync_marker,
+                    source.skipped,
                 ],
             )?;
         }
@@ -5882,6 +5960,7 @@ mod tests {
                 name: "Personal".to_owned(),
                 error: None,
                 event_count: events.len() as u64,
+                skipped: false,
             }],
             events,
         }
@@ -5979,6 +6058,76 @@ mod tests {
         assert_eq!(result.skipped_private, 1);
         assert_eq!(result.event_count, 0);
         assert!(repository.list_recent(10).unwrap().is_empty());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn ignored_calendar_is_not_ingested_and_existing_evidence_is_preserved() {
+        let path = temporary_database("calendar-source-control");
+        let mut repository = Repository::open(&path).unwrap();
+        repository.set_calendar_enabled(true).unwrap();
+        let generated = 1_800_000_000_000_i64;
+        let start = generated + 86_400_000;
+        repository
+            .sync_calendar_snapshot(&calendar_snapshot(
+                generated,
+                vec![calendar_event(
+                    start,
+                    "Original appointment",
+                    "Original notes",
+                )],
+            ))
+            .unwrap();
+
+        let ignored = repository
+            .set_calendar_source_enabled("local-calendar", false)
+            .unwrap();
+        assert!(!ignored.enabled);
+        assert_eq!(ignored.remembered_event_count, 1);
+        assert_eq!(
+            repository.disabled_calendar_source_uids().unwrap(),
+            vec!["local-calendar"]
+        );
+
+        let mut skipped_snapshot = calendar_snapshot(generated + 1_000, Vec::new());
+        skipped_snapshot.sources[0].skipped = true;
+        let skipped = repository
+            .sync_calendar_snapshot(&skipped_snapshot)
+            .unwrap();
+        assert_eq!(skipped.removed, 0);
+        assert_eq!(skipped.event_count, 1);
+        assert_eq!(repository.search("Original notes", 10).unwrap().len(), 1);
+
+        let blocked = repository
+            .sync_calendar_snapshot(&calendar_snapshot(
+                generated + 2_000,
+                vec![calendar_event(
+                    start,
+                    "Changed appointment",
+                    "Should not enter",
+                )],
+            ))
+            .unwrap();
+        assert_eq!(blocked.updated, 0);
+        assert!(
+            repository
+                .search("Should not enter", 10)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(repository.search("Original notes", 10).unwrap().len(), 1);
+
+        repository
+            .set_calendar_source_enabled("local-calendar", true)
+            .unwrap();
+        let resumed = repository
+            .sync_calendar_snapshot(&calendar_snapshot(
+                generated + 3_000,
+                vec![calendar_event(start, "Changed appointment", "Now allowed")],
+            ))
+            .unwrap();
+        assert_eq!(resumed.updated, 1);
+        assert_eq!(repository.search("Now allowed", 10).unwrap().len(), 1);
         let _ = fs::remove_file(path);
     }
 
@@ -6313,6 +6462,51 @@ mod tests {
         let repository = Repository::open(&path).unwrap();
         assert!(!repository.status().unwrap().notifications_enabled);
         assert!(repository.list_notification_sources().unwrap().is_empty());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn upgrades_version_thirteen_with_existing_calendars_allowed() {
+        let path = temporary_database("migration-v13-calendar-controls");
+        let connection = Connection::open(&path).unwrap();
+        for migration in [
+            MIGRATION_1,
+            MIGRATION_2,
+            MIGRATION_3,
+            MIGRATION_4,
+            MIGRATION_5,
+            MIGRATION_6,
+            MIGRATION_7,
+            MIGRATION_8,
+            MIGRATION_9,
+            MIGRATION_10,
+            MIGRATION_11,
+            MIGRATION_12,
+            MIGRATION_13,
+        ] {
+            connection.execute_batch(migration).unwrap();
+        }
+        connection
+            .execute(
+                "INSERT INTO calendar_sources(source_uid, name, updated_at_ms)
+                 VALUES('existing-calendar', 'Existing calendar', 1)",
+                [],
+            )
+            .unwrap();
+        connection.pragma_update(None, "user_version", 13).unwrap();
+        drop(connection);
+
+        let repository = Repository::open(&path).unwrap();
+        let sources = repository.list_calendar_sources().unwrap();
+        assert_eq!(sources.len(), 1);
+        assert!(sources[0].enabled);
+        assert_eq!(
+            repository
+                .connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
         let _ = fs::remove_file(path);
     }
 

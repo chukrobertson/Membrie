@@ -59,7 +59,7 @@ The project is intentionally local-first and self-hosted:
 - Evidence-aware Brie reasoning that separates scheduled plans, observed activity, copied text, and notes
 - Brie citations open the matching Timeline day, highlight the source, and show its exact evidence
 - Quick Brie compact window for local recall and note capture without leaving the current workflow
-- Opt-in read-only GNOME Calendar integration with recurring-event expansion and local reconciliation
+- Opt-in read-only GNOME Calendar integration with recurring-event expansion, local reconciliation, and per-calendar Allow/Ignore controls
 - Responsive Mobile Companion for universal paste capture, multi-file selection, direct voice notes, explicit text/image clipboard transfers, Brie, and compact recall
 - Independent Mobile Companion pairing plus a fail-closed locked-PC privacy boundary
 - One-use five-minute QR or 8-digit pairing invitations, with the reusable token retained as fallback
@@ -67,8 +67,8 @@ The project is intentionally local-first and self-hosted:
 - Coarse, local-only Companion usage totals for the last day, week, and month
 - Local model selection and visible indexing health
 
-Broader file-format understanding, per-calendar controls, meeting transcripts,
-individual device revocation, and richer cross-source corroboration are the next implementation milestones.
+Broader file-format understanding, meeting transcripts, individual device revocation,
+and richer cross-source corroboration are the next implementation milestones.
 
 ## Install on Ubuntu
 
@@ -124,7 +124,9 @@ correction alongside—never over—the machine interpretation.
 Calendar access is separately opt-in. Membrie reads enabled calendars from Ubuntu's local
 Evolution Data Server, never receives calendar-account credentials, and exposes no calendar write
 or refresh operation. A provider configured in GNOME may continue its own normal synchronization;
-Membrie only reads the resulting local calendar view.
+Membrie only reads the resulting local calendar view. After the first discovery sync, each calendar
+can be allowed or ignored independently. An ignored calendar is not read during later syncs; its
+already remembered events remain available unless the user explicitly deletes them.
 
 Membrie connects only to Ollama's fixed loopback address (`127.0.0.1`). Cloud-backed
 Ollama model names are deliberately rejected.
@@ -147,7 +149,9 @@ sees only clearly labeled, fallible text produced by local models.
 Clipboard ferrying is always explicit. Text that resembles a credential or payment card is blocked.
 On GNOME Wayland, **Fetch** can also bring a current PNG, JPEG, or WebP clipboard image to Companion
 for a temporary preview; the user then chooses whether to remember it, save it, or invoke the phone's
-share sheet. Binary clipboard content is never captured or published automatically.
+share sheet. The bridge accepts both byte representations used across supported GNOME/GJS releases
+and reports a specific problem when the clipboard is busy, times out, or contains no image. Binary
+clipboard content is never captured or published automatically.
 
 To remove the installed application while keeping every Remembrie and backup:
 
