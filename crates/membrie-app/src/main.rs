@@ -101,6 +101,7 @@ struct UiState {
     timeline_insight: gtk::Box,
     timeline_insight_content: gtk::Box,
     timeline_day_start_ms: Cell<i64>,
+    timeline_follow_today: Cell<bool>,
     timeline_map_mode: Cell<TimelineMapMode>,
     timeline_filter: Cell<TimelineFilter>,
     timeline_filter_summary: gtk::Label,
@@ -334,6 +335,7 @@ fn build_ui(application: &adw::Application) {
         timeline_insight,
         timeline_insight_content,
         timeline_day_start_ms: Cell::new(timeline_day_start_ms),
+        timeline_follow_today: Cell::new(true),
         timeline_map_mode: Cell::new(TimelineMapMode::Week),
         timeline_filter: Cell::new(TimelineFilter::All),
         timeline_filter_summary,
@@ -408,6 +410,13 @@ fn build_ui(application: &adw::Application) {
     stack.add_named(&build_search_page(&state), Some("search"));
     stack.add_named(&build_brie_page(&state, &stack), Some("brie"));
     stack.add_named(&build_privacy_page(&state), Some("privacy"));
+    let state_for_visible_page = Rc::clone(&state);
+    stack.connect_visible_child_name_notify(move |stack| {
+        if stack.visible_child_name().as_deref() == Some("timeline") {
+            *state_for_visible_page.timeline_render_key.borrow_mut() = None;
+            refresh_timeline(&state_for_visible_page);
+        }
+    });
     content.append(&build_sidebar(&stack));
     content.append(&stack);
     root.append(&content);
@@ -421,6 +430,13 @@ fn build_ui(application: &adw::Application) {
         .content(&toast_overlay)
         .build();
     window.set_widget_name("membrie-main-window");
+    let state_for_window_focus = Rc::clone(&state);
+    window.connect_is_active_notify(move |window| {
+        if window.is_active() {
+            *state_for_window_focus.timeline_render_key.borrow_mut() = None;
+            refresh_timeline(&state_for_window_focus);
+        }
+    });
 
     refresh_clipboard_bridge(&state);
     refresh_semantic_status(&state);
@@ -896,6 +912,7 @@ fn build_timeline_page(state: &Rc<UiState>) -> gtk::Widget {
     let state_for_previous = Rc::clone(state);
     previous.connect_clicked(move |_| {
         state_for_previous.timeline_target_id.borrow_mut().take();
+        state_for_previous.timeline_follow_today.set(false);
         let day = shift_timeline_period(
             state_for_previous.timeline_day_start_ms.get(),
             state_for_previous.timeline_map_mode.get(),
@@ -912,10 +929,10 @@ fn build_timeline_page(state: &Rc<UiState>) -> gtk::Widget {
         let last_upcoming_day = add_local_days(today, TIMELINE_FUTURE_DAYS);
         if selected < last_upcoming_day {
             state_for_next.timeline_target_id.borrow_mut().take();
-            state_for_next.timeline_day_start_ms.set(
-                shift_timeline_period(selected, state_for_next.timeline_map_mode.get(), 1)
-                    .min(last_upcoming_day),
-            );
+            let day = shift_timeline_period(selected, state_for_next.timeline_map_mode.get(), 1)
+                .min(last_upcoming_day);
+            state_for_next.timeline_day_start_ms.set(day);
+            state_for_next.timeline_follow_today.set(day == today);
             *state_for_next.timeline_render_key.borrow_mut() = None;
             refresh_timeline(&state_for_next);
         }
@@ -926,6 +943,7 @@ fn build_timeline_page(state: &Rc<UiState>) -> gtk::Widget {
         state_for_today
             .timeline_day_start_ms
             .set(local_today_start_ms());
+        state_for_today.timeline_follow_today.set(true);
         *state_for_today.timeline_render_key.borrow_mut() = None;
         refresh_timeline(&state_for_today);
     });
@@ -2327,6 +2345,9 @@ fn memory_list() -> gtk::ListBox {
 
 fn refresh_timeline(state: &Rc<UiState>) {
     let today = local_today_start_ms();
+    if state.timeline_follow_today.get() {
+        state.timeline_day_start_ms.set(today);
+    }
     let last_upcoming_day = add_local_days(today, TIMELINE_FUTURE_DAYS);
     let day_start = state.timeline_day_start_ms.get().min(last_upcoming_day);
     state.timeline_day_start_ms.set(day_start);
@@ -2414,42 +2435,63 @@ fn timeline_render_key(
     );
     for slice in slices {
         key.push_str(&format!(
-            ":{}:{}:{}",
-            slice.app_id, slice.started_at_ms, slice.ended_at_ms
+            ":{}:{}:{}:{}",
+            slice.app_id, slice.app_name, slice.started_at_ms, slice.ended_at_ms
         ));
     }
     for entry in entries {
         key.push_str(&format!(
-            ":{}:{}:{}",
-            entry.id, entry.started_at_ms, entry.ended_at_ms
+            ":{}:{}:{}:{}:{}:{:?}:{:?}:{:?}",
+            entry.id,
+            entry.kind,
+            entry.started_at_ms,
+            entry.ended_at_ms,
+            entry.title,
+            entry.source_app,
+            entry.window_title,
+            entry.summary,
         ));
         if let Some(activity) = &entry.activity {
             key.push_str(&format!(
-                ":{}:{}:{}",
+                ":{}:{}:{}:{}",
+                activity.end_reason,
                 activity.observation_count,
                 activity.semantic_observation_count,
                 activity.screen_observation_count
             ));
+            for observation in &activity.observations {
+                key.push_str(&format!(
+                    ":{}:{}:{}:{}",
+                    observation.observed_at_ms,
+                    observation.app_id,
+                    observation.app_name,
+                    observation.window_title
+                ));
+            }
         }
         for attachment in &entry.attachments {
             key.push_str(&format!(
-                ":{}:{}:{}",
-                attachment.content_id, attachment.blob_hash, attachment.analysis_state
+                ":{}:{}:{}:{}:{}:{}",
+                attachment.content_id,
+                attachment.original_name,
+                attachment.mime_type,
+                attachment.byte_size,
+                attachment.blob_hash,
+                attachment.analysis_state
             ));
         }
     }
     for pattern in patterns {
         key.push_str(&format!(
-            ":{}:{}:{}",
-            pattern.id,
-            pattern.detail,
-            pattern
-                .evidence
-                .iter()
-                .map(|item| item.occurred_at_ms)
-                .max()
-                .unwrap_or_default()
+            ":{}:{}:{}:{}:{}",
+            pattern.id, pattern.kind, pattern.title, pattern.detail, pattern.caution
         ));
+        for evidence in &pattern.evidence {
+            key.push_str(&format!(
+                ":{}:{}:{}",
+                evidence.remembrie_id, evidence.occurred_at_ms, evidence.label
+            ));
+        }
     }
     key
 }
@@ -2654,6 +2696,9 @@ fn timeline_map_button(
     button.connect_clicked(move |_| {
         state_for_day.timeline_target_id.borrow_mut().take();
         state_for_day.timeline_day_start_ms.set(day_start);
+        state_for_day
+            .timeline_follow_today
+            .set(day_start == local_today_start_ms());
         *state_for_day.timeline_render_key.borrow_mut() = None;
         refresh_timeline(&state_for_day);
     });
@@ -2873,6 +2918,7 @@ fn render_timeline_insights(state: &Rc<UiState>, patterns: &[EvidencePattern]) {
                 state
                     .timeline_day_start_ms
                     .set(local_day_start_ms(occurred_at_ms));
+                state.timeline_follow_today.set(false);
                 *state.timeline_target_id.borrow_mut() = Some(remembrie_id.clone());
                 *state.timeline_render_key.borrow_mut() = None;
                 refresh_timeline(&state);
@@ -4149,6 +4195,7 @@ fn append_brie_message(
                     state
                         .timeline_day_start_ms
                         .set(local_day_start_ms(citation.remembrie.occurred_at_ms));
+                    state.timeline_follow_today.set(false);
                     *state.timeline_target_id.borrow_mut() = Some(citation.remembrie.id.clone());
                     *state.timeline_render_key.borrow_mut() = None;
                     stack.set_visible_child_name("timeline");
@@ -5964,6 +6011,52 @@ mod tests {
         assert!(caution.contains("not proof"));
         assert!(caution.contains("seen"));
         assert!(caution.contains("acted"));
+    }
+
+    #[test]
+    fn timeline_refresh_key_tracks_visible_content_changes() {
+        let mut entry = TimelineEntry {
+            id: "remembrie-1".to_owned(),
+            kind: "note".to_owned(),
+            started_at_ms: 1_000,
+            ended_at_ms: 1_000,
+            source_app: Some("Membrie".to_owned()),
+            window_title: Some("Original window".to_owned()),
+            title: "Original title".to_owned(),
+            summary: None,
+            activity: None,
+            attachments: Vec::new(),
+        };
+        let original = timeline_render_key(
+            0,
+            TimelineMapMode::Day,
+            TimelineFilter::All,
+            &[],
+            &[entry.clone()],
+            &[],
+        );
+
+        entry.summary = Some("New local summary".to_owned());
+        let summarized = timeline_render_key(
+            0,
+            TimelineMapMode::Day,
+            TimelineFilter::All,
+            &[],
+            &[entry.clone()],
+            &[],
+        );
+        assert_ne!(original, summarized);
+
+        entry.title = "Updated title".to_owned();
+        let retitled = timeline_render_key(
+            0,
+            TimelineMapMode::Day,
+            TimelineFilter::All,
+            &[],
+            &[entry],
+            &[],
+        );
+        assert_ne!(summarized, retitled);
     }
 
     #[test]
