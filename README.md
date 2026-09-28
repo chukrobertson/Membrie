@@ -51,6 +51,7 @@ The project is intentionally local-first and self-hosted:
 - User-managed application exclusion rules
 - Temporary capture pauses and deletion by recent time range
 - Daily integrity-checked local backups of the database and referenced attachments, with a rolling 14-backup history
+- A Timeline storage meter for the database, local models, retained attachments, and backups, with hard-linked backup data counted once
 - Capture-service health reporting in the Privacy screen
 - Rootless Ubuntu installation, app launcher, and automatic user services
 - Restart-safe local summary and embedding jobs
@@ -67,8 +68,10 @@ The project is intentionally local-first and self-hosted:
 - Coarse, local-only Companion usage totals for the last day, week, and month
 - Local model selection and visible indexing health
 
-Broader file-format understanding, meeting transcripts, individual device revocation,
-and richer cross-source corroboration are the next implementation milestones.
+Companion device identity, recovery and retention controls, broader file-format
+understanding, cross-source corroboration, and meeting transcripts are the next
+implementation milestones. See the [development roadmap](docs/roadmap.md) for the
+ordered direction and Membrie's continuing non-goals.
 
 ## Install on Ubuntu
 

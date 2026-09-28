@@ -6,16 +6,16 @@ use membrie_core::{
     CaptureStatus, DaemonClient, EvidencePattern, IntelligenceSettings, IntelligenceStatus,
     LocalModel, NewRemembrie, NotificationSource, PauseMode, Remembrie, ScreenCaptureCandidate,
     ScreenCaptureResult, SearchHit, TimelineActivityObservation, TimelineEntry, TimelineMapSlice,
-    attachment_blob_path, attachment_inbox_dir, mobile_pairing_invitation_path,
+    attachment_blob_path, attachment_inbox_dir, data_dir, mobile_pairing_invitation_path,
     mobile_tailnet_host_path, mobile_token_path, socket_path,
 };
 use qrcode::{Color as QrColor, QrCode};
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 #[cfg(unix)]
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -106,6 +106,9 @@ struct UiState {
     timeline_filter: Cell<TimelineFilter>,
     timeline_filter_summary: gtk::Label,
     timeline_target_id: RefCell<Option<String>>,
+    storage_label: gtk::Label,
+    storage_progress: gtk::ProgressBar,
+    storage_refreshing: Cell<bool>,
     search_results: gtk::ListBox,
     capture_rules: gtk::ListBox,
     privacy_stats: gtk::Label,
@@ -200,6 +203,12 @@ fn build_ui(application: &adw::Application) {
     timeline_filter_summary.add_css_class("dim-label");
     timeline_filter_summary.set_xalign(0.0);
     timeline_filter_summary.set_hexpand(true);
+    let storage_label = gtk::Label::new(Some("Measuring Membrie storage…"));
+    storage_label.set_xalign(1.0);
+    storage_label.set_wrap(true);
+    let storage_progress = gtk::ProgressBar::new();
+    storage_progress.set_show_text(true);
+    storage_progress.set_text(Some("Measuring…"));
     let search_results = memory_list();
     let capture_rules = memory_list();
     let privacy_stats = gtk::Label::new(None);
@@ -340,6 +349,9 @@ fn build_ui(application: &adw::Application) {
         timeline_filter: Cell::new(TimelineFilter::All),
         timeline_filter_summary,
         timeline_target_id: RefCell::new(None),
+        storage_label,
+        storage_progress,
+        storage_refreshing: Cell::new(false),
         search_results,
         capture_rules,
         privacy_stats,
@@ -415,6 +427,7 @@ fn build_ui(application: &adw::Application) {
         if stack.visible_child_name().as_deref() == Some("timeline") {
             *state_for_visible_page.timeline_render_key.borrow_mut() = None;
             refresh_timeline(&state_for_visible_page);
+            begin_storage_refresh(&state_for_visible_page);
         }
     });
     content.append(&build_sidebar(&stack));
@@ -443,6 +456,7 @@ fn build_ui(application: &adw::Application) {
     refresh_status(&state);
     refresh_backups(&state);
     refresh_timeline(&state);
+    begin_storage_refresh(&state);
     refresh_capture_rules(&state);
     refresh_notification_sources(&state);
     refresh_calendar_sources(&state);
@@ -466,6 +480,11 @@ fn build_ui(application: &adw::Application) {
     let state_for_intelligence = Rc::clone(&state);
     gtk::glib::timeout_add_seconds_local(5, move || {
         refresh_intelligence(&state_for_intelligence);
+        gtk::glib::ControlFlow::Continue
+    });
+    let state_for_storage = Rc::clone(&state);
+    gtk::glib::timeout_add_seconds_local(60, move || {
+        begin_storage_refresh(&state_for_storage);
         gtk::glib::ControlFlow::Continue
     });
     window.present();
@@ -960,6 +979,7 @@ fn build_timeline_page(state: &Rc<UiState>) -> gtk::Widget {
         state_for_refresh.timeline_follow_today.set(true);
         *state_for_refresh.timeline_render_key.borrow_mut() = None;
         refresh_timeline(&state_for_refresh);
+        begin_storage_refresh(&state_for_refresh);
         toast(&state_for_refresh, "Timeline refreshed · showing today");
     });
     day_navigation.append(&previous);
@@ -968,6 +988,27 @@ fn build_timeline_page(state: &Rc<UiState>) -> gtk::Widget {
     day_navigation.append(&state.timeline_next_button);
     day_navigation.append(&refresh_button);
     page.append(&day_navigation);
+
+    let storage_section = gtk::Box::new(Orientation::Vertical, 7);
+    storage_section.add_css_class("timeline-section");
+    let storage_top = gtk::Box::new(Orientation::Horizontal, 10);
+    let storage_heading = gtk::Label::new(Some("Local storage"));
+    storage_heading.add_css_class("heading");
+    storage_heading.set_xalign(0.0);
+    storage_heading.set_hexpand(true);
+    storage_top.append(&storage_heading);
+    storage_top.append(&state.storage_label);
+    let storage_detail = gtk::Label::new(Some(
+        "Database, local models, retained attachments, and verified backups · hard-linked backup data is counted once.",
+    ));
+    storage_detail.add_css_class("caption");
+    storage_detail.add_css_class("dim-label");
+    storage_detail.set_xalign(0.0);
+    storage_detail.set_wrap(true);
+    storage_section.append(&storage_top);
+    storage_section.append(&state.storage_progress);
+    storage_section.append(&storage_detail);
+    page.append(&storage_section);
 
     let history_section = gtk::Box::new(Orientation::Vertical, 8);
     history_section.add_css_class("timeline-section");
@@ -2433,6 +2474,141 @@ fn refresh_timeline(state: &Rc<UiState>) {
                 &error.to_string(),
             );
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct StorageSnapshot {
+    used_bytes: u64,
+    total_bytes: u64,
+    available_bytes: u64,
+}
+
+fn begin_storage_refresh(state: &Rc<UiState>) {
+    if state.storage_refreshing.replace(true) {
+        return;
+    }
+    let root = data_dir();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = sender.send(measure_storage(&root));
+    });
+    let state = Rc::clone(state);
+    gtk::glib::timeout_add_local(Duration::from_millis(100), move || {
+        match receiver.try_recv() {
+            Ok(Ok(storage)) => {
+                state.storage_refreshing.set(false);
+                apply_storage_ui(&state, storage);
+                gtk::glib::ControlFlow::Break
+            }
+            Ok(Err(error)) => {
+                state.storage_refreshing.set(false);
+                state
+                    .storage_label
+                    .set_text("Storage measurement unavailable");
+                state.storage_progress.set_fraction(0.0);
+                state.storage_progress.set_text(Some("Could not measure"));
+                state.storage_progress.set_tooltip_text(Some(&error));
+                gtk::glib::ControlFlow::Break
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                state.storage_refreshing.set(false);
+                state
+                    .storage_label
+                    .set_text("Storage measurement unavailable");
+                state.storage_progress.set_fraction(0.0);
+                state.storage_progress.set_text(Some("Measurement stopped"));
+                gtk::glib::ControlFlow::Break
+            }
+        }
+    });
+}
+
+fn measure_storage(root: &Path) -> Result<StorageSnapshot, String> {
+    let used_bytes = allocated_data_bytes(root)
+        .map_err(|error| format!("Could not read Membrie's data directory: {error}"))?;
+    let file = gtk::gio::File::for_path(root);
+    let info = file
+        .query_filesystem_info(
+            "filesystem::size,filesystem::free",
+            None::<&gtk::gio::Cancellable>,
+        )
+        .map_err(|error| format!("Could not read filesystem capacity: {error}"))?;
+    let total_bytes = info.attribute_uint64("filesystem::size");
+    let available_bytes = info.attribute_uint64("filesystem::free");
+    if total_bytes == 0 {
+        return Err("The filesystem did not report its capacity".to_owned());
+    }
+    Ok(StorageSnapshot {
+        used_bytes,
+        total_bytes,
+        available_bytes,
+    })
+}
+
+fn allocated_data_bytes(root: &Path) -> std::io::Result<u64> {
+    fn visit(
+        path: &Path,
+        seen_files: &mut HashSet<(u64, u64)>,
+        total: &mut u64,
+    ) -> std::io::Result<()> {
+        let metadata = match fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        if metadata.file_type().is_symlink() {
+            return Ok(());
+        }
+        if metadata.is_file() {
+            if seen_files.insert((metadata.dev(), metadata.ino())) {
+                *total = total.saturating_add(metadata.blocks().saturating_mul(512));
+            }
+            return Ok(());
+        }
+        if metadata.is_dir() {
+            for entry in fs::read_dir(path)? {
+                visit(&entry?.path(), seen_files, total)?;
+            }
+        }
+        Ok(())
+    }
+
+    let mut seen_files = HashSet::new();
+    let mut total = 0_u64;
+    visit(root, &mut seen_files, &mut total)?;
+    Ok(total)
+}
+
+fn apply_storage_ui(state: &UiState, storage: StorageSnapshot) {
+    let share = storage.used_bytes as f64 / storage.total_bytes as f64;
+    let percent = storage_percent_text(share);
+    state.storage_label.set_text(&format!(
+        "{} used · {} available",
+        format_file_size(storage.used_bytes),
+        format_file_size(storage.available_bytes)
+    ));
+    state.storage_progress.set_fraction(share.clamp(0.0, 1.0));
+    state
+        .storage_progress
+        .set_text(Some(&format!("Membrie data uses {percent} of this disk")));
+    state.storage_progress.set_tooltip_text(Some(&format!(
+        "Membrie data: {} · Disk capacity: {} · Data directory: {}",
+        format_file_size(storage.used_bytes),
+        format_file_size(storage.total_bytes),
+        data_dir().display()
+    )));
+}
+
+fn storage_percent_text(share: f64) -> String {
+    let percent = (share * 100.0).max(0.0);
+    if percent > 0.0 && percent < 0.01 {
+        "<0.01%".to_owned()
+    } else if percent < 1.0 {
+        format!("{percent:.2}%")
+    } else {
+        format!("{percent:.1}%")
     }
 }
 
@@ -5804,7 +5980,13 @@ fn format_timestamp(timestamp_ms: i64) -> String {
 fn format_file_size(size_bytes: u64) -> String {
     const KIB: f64 = 1024.0;
     const MIB: f64 = 1024.0 * KIB;
-    if size_bytes >= MIB as u64 {
+    const GIB: f64 = 1024.0 * MIB;
+    const TIB: f64 = 1024.0 * GIB;
+    if size_bytes >= TIB as u64 {
+        format!("{:.1} TiB", size_bytes as f64 / TIB)
+    } else if size_bytes >= GIB as u64 {
+        format!("{:.1} GiB", size_bytes as f64 / GIB)
+    } else if size_bytes >= MIB as u64 {
         format!("{:.1} MiB", size_bytes as f64 / MIB)
     } else if size_bytes >= KIB as u64 {
         format!("{:.1} KiB", size_bytes as f64 / KIB)
@@ -6088,6 +6270,33 @@ mod tests {
         fs::write(&image, b"0000ftypheicprivate").unwrap();
         assert_eq!(desktop_attachment_mime(&audio).unwrap(), "audio/mp4");
         assert_eq!(desktop_attachment_mime(&image).unwrap(), "image/heic");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn storage_percentage_stays_readable_at_small_sizes() {
+        assert_eq!(storage_percent_text(0.0), "0.00%");
+        assert_eq!(storage_percent_text(0.000_001), "<0.01%");
+        assert_eq!(storage_percent_text(0.004_321), "0.43%");
+        assert_eq!(storage_percent_text(0.123_45), "12.3%");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn storage_measurement_counts_hard_linked_data_once() {
+        let directory = std::env::temp_dir().join(format!(
+            "membrie-storage-measurement-{}",
+            random_attachment_id().unwrap()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let original = directory.join("attachment.bin");
+        let backup = directory.join("backup.bin");
+        fs::write(&original, vec![0x5a; 8_192]).unwrap();
+        fs::hard_link(&original, &backup).unwrap();
+
+        let expected = fs::metadata(&original).unwrap().blocks() * 512;
+        assert_eq!(allocated_data_bytes(&directory).unwrap(), expected);
+
         fs::remove_dir_all(directory).unwrap();
     }
 }
