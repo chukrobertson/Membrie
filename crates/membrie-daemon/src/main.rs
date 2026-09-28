@@ -201,6 +201,9 @@ fn dispatch_database(request: Request, repository: &Mutex<Repository>) -> Result
         Request::Capture { candidate } => Ok(Response::CaptureResult {
             decision: repository.capture(candidate)?,
         }),
+        Request::CaptureNotification { candidate } => Ok(Response::CaptureResult {
+            decision: repository.capture_notification(candidate)?,
+        }),
         Request::ListRecent { limit } => Ok(Response::Remembries {
             remembries: repository.list_recent(limit)?,
         }),
@@ -248,9 +251,17 @@ fn dispatch_database(request: Request, repository: &Mutex<Repository>) -> Result
         Request::SetSemanticEnabled { enabled } => Ok(Response::CaptureSourceUpdated {
             status: with_capture_health(repository.set_semantic_enabled(enabled)?),
         }),
-        Request::SetMailNotificationsEnabled { enabled } => Ok(Response::CaptureSourceUpdated {
-            status: with_capture_health(repository.set_mail_notifications_enabled(enabled)?),
+        Request::SetNotificationsEnabled { enabled } => Ok(Response::CaptureSourceUpdated {
+            status: with_capture_health(repository.set_notifications_enabled(enabled)?),
         }),
+        Request::ListNotificationSources => Ok(Response::NotificationSources {
+            sources: repository.list_notification_sources()?,
+        }),
+        Request::SetNotificationSourceEnabled { app_id, enabled } => {
+            Ok(Response::NotificationSourceUpdated {
+                source: repository.set_notification_source_enabled(&app_id, enabled)?,
+            })
+        }
         Request::SetSemanticSampleInterval { sample_interval_ms } => {
             Ok(Response::CaptureSourceUpdated {
                 status: with_capture_health(

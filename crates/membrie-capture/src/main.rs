@@ -3,7 +3,8 @@ use gdk_pixbuf::prelude::*;
 use membrie_a11y::{WindowTarget, inspect_target_window};
 use membrie_core::{
     ActivitySnapshot, CaptureCandidate, CaptureDecision, CaptureStatus, DaemonClient,
-    ScreenCaptureCandidate, SemanticCaptureCandidate, screen_spool_dir, socket_path,
+    NotificationCaptureCandidate, ScreenCaptureCandidate, SemanticCaptureCandidate,
+    screen_spool_dir, socket_path,
 };
 use std::collections::HashMap;
 use std::fs;
@@ -98,7 +99,7 @@ fn main() -> Result<()> {
                 &semantic_sampler_for_signals,
                 &semantic_busy_for_signals,
             ),
-            "MailNotification" => capture_mail_notification(&client_for_signals, parameters),
+            "NotificationReceived" => capture_notification(&client_for_signals, parameters),
             _ => {}
         },
     );
@@ -622,22 +623,18 @@ fn current_time_ms() -> i64 {
         .unwrap_or(0)
 }
 
-fn capture_mail_notification(client: &DaemonClient, parameters: &glib::Variant) {
-    let Ok((app_id, app_name, title, notification_body)) =
-        parameters.try_get::<(String, String, String, String)>()
+fn capture_notification(client: &DaemonClient, parameters: &glib::Variant) {
+    let Ok((app_id, app_name, title, notification_body, transient)) =
+        parameters.try_get::<(String, String, String, String, bool)>()
     else {
-        eprintln!("Desktop bridge sent invalid mail-notification metadata");
+        eprintln!("Desktop bridge sent invalid notification metadata");
         return;
     };
-    let identity = format!("{app_id}\n{app_name}").to_ascii_lowercase();
-    if !identity.contains("thunderbird") {
-        return;
-    }
     match client.status() {
-        Ok(status) if status.mail_notifications_enabled && !status.paused => {}
+        Ok(status) if status.notifications_enabled && !status.paused => {}
         Ok(_) => return,
         Err(error) => {
-            eprintln!("Could not check whether mail capture is enabled: {error}");
+            eprintln!("Could not check whether Notification Memory is enabled: {error}");
             return;
         }
     }
@@ -646,46 +643,25 @@ fn capture_mail_notification(client: &DaemonClient, parameters: &glib::Variant) 
     if title.is_empty() && notification_body.is_empty() {
         return;
     }
-    let display_subject = if !title.is_empty() {
-        title.as_str()
-    } else {
-        notification_body.as_str()
-    };
-    let mut body = "Thunderbird reported a local new-mail notification.".to_owned();
-    if !title.is_empty() {
-        body.push_str("\nNotification title: ");
-        body.push_str(&title);
-    }
-    if !notification_body.is_empty() {
-        body.push_str("\nNotification text: ");
-        body.push_str(&notification_body);
-    }
-    body.push_str(
-        "\nEvidence boundary: this supports that Thunderbird presented a new-mail notification. It does not prove the message was opened, read, answered, or acted upon.",
-    );
-    let candidate = CaptureCandidate {
-        kind: "mail_arrival".to_owned(),
-        title: format!(
-            "New email · {}",
-            bounded_notification_text(display_subject, 120)
-        ),
-        body,
-        source_app: Some("Thunderbird".to_owned()),
-        window_title: Some("New mail notification".to_owned()),
-        source_uri: None,
+    let candidate = NotificationCaptureCandidate {
+        app_id,
+        app_name,
+        title,
+        body: notification_body,
+        transient,
         occurred_at_ms: Some(current_time_ms()),
     };
     let client = client.clone();
-    std::thread::spawn(move || match client.capture(candidate) {
+    std::thread::spawn(move || match client.capture_notification(candidate) {
         Ok(CaptureDecision::Stored { remembrie }) => {
-            println!("Remembered Thunderbird mail arrival {}", remembrie.id);
+            println!("Remembered desktop notification {}", remembrie.id);
         }
         Ok(CaptureDecision::Skipped {
             category, reason, ..
         }) => {
-            println!("Skipped Thunderbird mail arrival ({category}): {reason}");
+            println!("Skipped desktop notification ({category}): {reason}");
         }
-        Err(error) => eprintln!("Thunderbird mail arrival capture failed: {error}"),
+        Err(error) => eprintln!("Desktop notification capture failed: {error}"),
     });
 }
 
@@ -833,7 +809,7 @@ mod tests {
     }
 
     #[test]
-    fn mail_notification_text_is_normalized_and_bounded() {
+    fn notification_text_is_normalized_and_bounded() {
         assert_eq!(
             bounded_notification_text("  Duke\n  care   update  ", 100),
             "Duke care update"

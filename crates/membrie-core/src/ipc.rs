@@ -2,9 +2,9 @@ use crate::model::{
     ActivityRecordResult, ActivitySnapshot, Attachment, AttachmentBatchImport, AttachmentImport,
     BackupInfo, BrieAnswer, CalendarSyncResult, CaptureCandidate, CaptureDecision, CaptureRule,
     CaptureStatus, EvidencePattern, IntelligenceSettings, IntelligenceStatus, MobileUsageSummary,
-    NewRemembrie, PauseMode, RecallSnapshot, Remembrie, ScreenCaptureCandidate,
-    ScreenCaptureResult, SearchHit, SemanticCaptureCandidate, SemanticCaptureResult, TimelineEntry,
-    TimelineHistorySpan, TimelineMapSlice,
+    NewRemembrie, NotificationCaptureCandidate, NotificationSource, PauseMode, RecallSnapshot,
+    Remembrie, ScreenCaptureCandidate, ScreenCaptureResult, SearchHit, SemanticCaptureCandidate,
+    SemanticCaptureResult, TimelineEntry, TimelineHistorySpan, TimelineMapSlice,
 };
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -46,6 +46,9 @@ pub enum Request {
     },
     Capture {
         candidate: CaptureCandidate,
+    },
+    CaptureNotification {
+        candidate: NotificationCaptureCandidate,
     },
     ListRecent {
         limit: u32,
@@ -93,7 +96,12 @@ pub enum Request {
     SetSemanticEnabled {
         enabled: bool,
     },
-    SetMailNotificationsEnabled {
+    SetNotificationsEnabled {
+        enabled: bool,
+    },
+    ListNotificationSources,
+    SetNotificationSourceEnabled {
+        app_id: String,
         enabled: bool,
     },
     SetSemanticSampleInterval {
@@ -191,6 +199,12 @@ pub enum Response {
     },
     CaptureResult {
         decision: CaptureDecision,
+    },
+    NotificationSources {
+        sources: Vec<NotificationSource>,
+    },
+    NotificationSourceUpdated {
+        source: NotificationSource,
     },
     Remembries {
         remembries: Vec<Remembrie>,
@@ -475,6 +489,18 @@ impl DaemonClient {
         }
     }
 
+    pub fn capture_notification(
+        &self,
+        candidate: NotificationCaptureCandidate,
+    ) -> Result<CaptureDecision, ClientError> {
+        match self.request(&Request::CaptureNotification { candidate })? {
+            Response::CaptureResult { decision } => Ok(decision),
+            other => Err(ClientError::Rejected(format!(
+                "unexpected response: {other:?}"
+            ))),
+        }
+    }
+
     pub fn list_recent(&self, limit: u32) -> Result<Vec<Remembrie>, ClientError> {
         match self.request(&Request::ListRecent { limit })? {
             Response::Remembries { remembries } => Ok(remembries),
@@ -633,12 +659,34 @@ impl DaemonClient {
         }
     }
 
-    pub fn set_mail_notifications_enabled(
-        &self,
-        enabled: bool,
-    ) -> Result<CaptureStatus, ClientError> {
-        match self.request(&Request::SetMailNotificationsEnabled { enabled })? {
+    pub fn set_notifications_enabled(&self, enabled: bool) -> Result<CaptureStatus, ClientError> {
+        match self.request(&Request::SetNotificationsEnabled { enabled })? {
             Response::CaptureSourceUpdated { status } => Ok(status),
+            other => Err(ClientError::Rejected(format!(
+                "unexpected response: {other:?}"
+            ))),
+        }
+    }
+
+    pub fn list_notification_sources(&self) -> Result<Vec<NotificationSource>, ClientError> {
+        match self.request(&Request::ListNotificationSources)? {
+            Response::NotificationSources { sources } => Ok(sources),
+            other => Err(ClientError::Rejected(format!(
+                "unexpected response: {other:?}"
+            ))),
+        }
+    }
+
+    pub fn set_notification_source_enabled(
+        &self,
+        app_id: impl Into<String>,
+        enabled: bool,
+    ) -> Result<NotificationSource, ClientError> {
+        match self.request(&Request::SetNotificationSourceEnabled {
+            app_id: app_id.into(),
+            enabled,
+        })? {
+            Response::NotificationSourceUpdated { source } => Ok(source),
             other => Err(ClientError::Rejected(format!(
                 "unexpected response: {other:?}"
             ))),

@@ -3,13 +3,16 @@ use crate::model::{
     AttachmentProcessingJob, AudioTranscription, CalendarEventSnapshot, CalendarSnapshot,
     CalendarSyncResult, CaptureCandidate, CaptureDecision, CaptureRule, CaptureStatus,
     EmbeddedChunk, EvidencePattern, IntelligenceSettings, IntelligenceStatus, LocalModel,
-    MobileUsageSummary, NewRemembrie, PatternEvidence, PauseMode, ProcessingJob, RecallSnapshot,
-    Remembrie, ScreenAnalysis, ScreenCaptureCandidate, ScreenCaptureResult, SearchHit,
-    SemanticCaptureCandidate, SemanticCaptureResult, StagedAttachmentImport,
-    TimelineActivityObservation, TimelineActivitySummary, TimelineEntry, TimelineHistorySpan,
-    TimelineMapSlice,
+    MobileUsageSummary, NewRemembrie, NotificationCaptureCandidate, NotificationSource,
+    PatternEvidence, PauseMode, ProcessingJob, RecallSnapshot, Remembrie, ScreenAnalysis,
+    ScreenCaptureCandidate, ScreenCaptureResult, SearchHit, SemanticCaptureCandidate,
+    SemanticCaptureResult, StagedAttachmentImport, TimelineActivityObservation,
+    TimelineActivitySummary, TimelineEntry, TimelineHistorySpan, TimelineMapSlice,
 };
-use crate::policy::{MAX_AUTOMATIC_CONTENT_BYTES, exclusion_reason, sensitive_reason};
+use crate::policy::{
+    MAX_AUTOMATIC_CONTENT_BYTES, exclusion_reason, is_noisy_progress_notification,
+    notification_sensitive_reason, protected_notification_source, sensitive_reason,
+};
 use rusqlite::{Connection, DatabaseName, OptionalExtension, Row, Transaction, params};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
@@ -20,7 +23,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use uuid::Uuid;
 
-const SCHEMA_VERSION: i64 = 12;
+const SCHEMA_VERSION: i64 = 13;
 const DUPLICATE_WINDOW_MS: i64 = 24 * 60 * 60 * 1000;
 const MIN_SEMANTIC_SIMILARITY: f64 = 0.25;
 const SEMANTIC_SCORE_WINDOW: f64 = 0.20;
@@ -446,6 +449,25 @@ ALTER TABLE capture_state ADD COLUMN mail_notifications_enabled INTEGER NOT NULL
     CHECK(mail_notifications_enabled IN (0, 1));
 "#;
 
+const MIGRATION_13: &str = r#"
+ALTER TABLE capture_state ADD COLUMN notifications_enabled INTEGER NOT NULL DEFAULT 0
+    CHECK(notifications_enabled IN (0, 1));
+
+CREATE TABLE IF NOT EXISTS notification_sources (
+    app_id              TEXT PRIMARY KEY NOT NULL,
+    app_name            TEXT NOT NULL,
+    enabled             INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0, 1)),
+    protection_reason   TEXT,
+    seen_count          INTEGER NOT NULL DEFAULT 0,
+    stored_count        INTEGER NOT NULL DEFAULT 0,
+    last_seen_at_ms     INTEGER NOT NULL,
+    updated_at_ms       INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_notification_sources_last_seen
+    ON notification_sources(last_seen_at_ms DESC);
+"#;
+
 #[derive(Debug, Error)]
 pub enum RepositoryError {
     #[error("database error: {0}")]
@@ -602,6 +624,13 @@ impl Repository {
         if version < 12 {
             let transaction = connection.unchecked_transaction()?;
             transaction.execute_batch(MIGRATION_12)?;
+            transaction.pragma_update(None, "user_version", 12)?;
+            transaction.commit()?;
+            version = 12;
+        }
+        if version < 13 {
+            let transaction = connection.unchecked_transaction()?;
+            transaction.execute_batch(MIGRATION_13)?;
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             transaction.commit()?;
         }
@@ -1261,6 +1290,217 @@ impl Repository {
         Ok(CaptureDecision::Stored { remembrie })
     }
 
+    pub fn capture_notification(
+        &mut self,
+        candidate: NotificationCaptureCandidate,
+    ) -> Result<CaptureDecision, RepositoryError> {
+        let app_id = candidate.app_id.trim();
+        let app_name = candidate.app_name.trim();
+        let title = candidate.title.trim();
+        let body = candidate.body.trim();
+        if app_id.is_empty() && app_name.is_empty() {
+            return Err(RepositoryError::Validation(
+                "a notification needs a local application identity".to_owned(),
+            ));
+        }
+        if app_id.chars().count() > 300
+            || app_name.chars().count() > 300
+            || title.chars().count() > 1_000
+            || body.chars().count() > 4_000
+        {
+            return Err(RepositoryError::Validation(
+                "notification metadata exceeded the bounded safety limit".to_owned(),
+            ));
+        }
+        let notifications_enabled = self.connection.query_row(
+            "SELECT notifications_enabled FROM capture_state WHERE singleton = 1",
+            [],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !notifications_enabled {
+            return self.skip_capture(
+                "notification",
+                "source_disabled",
+                "Notification Memory has not been enabled",
+                now_ms()?,
+            );
+        }
+
+        let source_id = if app_id.is_empty() { app_name } else { app_id };
+        let display_name = if app_name.is_empty() {
+            source_id
+        } else {
+            app_name
+        };
+        let now = now_ms()?;
+        let protection_reason = protected_notification_source(app_id, app_name);
+        self.connection.execute(
+            "INSERT INTO notification_sources(
+                app_id, app_name, enabled, protection_reason, seen_count,
+                stored_count, last_seen_at_ms, updated_at_ms
+             ) VALUES(?1, ?2, ?3, ?4, 1, 0, ?5, ?5)
+             ON CONFLICT(app_id) DO UPDATE SET
+                app_name = excluded.app_name,
+                enabled = CASE WHEN excluded.protection_reason IS NOT NULL
+                               THEN 0 ELSE notification_sources.enabled END,
+                protection_reason = excluded.protection_reason,
+                seen_count = notification_sources.seen_count + 1,
+                last_seen_at_ms = excluded.last_seen_at_ms,
+                updated_at_ms = excluded.updated_at_ms",
+            params![
+                source_id,
+                display_name,
+                protection_reason.is_none(),
+                protection_reason,
+                now
+            ],
+        )?;
+        if let Some(reason) = protection_reason {
+            return self.skip_capture("notification", "sensitive", reason, now);
+        }
+        let source_enabled = self.connection.query_row(
+            "SELECT enabled FROM notification_sources WHERE app_id = ?1",
+            [source_id],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !source_enabled {
+            return self.skip_capture(
+                "notification",
+                "source_disabled",
+                "Notifications from this application are blocked",
+                now,
+            );
+        }
+        if let Some(reason) = notification_sensitive_reason(title, body) {
+            return self.skip_capture(
+                "notification",
+                "sensitive",
+                &format!("Skipped probable {reason}"),
+                now,
+            );
+        }
+        if is_noisy_progress_notification(title, body, candidate.transient) {
+            return self.skip_capture(
+                "notification",
+                "transient_progress",
+                "Skipped a transient progress update",
+                now,
+            );
+        }
+        if title.is_empty() && body.is_empty() {
+            return self.skip_capture(
+                "notification",
+                "empty",
+                "The notification had no readable text",
+                now,
+            );
+        }
+
+        let is_thunderbird = format!("{app_id}\n{app_name}")
+            .to_ascii_lowercase()
+            .contains("thunderbird");
+        let subject = if title.is_empty() { body } else { title };
+        let mut evidence = format!("{display_name} presented a local desktop notification.");
+        if !title.is_empty() {
+            evidence.push_str("\nNotification title: ");
+            evidence.push_str(title);
+        }
+        if !body.is_empty() {
+            evidence.push_str("\nNotification text: ");
+            evidence.push_str(body);
+        }
+        evidence.push_str(if is_thunderbird {
+            "\nEvidence boundary: this supports only that Thunderbird presented a local notification. It does not prove the message was opened, read, answered, or acted upon."
+        } else {
+            "\nEvidence boundary: this supports only that the application presented a local notification. It does not prove the user saw, opened, or acted on it."
+        });
+        let decision = self.capture(CaptureCandidate {
+            kind: "notification".to_owned(),
+            title: format!(
+                "{display_name} · {}",
+                subject.chars().take(120).collect::<String>()
+            ),
+            body: evidence,
+            source_app: Some(format!("{display_name} ({source_id})")),
+            window_title: Some("Desktop notification".to_owned()),
+            source_uri: None,
+            occurred_at_ms: candidate.occurred_at_ms,
+        })?;
+        if matches!(decision, CaptureDecision::Stored { .. }) {
+            self.connection.execute(
+                "UPDATE notification_sources
+                 SET stored_count = stored_count + 1, updated_at_ms = ?2
+                 WHERE app_id = ?1",
+                params![source_id, now],
+            )?;
+        }
+        Ok(decision)
+    }
+
+    pub fn list_notification_sources(&self) -> Result<Vec<NotificationSource>, RepositoryError> {
+        let mut statement = self.connection.prepare(
+            "SELECT app_id, app_name, enabled, protection_reason, seen_count,
+                    stored_count, last_seen_at_ms
+             FROM notification_sources
+             ORDER BY last_seen_at_ms DESC, app_name COLLATE NOCASE",
+        )?;
+        let rows = statement.query_map([], |row| {
+            let protection_reason = row.get::<_, Option<String>>(3)?;
+            Ok(NotificationSource {
+                app_id: row.get(0)?,
+                app_name: row.get(1)?,
+                enabled: row.get(2)?,
+                protected: protection_reason.is_some(),
+                protection_reason,
+                seen_count: row.get(4)?,
+                stored_count: row.get(5)?,
+                last_seen_at_ms: row.get(6)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn set_notification_source_enabled(
+        &self,
+        app_id: &str,
+        enabled: bool,
+    ) -> Result<NotificationSource, RepositoryError> {
+        let app_id = app_id.trim();
+        if app_id.is_empty() {
+            return Err(RepositoryError::Validation(
+                "a notification application must be selected".to_owned(),
+            ));
+        }
+        let protected = self
+            .connection
+            .query_row(
+                "SELECT protection_reason IS NOT NULL FROM notification_sources WHERE app_id = ?1",
+                [app_id],
+                |row| row.get::<_, bool>(0),
+            )
+            .optional()?;
+        let Some(protected) = protected else {
+            return Err(RepositoryError::Validation(
+                "the notification application was not found".to_owned(),
+            ));
+        };
+        if protected && enabled {
+            return Err(RepositoryError::Validation(
+                "password-manager notifications are always protected".to_owned(),
+            ));
+        }
+        self.connection.execute(
+            "UPDATE notification_sources SET enabled = ?2, updated_at_ms = ?3 WHERE app_id = ?1",
+            params![app_id, enabled, now_ms()?],
+        )?;
+        self.list_notification_sources()?
+            .into_iter()
+            .find(|source| source.app_id == app_id)
+            .ok_or_else(|| {
+                RepositoryError::Validation("notification application was not found".to_owned())
+            })
+    }
+
     pub fn get(&self, id: &str) -> Result<Option<Remembrie>, RepositoryError> {
         self.connection
             .query_row(
@@ -1522,9 +1762,7 @@ impl Repository {
 
         let mut patterns = repeated_context_patterns(&observations, start_ms, end_ms);
         patterns.extend(resumed_context_patterns(&observations, start_ms, end_ms));
-        if let Some(mail_pattern) = self.mail_arrival_pattern(start_ms, end_ms)? {
-            patterns.push(mail_pattern);
-        }
+        patterns.extend(self.notification_patterns(start_ms, end_ms)?);
         patterns.sort_by(|left, right| {
             pattern_priority(&right.kind)
                 .cmp(&pattern_priority(&left.kind))
@@ -1542,44 +1780,59 @@ impl Repository {
         Ok(patterns)
     }
 
-    fn mail_arrival_pattern(
+    fn notification_patterns(
         &self,
         start_ms: i64,
         end_ms: i64,
-    ) -> Result<Option<EvidencePattern>, RepositoryError> {
-        let records = {
+    ) -> Result<Vec<EvidencePattern>, RepositoryError> {
+        let records: Vec<(String, PatternEvidence)> = {
             let mut statement = self.connection.prepare(
-                "SELECT id, occurred_at_ms, title
+                "SELECT COALESCE(source_app, 'Unknown application'), id, occurred_at_ms, title
                  FROM remembries
-                 WHERE deleted_at_ms IS NULL AND kind = 'mail_arrival'
+                 WHERE deleted_at_ms IS NULL AND kind IN ('notification', 'mail_arrival')
                    AND occurred_at_ms >= ?1 AND occurred_at_ms < ?2
                  ORDER BY occurred_at_ms
-                 LIMIT 100",
+                 LIMIT 500",
             )?;
             let rows = statement.query_map(params![start_ms, end_ms], |row| {
-                Ok(PatternEvidence {
-                    remembrie_id: row.get(0)?,
-                    occurred_at_ms: row.get(1)?,
-                    label: row.get(2)?,
-                })
+                Ok((
+                    row.get(0)?,
+                    PatternEvidence {
+                        remembrie_id: row.get(1)?,
+                        occurred_at_ms: row.get(2)?,
+                        label: row.get(3)?,
+                    },
+                ))
             })?;
             rows.collect::<Result<Vec<_>, _>>()?
         };
-        if records.len() < 2 {
-            return Ok(None);
+        let mut by_source: HashMap<String, Vec<PatternEvidence>> = HashMap::new();
+        for (source, evidence) in records {
+            by_source.entry(source).or_default().push(evidence);
         }
-        let count = records.len();
-        Ok(Some(EvidencePattern {
-            id: pattern_id("mail-arrivals", &format!("{start_ms}:{end_ms}")),
-            kind: "mail_arrivals".to_owned(),
-            title: "New mail arrived in a cluster".to_owned(),
-            detail: format!(
-                "Thunderbird reported {count} new-mail notifications during this period."
-            ),
-            caution: "Arrival notifications do not prove that any message was opened, read, answered, or acted upon."
+        let mut patterns = Vec::new();
+        for (source, records) in by_source {
+            let is_thunderbird = source.to_ascii_lowercase().contains("thunderbird");
+            let minimum = if is_thunderbird { 2 } else { 3 };
+            if records.len() < minimum {
+                continue;
+            }
+            let count = records.len();
+            patterns.push(EvidencePattern {
+                id: pattern_id("notifications", &format!("{source}:{start_ms}:{end_ms}")),
+                kind: "notifications".to_owned(),
+                title: format!("{source} presented notifications in a cluster"),
+                detail: format!("{source} presented {count} local notifications during this period."),
+                caution: if is_thunderbird {
+                    "Notification arrival does not prove that any message was opened, read, answered, or acted upon."
+                } else {
+                    "A notification appearing does not prove that it was seen, opened, or acted upon."
+                }
                 .to_owned(),
-            evidence: records.into_iter().rev().take(5).collect(),
-        }))
+                evidence: records.into_iter().rev().take(5).collect(),
+            });
+        }
+        Ok(patterns)
     }
 
     fn timeline_activity_summary(
@@ -2440,13 +2693,13 @@ impl Repository {
             activity_idle_threshold_ms,
             semantic_enabled,
             semantic_sample_interval_ms,
-            mail_notifications_enabled,
+            notifications_enabled,
             screen_enabled,
             screen_sample_interval_ms,
             screen_model,
         ) = self.connection.query_row(
             "SELECT clipboard_enabled, activity_enabled, activity_idle_threshold_ms,
-                        semantic_enabled, semantic_sample_interval_ms, mail_notifications_enabled,
+                        semantic_enabled, semantic_sample_interval_ms, notifications_enabled,
                         screen_enabled, screen_sample_interval_ms, screen_model
                  FROM capture_state WHERE singleton = 1",
             [],
@@ -2549,10 +2802,10 @@ impl Repository {
                 |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
             )
             .optional()?;
-        let (mail_notification_count, mail_last_received_at_ms) = self.connection.query_row(
+        let (notification_count, notification_last_received_at_ms) = self.connection.query_row(
             "SELECT COUNT(*), MAX(occurred_at_ms)
              FROM remembries
-             WHERE deleted_at_ms IS NULL AND kind = 'mail_arrival'",
+             WHERE deleted_at_ms IS NULL AND kind IN ('notification', 'mail_arrival')",
             [],
             |row| Ok((row.get::<_, u64>(0)?, row.get::<_, Option<i64>>(1)?)),
         )?;
@@ -2605,9 +2858,9 @@ impl Repository {
                 .as_ref()
                 .map(|observation| observation.0),
             semantic_last_app: last_semantic_observation.map(|observation| observation.1),
-            mail_notifications_enabled,
-            mail_notification_count,
-            mail_last_received_at_ms,
+            notifications_enabled,
+            notification_count,
+            notification_last_received_at_ms,
             screen_enabled,
             screen_sample_interval_ms,
             screen_model,
@@ -3046,15 +3299,15 @@ impl Repository {
         self.status()
     }
 
-    pub fn set_mail_notifications_enabled(
+    pub fn set_notifications_enabled(
         &self,
-        mail_notifications_enabled: bool,
+        notifications_enabled: bool,
     ) -> Result<CaptureStatus, RepositoryError> {
         self.connection.execute(
             "UPDATE capture_state
-             SET mail_notifications_enabled = ?1, updated_at_ms = ?2
+             SET notifications_enabled = ?1, updated_at_ms = ?2
              WHERE singleton = 1",
-            params![mail_notifications_enabled, now_ms()?],
+            params![notifications_enabled, now_ms()?],
         )?;
         self.status()
     }
@@ -4689,7 +4942,7 @@ fn pattern_id(kind: &str, key: &str) -> String {
 fn pattern_priority(kind: &str) -> u8 {
     match kind {
         "resumed_context" => 3,
-        "mail_arrivals" => 2,
+        "notifications" => 2,
         "repeated_context" => 1,
         _ => 0,
     }
@@ -5830,18 +6083,18 @@ mod tests {
     }
 
     #[test]
-    fn evidence_patterns_keep_mail_arrivals_truthfully_bounded() {
-        let path = temporary_database("mail-arrival-pattern");
+    fn evidence_patterns_keep_notifications_truthfully_bounded() {
+        let path = temporary_database("notification-pattern");
         let mut repository = Repository::open(&path).unwrap();
         let start = 1_800_000_000_000_i64;
         for (offset, subject) in [(1_000, "Care update"), (2_000, "School follow-up")] {
             repository
                 .create(NewRemembrie {
-                    kind: "mail_arrival".to_owned(),
-                    title: format!("New email · {subject}"),
-                    body: format!("Thunderbird reported {subject}"),
-                    source_app: Some("Thunderbird".to_owned()),
-                    window_title: Some("New mail notification".to_owned()),
+                    kind: "notification".to_owned(),
+                    title: format!("Thunderbird · {subject}"),
+                    body: format!("Thunderbird presented {subject}"),
+                    source_app: Some("Thunderbird (org.mozilla.Thunderbird)".to_owned()),
+                    window_title: Some("Desktop notification".to_owned()),
                     occurred_at_ms: Some(start + offset),
                 })
                 .unwrap();
@@ -5849,13 +6102,13 @@ mod tests {
         let patterns = repository
             .evidence_patterns(start, start + 60_000, 10)
             .unwrap();
-        let mail = patterns
+        let notifications = patterns
             .iter()
-            .find(|pattern| pattern.kind == "mail_arrivals")
+            .find(|pattern| pattern.kind == "notifications")
             .unwrap();
-        assert!(mail.detail.contains("2 new-mail notifications"));
-        assert!(mail.caution.contains("do not prove"));
-        assert_eq!(mail.evidence.len(), 2);
+        assert!(notifications.detail.contains("2 local notifications"));
+        assert!(notifications.caution.contains("does not prove"));
+        assert_eq!(notifications.evidence.len(), 2);
         let _ = fs::remove_file(path);
     }
 
@@ -5975,7 +6228,7 @@ mod tests {
         assert_eq!(status.semantic_observation_count, 0);
         assert!(!status.mobile_enabled);
         assert!(!status.mobile_allow_while_locked);
-        assert!(!status.mail_notifications_enabled);
+        assert!(!status.notifications_enabled);
         let version: i64 = repository
             .connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
@@ -6009,21 +6262,133 @@ mod tests {
     }
 
     #[test]
-    fn thunderbird_arrival_capture_has_separate_consent() {
-        let path = temporary_database("mail-notification-setting");
+    fn notification_capture_has_separate_consent() {
+        let path = temporary_database("notification-setting");
         let repository = Repository::open(&path).unwrap();
-        assert!(!repository.status().unwrap().mail_notifications_enabled);
+        assert!(!repository.status().unwrap().notifications_enabled);
         assert!(
             repository
-                .set_mail_notifications_enabled(true)
+                .set_notifications_enabled(true)
                 .unwrap()
-                .mail_notifications_enabled
+                .notifications_enabled
         );
         assert!(
             !repository
-                .set_mail_notifications_enabled(false)
+                .set_notifications_enabled(false)
                 .unwrap()
-                .mail_notifications_enabled
+                .notifications_enabled
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn thunderbird_only_consent_does_not_enable_broader_notification_memory() {
+        let path = temporary_database("notification-consent-upgrade");
+        let connection = Connection::open(&path).unwrap();
+        for migration in [
+            MIGRATION_1,
+            MIGRATION_2,
+            MIGRATION_3,
+            MIGRATION_4,
+            MIGRATION_5,
+            MIGRATION_6,
+            MIGRATION_7,
+            MIGRATION_8,
+            MIGRATION_9,
+            MIGRATION_10,
+            MIGRATION_11,
+            MIGRATION_12,
+        ] {
+            connection.execute_batch(migration).unwrap();
+        }
+        connection
+            .execute(
+                "UPDATE capture_state SET mail_notifications_enabled = 1 WHERE singleton = 1",
+                [],
+            )
+            .unwrap();
+        connection.pragma_update(None, "user_version", 12).unwrap();
+        drop(connection);
+
+        let repository = Repository::open(&path).unwrap();
+        assert!(!repository.status().unwrap().notifications_enabled);
+        assert!(repository.list_notification_sources().unwrap().is_empty());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn notification_capture_applies_source_and_sensitive_content_controls() {
+        let path = temporary_database("notification-policy");
+        let mut repository = Repository::open(&path).unwrap();
+        repository.set_notifications_enabled(true).unwrap();
+
+        let stored = repository
+            .capture_notification(NotificationCaptureCandidate {
+                app_id: "org.mozilla.Thunderbird".to_owned(),
+                app_name: "Thunderbird".to_owned(),
+                title: "Care update".to_owned(),
+                body: "Duke sent a new message".to_owned(),
+                transient: false,
+                occurred_at_ms: Some(1_800_000_000_000),
+            })
+            .unwrap();
+        assert!(matches!(stored, CaptureDecision::Stored { .. }));
+        let source = repository.list_notification_sources().unwrap().remove(0);
+        assert!(source.enabled);
+        assert_eq!(source.seen_count, 1);
+        assert_eq!(source.stored_count, 1);
+
+        repository
+            .set_notification_source_enabled("org.mozilla.Thunderbird", false)
+            .unwrap();
+        let blocked = repository
+            .capture_notification(NotificationCaptureCandidate {
+                app_id: "org.mozilla.Thunderbird".to_owned(),
+                app_name: "Thunderbird".to_owned(),
+                title: "Another update".to_owned(),
+                body: "A second message arrived".to_owned(),
+                transient: false,
+                occurred_at_ms: Some(1_800_000_001_000),
+            })
+            .unwrap();
+        assert!(matches!(
+            blocked,
+            CaptureDecision::Skipped { category, .. } if category == "source_disabled"
+        ));
+
+        let auth = repository
+            .capture_notification(NotificationCaptureCandidate {
+                app_id: "org.gnome.Settings".to_owned(),
+                app_name: "Settings".to_owned(),
+                title: "Your verification code".to_owned(),
+                body: "Use 123456 to sign in".to_owned(),
+                transient: false,
+                occurred_at_ms: Some(1_800_000_002_000),
+            })
+            .unwrap();
+        assert!(matches!(
+            auth,
+            CaptureDecision::Skipped { category, .. } if category == "sensitive"
+        ));
+
+        let protected = repository
+            .capture_notification(NotificationCaptureCandidate {
+                app_id: "com.bitwarden.desktop".to_owned(),
+                app_name: "Bitwarden".to_owned(),
+                title: "Vault".to_owned(),
+                body: "Item copied".to_owned(),
+                transient: false,
+                occurred_at_ms: Some(1_800_000_003_000),
+            })
+            .unwrap();
+        assert!(matches!(
+            protected,
+            CaptureDecision::Skipped { category, .. } if category == "sensitive"
+        ));
+        assert!(
+            repository
+                .set_notification_source_enabled("com.bitwarden.desktop", true)
+                .is_err()
         );
         let _ = fs::remove_file(path);
     }

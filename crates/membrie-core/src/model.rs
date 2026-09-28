@@ -297,11 +297,11 @@ pub struct CaptureStatus {
     #[serde(default)]
     pub semantic_last_app: Option<String>,
     #[serde(default)]
-    pub mail_notifications_enabled: bool,
+    pub notifications_enabled: bool,
     #[serde(default)]
-    pub mail_notification_count: u64,
+    pub notification_count: u64,
     #[serde(default)]
-    pub mail_last_received_at_ms: Option<i64>,
+    pub notification_last_received_at_ms: Option<i64>,
     #[serde(default)]
     pub screen_enabled: bool,
     #[serde(default = "default_screen_sample_interval_ms")]
@@ -483,6 +483,29 @@ pub struct CaptureCandidate {
     pub window_title: Option<String>,
     pub source_uri: Option<String>,
     pub occurred_at_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct NotificationCaptureCandidate {
+    pub app_id: String,
+    pub app_name: String,
+    pub title: String,
+    pub body: String,
+    #[serde(default)]
+    pub transient: bool,
+    pub occurred_at_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct NotificationSource {
+    pub app_id: String,
+    pub app_name: String,
+    pub enabled: bool,
+    pub protected: bool,
+    pub protection_reason: Option<String>,
+    pub seen_count: u64,
+    pub stored_count: u64,
+    pub last_seen_at_ms: i64,
 }
 
 impl CaptureCandidate {

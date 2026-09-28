@@ -16,9 +16,10 @@ pub use model::{
     CalendarSnapshot, CalendarSourceSnapshot, CalendarSyncResult, CaptureCandidate,
     CaptureDecision, CaptureRule, CaptureStatus, EmbeddedChunk, EvidencePattern,
     IntelligenceSettings, IntelligenceStatus, LocalModel, MobileUsageSummary, NewRemembrie,
-    PatternEvidence, PauseMode, ProcessingJob, Remembrie, ScreenAnalysis, ScreenCaptureCandidate,
-    ScreenCaptureResult, SearchHit, SemanticCaptureCandidate, SemanticCaptureResult,
-    StagedAttachmentImport, TimelineActivityObservation, TimelineActivitySummary, TimelineEntry,
-    TimelineHistorySpan, TimelineMapSlice,
+    NotificationCaptureCandidate, NotificationSource, PatternEvidence, PauseMode, ProcessingJob,
+    Remembrie, ScreenAnalysis, ScreenCaptureCandidate, ScreenCaptureResult, SearchHit,
+    SemanticCaptureCandidate, SemanticCaptureResult, StagedAttachmentImport,
+    TimelineActivityObservation, TimelineActivitySummary, TimelineEntry, TimelineHistorySpan,
+    TimelineMapSlice,
 };
 pub use repository::{Repository, RepositoryError};

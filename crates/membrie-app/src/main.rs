@@ -4,10 +4,10 @@ use membrie_a11y::{ProbeSummary, WindowTarget};
 use membrie_core::{
     ActivitySnapshot, AttachmentImport, BrieAnswer, BrieCitation, CaptureRule, CaptureStatus,
     DaemonClient, EvidencePattern, IntelligenceSettings, IntelligenceStatus, LocalModel,
-    NewRemembrie, PauseMode, Remembrie, ScreenCaptureCandidate, ScreenCaptureResult, SearchHit,
-    TimelineActivityObservation, TimelineEntry, TimelineMapSlice, attachment_blob_path,
-    attachment_inbox_dir, mobile_pairing_invitation_path, mobile_tailnet_host_path,
-    mobile_token_path, socket_path,
+    NewRemembrie, NotificationSource, PauseMode, Remembrie, ScreenCaptureCandidate,
+    ScreenCaptureResult, SearchHit, TimelineActivityObservation, TimelineEntry, TimelineMapSlice,
+    attachment_blob_path, attachment_inbox_dir, mobile_pairing_invitation_path,
+    mobile_tailnet_host_path, mobile_token_path, socket_path,
 };
 use qrcode::{Color as QrColor, QrCode};
 use std::cell::{Cell, RefCell};
@@ -125,6 +125,7 @@ struct UiState {
     semantic_settings_updating: Cell<bool>,
     mail_status: gtk::Label,
     mail_button: gtk::Button,
+    notification_sources: gtk::ListBox,
     screen_status: gtk::Label,
     screen_button: gtk::Button,
     screen_capture_now_button: gtk::Button,
@@ -245,11 +246,12 @@ fn build_ui(application: &adw::Application) {
         semantic_interval_combo.append(Some(id), label);
     }
     semantic_interval_combo.set_active_id(Some("60000"));
-    let mail_status = gtk::Label::new(Some("Thunderbird arrivals · Checking…"));
+    let mail_status = gtk::Label::new(Some("Notification Memory · Checking…"));
     mail_status.set_xalign(0.0);
     mail_status.set_wrap(true);
-    let mail_button = gtk::Button::with_label("Enable Thunderbird arrivals");
+    let mail_button = gtk::Button::with_label("Enable Notification Memory");
     mail_button.set_halign(Align::Start);
+    let notification_sources = memory_list();
     let screen_status = gtk::Label::new(Some("Screen memory · Checking…"));
     screen_status.set_xalign(0.0);
     screen_status.set_wrap(true);
@@ -354,6 +356,7 @@ fn build_ui(application: &adw::Application) {
         semantic_settings_updating: Cell::new(false),
         mail_status,
         mail_button,
+        notification_sources,
         screen_status,
         screen_button,
         screen_capture_now_button,
@@ -422,6 +425,7 @@ fn build_ui(application: &adw::Application) {
     refresh_backups(&state);
     refresh_timeline(&state);
     refresh_capture_rules(&state);
+    refresh_notification_sources(&state);
     refresh_intelligence(&state);
     let state_for_live_capture = Rc::clone(&state);
     gtk::glib::timeout_add_seconds_local(2, move || {
@@ -434,6 +438,7 @@ fn build_ui(application: &adw::Application) {
         refresh_clipboard_bridge(&state_for_timer);
         refresh_semantic_status(&state_for_timer);
         refresh_status(&state_for_timer);
+        refresh_notification_sources(&state_for_timer);
         refresh_backups(&state_for_timer);
         gtk::glib::ControlFlow::Continue
     });
@@ -1741,11 +1746,11 @@ fn build_privacy_page(state: &Rc<UiState>) -> gtk::Widget {
     let mail_card = gtk::Box::new(Orientation::Vertical, 8);
     mail_card.add_css_class("card");
     mail_card.add_css_class("capture-card");
-    let mail_heading = gtk::Label::new(Some("Thunderbird arrivals"));
+    let mail_heading = gtk::Label::new(Some("Notification Memory"));
     mail_heading.add_css_class("heading");
     mail_heading.set_xalign(0.0);
     let mail_detail = gtk::Label::new(Some(
-        "Off by default and separate from focused-window capture. When enabled, Membrie remembers bounded new-mail notifications that Thunderbird presents to GNOME. Sender and subject text may be included. The record proves only that a local notification appeared—not that the message was opened, read, answered, or acted upon. Exclusions, secret filtering, duplicate filtering, and Pause apply before storage.",
+        "Off by default and separate from focused-window capture. When enabled, Membrie remembers eligible local notifications presented by GNOME. Titles, sender names, subjects, and message previews may be included. Authentication codes and password managers are blocked, noisy progress updates are suppressed, and exclusions, secret filtering, duplicate filtering, and Pause apply before storage. A record proves only that a notification appeared—not that you saw, opened, or acted on it.",
     ));
     mail_detail.add_css_class("dim-label");
     mail_detail.set_xalign(0.0);
@@ -1754,33 +1759,44 @@ fn build_privacy_page(state: &Rc<UiState>) -> gtk::Widget {
     mail_card.append(&state.mail_status);
     mail_card.append(&mail_detail);
     mail_card.append(&state.mail_button);
+    let source_heading = gtk::Label::new(Some("Application controls"));
+    source_heading.add_css_class("heading");
+    source_heading.set_xalign(0.0);
+    source_heading.set_margin_top(8);
+    let source_detail = gtk::Label::new(Some(
+        "Applications appear here after their first eligible notification. You can block or allow each source; password managers remain protected.",
+    ));
+    source_detail.add_css_class("dim-label");
+    source_detail.set_xalign(0.0);
+    source_detail.set_wrap(true);
+    mail_card.append(&source_heading);
+    mail_card.append(&source_detail);
+    mail_card.append(&state.notification_sources);
     let state_for_mail = Rc::clone(state);
     state.mail_button.connect_clicked(move |_| {
         let enabled = state_for_mail
             .client
             .status()
-            .map(|status| !status.mail_notifications_enabled)
+            .map(|status| !status.notifications_enabled)
             .unwrap_or(false);
-        match state_for_mail
-            .client
-            .set_mail_notifications_enabled(enabled)
-        {
+        match state_for_mail.client.set_notifications_enabled(enabled) {
             Ok(status) => {
                 apply_status_ui(&state_for_mail, &status);
                 toast(
                     &state_for_mail,
                     if enabled {
-                        "Thunderbird arrival evidence enabled"
+                        "Notification Memory enabled"
                     } else {
-                        "Thunderbird arrival evidence disabled"
+                        "Notification Memory disabled"
                     },
                 );
             }
             Err(error) => toast(
                 &state_for_mail,
-                &format!("Could not update Thunderbird arrivals: {error}"),
+                &format!("Could not update Notification Memory: {error}"),
             ),
         }
+        refresh_notification_sources(&state_for_mail);
     });
     page.append(&mail_card);
 
@@ -3720,7 +3736,7 @@ fn refresh_status(state: &Rc<UiState>) {
                 .set_text("Semantic Context · Daemon offline");
             state
                 .mail_status
-                .set_text("Thunderbird arrivals · Daemon offline");
+                .set_text("Notification Memory · Daemon offline");
             state
                 .screen_status
                 .set_text("Screen Memory · Daemon offline");
@@ -4205,7 +4221,7 @@ fn apply_status_ui(state: &UiState, status: &CaptureStatus) {
         .set_sensitive(status.semantic_enabled);
     state
         .mail_button
-        .set_sensitive(state.clipboard_bridge_available.get() || status.mail_notifications_enabled);
+        .set_sensitive(state.clipboard_bridge_available.get() || status.notifications_enabled);
     state.screen_button.set_sensitive(
         (state.clipboard_bridge_available.get() || status.screen_enabled)
             && status.activity_enabled,
@@ -4282,10 +4298,10 @@ fn apply_status_ui(state: &UiState, status: &CaptureStatus) {
         });
     state
         .mail_button
-        .set_label(if status.mail_notifications_enabled {
-            "Disable Thunderbird arrivals"
+        .set_label(if status.notifications_enabled {
+            "Disable Notification Memory"
         } else {
-            "Enable Thunderbird arrivals"
+            "Enable Notification Memory"
         });
     state.screen_button.set_label(if status.screen_enabled {
         "Disable screen memory"
@@ -4418,21 +4434,21 @@ fn apply_status_ui(state: &UiState, status: &CaptureStatus) {
     if !state.semantic_probe_busy.get() {
         state.semantic_status.set_text(&semantic_text);
     }
-    let mail_text = if !status.mail_notifications_enabled {
+    let mail_text = if !status.notifications_enabled {
         format!(
-            "Off · {} Thunderbird arrival notifications stored",
-            status.mail_notification_count
+            "Off · {} eligible notifications stored",
+            status.notification_count
         )
     } else if !capture_agent_running {
         "Enabled, but the desktop capture service is not responding".to_owned()
     } else {
         let last_received = status
-            .mail_last_received_at_ms
+            .notification_last_received_at_ms
             .map(|timestamp| format!("\nLast remembered: {}", format_timestamp(timestamp)))
             .unwrap_or_default();
         format!(
-            "On · local GNOME notification evidence only\n{} arrivals stored{last_received}",
-            status.mail_notification_count
+            "On · local GNOME notification evidence only\n{} notifications stored{last_received}",
+            status.notification_count
         )
     };
     state.mail_status.set_text(&mail_text);
@@ -4581,6 +4597,108 @@ fn refresh_capture_rules(state: &Rc<UiState>) {
             "Exclusions unavailable",
             &error.to_string(),
         ),
+    }
+}
+
+fn refresh_notification_sources(state: &Rc<UiState>) {
+    match state.client.list_notification_sources() {
+        Ok(sources) => render_notification_sources(&state.notification_sources, state, &sources),
+        Err(error) => render_error(
+            &state.notification_sources,
+            "Application controls unavailable",
+            &error.to_string(),
+        ),
+    }
+}
+
+fn render_notification_sources(
+    list: &gtk::ListBox,
+    state: &Rc<UiState>,
+    sources: &[NotificationSource],
+) {
+    clear_list(list);
+    if sources.is_empty() {
+        let row = gtk::ListBoxRow::new();
+        let label = gtk::Label::new(Some(
+            "No notification applications observed yet. Enable Notification Memory, then new sources will appear here.",
+        ));
+        label.add_css_class("dim-label");
+        label.set_xalign(0.0);
+        label.set_wrap(true);
+        label.set_margin_top(10);
+        label.set_margin_bottom(10);
+        label.set_margin_start(12);
+        label.set_margin_end(12);
+        row.set_child(Some(&label));
+        list.append(&row);
+        return;
+    }
+
+    for source in sources {
+        let row = gtk::ListBoxRow::new();
+        let content = gtk::Box::new(Orientation::Horizontal, 10);
+        content.set_margin_top(9);
+        content.set_margin_bottom(9);
+        content.set_margin_start(12);
+        content.set_margin_end(12);
+        let labels = gtk::Box::new(Orientation::Vertical, 2);
+        labels.set_hexpand(true);
+        let title = gtk::Label::new(Some(&source.app_name));
+        title.add_css_class("heading");
+        title.set_xalign(0.0);
+        let detail = if let Some(reason) = source.protection_reason.as_deref() {
+            format!("{} · {reason}", source.app_id)
+        } else {
+            format!(
+                "{} · {} observed · {} stored",
+                source.app_id, source.seen_count, source.stored_count
+            )
+        };
+        let detail = gtk::Label::new(Some(&detail));
+        detail.add_css_class("caption");
+        detail.add_css_class("dim-label");
+        detail.set_xalign(0.0);
+        detail.set_wrap(true);
+        labels.append(&title);
+        labels.append(&detail);
+        content.append(&labels);
+
+        let control = if source.protected {
+            gtk::Button::with_label("Always protected")
+        } else if source.enabled {
+            gtk::Button::with_label("Block")
+        } else {
+            gtk::Button::with_label("Allow")
+        };
+        control.set_sensitive(!source.protected);
+        if !source.protected {
+            let state = Rc::clone(state);
+            let app_id = source.app_id.clone();
+            let enable = !source.enabled;
+            control.connect_clicked(move |_| {
+                match state
+                    .client
+                    .set_notification_source_enabled(&app_id, enable)
+                {
+                    Ok(source) => toast(
+                        &state,
+                        &format!(
+                            "{} notifications {}",
+                            source.app_name,
+                            if source.enabled { "allowed" } else { "blocked" }
+                        ),
+                    ),
+                    Err(error) => toast(
+                        &state,
+                        &format!("Could not update notification application: {error}"),
+                    ),
+                }
+                refresh_notification_sources(&state);
+            });
+        }
+        content.append(&control);
+        row.set_child(Some(&content));
+        list.append(&row);
     }
 }
 
@@ -4890,7 +5008,7 @@ fn timeline_entry_row(state: &Rc<UiState>, entry: &TimelineEntry) -> gtk::ListBo
         content.append(&caution);
     } else if matches!(
         entry.kind.as_str(),
-        "calendar" | "screen" | "semantic" | "mail_arrival"
+        "calendar" | "screen" | "semantic" | "notification" | "mail_arrival"
     ) {
         let caution = gtk::Label::new(Some(timeline_evidence_caution(&entry.kind)));
         caution.add_css_class("caption");
@@ -4917,6 +5035,7 @@ fn timeline_entry_row(state: &Rc<UiState>, entry: &TimelineEntry) -> gtk::ListBo
 fn timeline_evidence_type(kind: &str) -> &'static str {
     match kind {
         "activity" => "OBSERVED SESSION",
+        "notification" => "NOTIFICATION",
         "mail_arrival" => "MAIL ARRIVAL",
         "calendar" => "SCHEDULED",
         "clipboard" => "CAPTURED CLIPBOARD",
@@ -4939,6 +5058,9 @@ fn timeline_evidence_caution(kind: &str) -> &'static str {
         }
         "mail_arrival" => {
             "Thunderbird presented a new-mail notification—not proof the message was opened, read, answered, or acted upon."
+        }
+        "notification" => {
+            "An application presented a local notification—not proof it was seen, opened, or acted upon."
         }
         "clipboard" => "Captured text shows what was copied, not how it was used.",
         "note" => "Written manually rather than observed automatically.",
@@ -5685,7 +5807,7 @@ mod tests {
         ));
         assert!(timeline_filter_matches(
             TimelineFilter::Observed,
-            "mail_arrival"
+            "notification"
         ));
         assert!(!timeline_filter_matches(
             TimelineFilter::Observed,
@@ -5709,12 +5831,12 @@ mod tests {
     }
 
     #[test]
-    fn mail_arrival_evidence_never_claims_reading_or_response() {
-        assert_eq!(timeline_evidence_type("mail_arrival"), "MAIL ARRIVAL");
-        let caution = timeline_evidence_caution("mail_arrival");
+    fn notification_evidence_never_claims_attention_or_action() {
+        assert_eq!(timeline_evidence_type("notification"), "NOTIFICATION");
+        let caution = timeline_evidence_caution("notification");
         assert!(caution.contains("not proof"));
-        assert!(caution.contains("read"));
-        assert!(caution.contains("answered"));
+        assert!(caution.contains("seen"));
+        assert!(caution.contains("acted"));
     }
 
     #[test]

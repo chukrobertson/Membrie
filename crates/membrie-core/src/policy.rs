@@ -2,6 +2,90 @@ use crate::model::{CaptureCandidate, CaptureRule};
 
 pub const MAX_AUTOMATIC_CONTENT_BYTES: usize = 256 * 1024;
 
+pub fn protected_notification_source(app_id: &str, app_name: &str) -> Option<&'static str> {
+    let identity = format!("{app_id}\n{app_name}").to_ascii_lowercase();
+    [
+        "1password",
+        "bitwarden",
+        "keepass",
+        "password safe",
+        "passwordsafe",
+        "seahorse",
+        "proton pass",
+    ]
+    .iter()
+    .any(|marker| identity.contains(marker))
+    .then_some("Password-manager notifications are always protected")
+}
+
+pub fn notification_sensitive_reason(title: &str, body: &str) -> Option<&'static str> {
+    let text = format!("{title}\n{body}").to_ascii_lowercase();
+    let authentication_language = [
+        "verification code",
+        "security code",
+        "authentication code",
+        "one-time code",
+        "one time code",
+        "one-time password",
+        "login code",
+        "sign-in code",
+        "sign in code",
+        "two-factor",
+        "two factor",
+        "2fa",
+    ]
+    .iter()
+    .any(|marker| text.contains(marker))
+        || text
+            .split(|character: char| !character.is_ascii_alphanumeric())
+            .any(|word| word == "otp");
+    authentication_language.then_some("authentication-code notification")
+}
+
+pub fn is_noisy_progress_notification(title: &str, body: &str, transient: bool) -> bool {
+    if !transient {
+        return false;
+    }
+    let text = format!("{title} {body}").to_ascii_lowercase();
+    if [
+        "complete",
+        "completed",
+        "finished",
+        "ready",
+        "failed",
+        "failure",
+        "error",
+        "warning",
+        "attention",
+        "disconnected",
+        "low battery",
+    ]
+    .iter()
+    .any(|marker| text.contains(marker))
+    {
+        return false;
+    }
+    let progress_language = [
+        "downloading",
+        "uploading",
+        "installing",
+        "updating",
+        "syncing",
+        "copying",
+        "moving",
+        "processing",
+        "scanning",
+        "progress",
+    ]
+    .iter()
+    .any(|marker| text.contains(marker));
+    let has_percent = text.split_whitespace().any(|word| {
+        word.trim_matches(|c: char| !c.is_ascii_digit() && c != '%')
+            .ends_with('%')
+    });
+    progress_language || has_percent
+}
+
 pub fn sensitive_reason(text: &str) -> Option<&'static str> {
     let lower = text.to_ascii_lowercase();
 
@@ -233,5 +317,30 @@ mod tests {
         assert!(wildcard_match("*KeePass*", "org.keepassxc.KeePassXC"));
         assert!(wildcard_match("private.?", "PRIVATE.1"));
         assert!(!wildcard_match("Bitwarden", "Firefox"));
+    }
+
+    #[test]
+    fn notification_policy_blocks_authentication_codes_and_password_managers() {
+        assert_eq!(
+            notification_sensitive_reason("Your verification code", "Use 123456 to sign in"),
+            Some("authentication-code notification")
+        );
+        assert_eq!(
+            notification_sensitive_reason("Build complete", "All done"),
+            None
+        );
+        assert!(protected_notification_source("com.bitwarden.desktop", "Bitwarden").is_some());
+        assert!(protected_notification_source("org.mozilla.Thunderbird", "Thunderbird").is_none());
+    }
+
+    #[test]
+    fn notification_policy_suppresses_progress_but_keeps_outcomes() {
+        assert!(is_noisy_progress_notification("Downloading", "42%", true));
+        assert!(!is_noisy_progress_notification(
+            "Download complete",
+            "100%",
+            true
+        ));
+        assert!(!is_noisy_progress_notification("Downloading", "42%", false));
     }
 }

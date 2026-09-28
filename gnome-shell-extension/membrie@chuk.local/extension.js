@@ -53,11 +53,12 @@ const DBUS_XML = `
     </signal>
     <signal name="TextReady"/>
     <signal name="ActivityChanged"/>
-    <signal name="MailNotification">
+    <signal name="NotificationReceived">
       <arg type="s" name="app_id"/>
       <arg type="s" name="app_name"/>
       <arg type="s" name="title"/>
       <arg type="s" name="body"/>
+      <arg type="b" name="transient"/>
     </signal>
   </interface>
 </node>
@@ -477,16 +478,16 @@ class ClipboardBridge {
     _trackNotification(source, notification, newlyAdded) {
         if (this._notificationSignals.has(notification)) {
             if (newlyAdded)
-                this._queueMailNotification(source, notification);
+                this._queueNotification(source, notification);
             return;
         }
         const titleId = notification.connect(
             'notify::title',
-            () => this._queueMailNotification(source, notification)
+            () => this._queueNotification(source, notification)
         );
         const bodyId = notification.connect(
             'notify::body',
-            () => this._queueMailNotification(source, notification)
+            () => this._queueNotification(source, notification)
         );
         const destroyId = notification.connect('destroy', () => {
             const pendingId = this._notificationPending.get(notification);
@@ -502,10 +503,10 @@ class ClipboardBridge {
             this._notificationSignature(source, notification)
         );
         if (newlyAdded)
-            this._queueMailNotification(source, notification, true);
+            this._queueNotification(source, notification, true);
     }
 
-    _queueMailNotification(source, notification, force = false) {
+    _queueNotification(source, notification, force = false) {
         if (this._notificationPending.has(notification))
             return;
         const pendingId = GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
@@ -514,7 +515,7 @@ class ClipboardBridge {
             const previous = this._notificationSignatures.get(notification);
             this._notificationSignatures.set(notification, signature);
             if ((force || signature !== previous) && signature)
-                this._emitMailNotification(source, notification);
+                this._emitNotification(source, notification);
             return GLib.SOURCE_REMOVE;
         });
         this._notificationPending.set(notification, pendingId);
@@ -529,9 +530,6 @@ class ClipboardBridge {
 
     _notificationSignature(source, notification) {
         const [appId, appName] = this._notificationIdentity(source);
-        const identity = `${appId}\n${appName}`.toLowerCase();
-        if (!identity.includes('thunderbird'))
-            return '';
         const title = this._safeNotificationText(notification.title, 1000);
         const body = this._safeNotificationText(notification.body, 4000);
         if (!title && !body)
@@ -547,17 +545,23 @@ class ClipboardBridge {
         return Array.from(normalized).slice(0, maximumCharacters).join('');
     }
 
-    _emitMailNotification(source, notification) {
+    _emitNotification(source, notification) {
         const [appId, appName] = this._notificationIdentity(source);
         const title = this._safeNotificationText(notification.title, 1000);
         const body = this._safeNotificationText(notification.body, 4000);
         try {
             this._dbusObject.emit_signal(
-                'MailNotification',
-                new GLib.Variant('(ssss)', [appId, appName, title, body])
+                'NotificationReceived',
+                new GLib.Variant('(ssssb)', [
+                    appId,
+                    appName,
+                    title,
+                    body,
+                    Boolean(notification.isTransient),
+                ])
             );
         } catch (error) {
-            logError(error, 'Membrie could not report a Thunderbird notification');
+            logError(error, 'Membrie could not report a desktop notification');
         }
     }
 
