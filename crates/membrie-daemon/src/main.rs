@@ -222,6 +222,13 @@ fn dispatch_database(request: Request, repository: &Mutex<Repository>) -> Result
         Request::TimelineMap { start_ms, end_ms } => Ok(Response::TimelineMap {
             slices: repository.timeline_map(start_ms, end_ms)?,
         }),
+        Request::EvidencePatterns {
+            start_ms,
+            end_ms,
+            limit,
+        } => Ok(Response::EvidencePatterns {
+            patterns: repository.evidence_patterns(start_ms, end_ms, limit)?,
+        }),
         Request::SetPause { mode } => Ok(Response::PauseUpdated {
             status: with_capture_health(repository.set_pause(mode)?),
         }),
@@ -240,6 +247,9 @@ fn dispatch_database(request: Request, repository: &Mutex<Repository>) -> Result
         }
         Request::SetSemanticEnabled { enabled } => Ok(Response::CaptureSourceUpdated {
             status: with_capture_health(repository.set_semantic_enabled(enabled)?),
+        }),
+        Request::SetMailNotificationsEnabled { enabled } => Ok(Response::CaptureSourceUpdated {
+            status: with_capture_health(repository.set_mail_notifications_enabled(enabled)?),
         }),
         Request::SetSemanticSampleInterval { sample_interval_ms } => {
             Ok(Response::CaptureSourceUpdated {

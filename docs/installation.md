@@ -68,6 +68,12 @@ with different evidence limits so Brie cannot mistake an open draft for a sent m
 for proof of delivery. Use **Compatibility test** while a Thunderbird mailbox, message, or compose
 window is focused to preview what it exposes without storing anything.
 
+The separate, off-by-default **Thunderbird arrivals** control lets the GNOME bridge remember bounded
+new-mail notifications from Thunderbird. It does not require focused-window capture. A notification Remembrie means Thunderbird presented a
+local arrival notification; it does not mean the message was opened, read, answered, or acted upon.
+This depends on Thunderbird notifications being enabled. After an upgrade that changes the GNOME
+bridge, log out and back in once before testing notification capture.
+
 Calendar access is also off by default. When enabled, Membrie reads the calendars already exposed by
 Ubuntu's Evolution Data Server every 15 minutes. It imports a bounded one-year history and one-year
 look-ahead, expands recurring events, and makes them locally searchable by Brie. The connector does

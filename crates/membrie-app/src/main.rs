@@ -3,10 +3,11 @@ use gtk::{Align, Orientation};
 use membrie_a11y::{ProbeSummary, WindowTarget};
 use membrie_core::{
     ActivitySnapshot, AttachmentImport, BrieAnswer, BrieCitation, CaptureRule, CaptureStatus,
-    DaemonClient, IntelligenceSettings, IntelligenceStatus, LocalModel, NewRemembrie, PauseMode,
-    Remembrie, ScreenCaptureCandidate, ScreenCaptureResult, SearchHit, TimelineActivityObservation,
-    TimelineEntry, TimelineMapSlice, attachment_blob_path, attachment_inbox_dir,
-    mobile_pairing_invitation_path, mobile_tailnet_host_path, mobile_token_path, socket_path,
+    DaemonClient, EvidencePattern, IntelligenceSettings, IntelligenceStatus, LocalModel,
+    NewRemembrie, PauseMode, Remembrie, ScreenCaptureCandidate, ScreenCaptureResult, SearchHit,
+    TimelineActivityObservation, TimelineEntry, TimelineMapSlice, attachment_blob_path,
+    attachment_inbox_dir, mobile_pairing_invitation_path, mobile_tailnet_host_path,
+    mobile_token_path, socket_path,
 };
 use qrcode::{Color as QrColor, QrCode};
 use std::cell::{Cell, RefCell};
@@ -98,7 +99,7 @@ struct UiState {
     timeline_next_button: gtk::Button,
     timeline_today_button: gtk::Button,
     timeline_insight: gtk::Box,
-    timeline_insight_label: gtk::Label,
+    timeline_insight_content: gtk::Box,
     timeline_day_start_ms: Cell<i64>,
     timeline_map_mode: Cell<TimelineMapMode>,
     timeline_filter: Cell<TimelineFilter>,
@@ -122,6 +123,8 @@ struct UiState {
     semantic_probe_busy: Cell<bool>,
     semantic_interval_combo: gtk::ComboBoxText,
     semantic_settings_updating: Cell<bool>,
+    mail_status: gtk::Label,
+    mail_button: gtk::Button,
     screen_status: gtk::Label,
     screen_button: gtk::Button,
     screen_capture_now_button: gtk::Button,
@@ -187,9 +190,7 @@ fn build_ui(application: &adw::Application) {
     timeline_insight.add_css_class("card");
     timeline_insight.add_css_class("timeline-insight");
     timeline_insight.set_visible(false);
-    let timeline_insight_label = gtk::Label::new(None);
-    timeline_insight_label.set_xalign(0.0);
-    timeline_insight_label.set_wrap(true);
+    let timeline_insight_content = gtk::Box::new(Orientation::Vertical, 10);
     let timeline_day_start_ms = local_today_start_ms();
     let timeline_filter_summary = gtk::Label::new(None);
     timeline_filter_summary.add_css_class("caption");
@@ -244,6 +245,11 @@ fn build_ui(application: &adw::Application) {
         semantic_interval_combo.append(Some(id), label);
     }
     semantic_interval_combo.set_active_id(Some("60000"));
+    let mail_status = gtk::Label::new(Some("Thunderbird arrivals · Checking…"));
+    mail_status.set_xalign(0.0);
+    mail_status.set_wrap(true);
+    let mail_button = gtk::Button::with_label("Enable Thunderbird arrivals");
+    mail_button.set_halign(Align::Start);
     let screen_status = gtk::Label::new(Some("Screen memory · Checking…"));
     screen_status.set_xalign(0.0);
     screen_status.set_wrap(true);
@@ -322,7 +328,7 @@ fn build_ui(application: &adw::Application) {
         timeline_next_button,
         timeline_today_button,
         timeline_insight,
-        timeline_insight_label,
+        timeline_insight_content,
         timeline_day_start_ms: Cell::new(timeline_day_start_ms),
         timeline_map_mode: Cell::new(TimelineMapMode::Week),
         timeline_filter: Cell::new(TimelineFilter::All),
@@ -346,6 +352,8 @@ fn build_ui(application: &adw::Application) {
         semantic_probe_busy: Cell::new(false),
         semantic_interval_combo,
         semantic_settings_updating: Cell::new(false),
+        mail_status,
+        mail_button,
         screen_status,
         screen_button,
         screen_capture_now_button,
@@ -978,11 +986,13 @@ fn build_timeline_page(state: &Rc<UiState>) -> gtk::Widget {
     ribbon_section.append(&state.timeline_app_legend);
     page.append(&ribbon_section);
 
-    let insight_heading = gtk::Label::new(Some("Pattern worth noticing"));
+    let insight_heading = gtk::Label::new(Some("Patterns worth noticing"));
     insight_heading.add_css_class("heading");
     insight_heading.set_xalign(0.0);
     state.timeline_insight.append(&insight_heading);
-    state.timeline_insight.append(&state.timeline_insight_label);
+    state
+        .timeline_insight
+        .append(&state.timeline_insight_content);
     page.append(&state.timeline_insight);
 
     let capture = gtk::Box::new(Orientation::Vertical, 10);
@@ -1728,6 +1738,52 @@ fn build_privacy_page(state: &Rc<UiState>) -> gtk::Widget {
     });
     page.append(&semantic_card);
 
+    let mail_card = gtk::Box::new(Orientation::Vertical, 8);
+    mail_card.add_css_class("card");
+    mail_card.add_css_class("capture-card");
+    let mail_heading = gtk::Label::new(Some("Thunderbird arrivals"));
+    mail_heading.add_css_class("heading");
+    mail_heading.set_xalign(0.0);
+    let mail_detail = gtk::Label::new(Some(
+        "Off by default and separate from focused-window capture. When enabled, Membrie remembers bounded new-mail notifications that Thunderbird presents to GNOME. Sender and subject text may be included. The record proves only that a local notification appeared—not that the message was opened, read, answered, or acted upon. Exclusions, secret filtering, duplicate filtering, and Pause apply before storage.",
+    ));
+    mail_detail.add_css_class("dim-label");
+    mail_detail.set_xalign(0.0);
+    mail_detail.set_wrap(true);
+    mail_card.append(&mail_heading);
+    mail_card.append(&state.mail_status);
+    mail_card.append(&mail_detail);
+    mail_card.append(&state.mail_button);
+    let state_for_mail = Rc::clone(state);
+    state.mail_button.connect_clicked(move |_| {
+        let enabled = state_for_mail
+            .client
+            .status()
+            .map(|status| !status.mail_notifications_enabled)
+            .unwrap_or(false);
+        match state_for_mail
+            .client
+            .set_mail_notifications_enabled(enabled)
+        {
+            Ok(status) => {
+                apply_status_ui(&state_for_mail, &status);
+                toast(
+                    &state_for_mail,
+                    if enabled {
+                        "Thunderbird arrival evidence enabled"
+                    } else {
+                        "Thunderbird arrival evidence disabled"
+                    },
+                );
+            }
+            Err(error) => toast(
+                &state_for_mail,
+                &format!("Could not update Thunderbird arrivals: {error}"),
+            ),
+        }
+    });
+    page.append(&mail_card);
+
     let screen_card = gtk::Box::new(Orientation::Vertical, 8);
     screen_card.add_css_class("card");
     screen_card.add_css_class("capture-card");
@@ -2249,12 +2305,18 @@ fn refresh_timeline(state: &Rc<UiState>) {
             state
                 .client
                 .timeline_day(day_start, day_end)
-                .map(|entries| (slices, entries))
+                .and_then(|entries| {
+                    state
+                        .client
+                        .evidence_patterns(map_start, map_end, 5)
+                        .map(|patterns| (slices, entries, patterns))
+                })
         });
     match result {
-        Ok((slices, entries)) => {
+        Ok((slices, entries, patterns)) => {
             let filter = state.timeline_filter.get();
-            let key = timeline_render_key(day_start, map_mode, filter, &slices, &entries);
+            let key =
+                timeline_render_key(day_start, map_mode, filter, &slices, &entries, &patterns);
             if state.timeline_render_key.borrow().as_deref() == Some(&key) {
                 return;
             }
@@ -2272,7 +2334,7 @@ fn refresh_timeline(state: &Rc<UiState>) {
                 filter,
                 entries.len(),
             );
-            render_timeline_insight(state, &entries);
+            render_timeline_insights(state, &patterns);
             state
                 .timeline_filter_summary
                 .set_text(&timeline_filter_summary(
@@ -2308,6 +2370,7 @@ fn timeline_render_key(
     filter: TimelineFilter,
     slices: &[TimelineMapSlice],
     entries: &[TimelineEntry],
+    patterns: &[EvidencePattern],
 ) -> String {
     let mut key = format!(
         "{day_start}:{map_mode:?}:{filter:?}:{}:{}",
@@ -2339,6 +2402,19 @@ fn timeline_render_key(
                 attachment.content_id, attachment.blob_hash, attachment.analysis_state
             ));
         }
+    }
+    for pattern in patterns {
+        key.push_str(&format!(
+            ":{}:{}:{}",
+            pattern.id,
+            pattern.detail,
+            pattern
+                .evidence
+                .iter()
+                .map(|item| item.occurred_at_ms)
+                .max()
+                .unwrap_or_default()
+        ));
     }
     key
 }
@@ -2713,44 +2789,63 @@ fn render_timeline_ribbon(
     }
 }
 
-fn render_timeline_insight(state: &UiState, entries: &[TimelineEntry]) {
-    let mut returns: HashMap<(String, String), (String, String, u32)> = HashMap::new();
-    for entry in entries {
-        let Some(activity) = &entry.activity else {
-            continue;
-        };
-        for observation in &activity.observations {
-            let title = observation.window_title.trim();
-            if title.is_empty() {
-                continue;
-            }
-            let app = if observation.app_name.trim().is_empty() {
-                observation.app_id.trim()
-            } else {
-                observation.app_name.trim()
-            };
-            let key = (app.to_ascii_lowercase(), title.to_ascii_lowercase());
-            let value = returns
-                .entry(key)
-                .or_insert_with(|| (app.to_owned(), title.to_owned(), 0));
-            value.2 += 1;
+fn render_timeline_insights(state: &Rc<UiState>, patterns: &[EvidencePattern]) {
+    clear_box(&state.timeline_insight_content);
+    state.timeline_insight.set_visible(!patterns.is_empty());
+    for (index, pattern) in patterns.iter().enumerate() {
+        if index > 0 {
+            state
+                .timeline_insight_content
+                .append(&gtk::Separator::new(Orientation::Horizontal));
         }
-    }
-    let insight = returns
-        .into_iter()
-        .filter(|(_, (_, _, count))| *count >= 3)
-        .max_by_key(|(_, (_, _, count))| *count)
-        .map(|(_, (app, title, count))| {
-            format!(
-                "You returned to “{}” {count} times in {app}. This is evidence of repeated context—not proof of an unfinished task. Brie can use the supporting Remembries if you ask.",
-                truncate_display_text(&title, 120)
-            )
-        });
-    if let Some(insight) = insight {
-        state.timeline_insight_label.set_text(&insight);
-        state.timeline_insight.set_visible(true);
-    } else {
-        state.timeline_insight.set_visible(false);
+        let insight = gtk::Box::new(Orientation::Vertical, 5);
+        let title = gtk::Label::new(Some(&pattern.title));
+        title.add_css_class("heading");
+        title.set_xalign(0.0);
+        title.set_wrap(true);
+        insight.append(&title);
+
+        let detail = gtk::Label::new(Some(&pattern.detail));
+        detail.set_xalign(0.0);
+        detail.set_wrap(true);
+        insight.append(&detail);
+
+        let caution = gtk::Label::new(Some(&pattern.caution));
+        caution.add_css_class("caption");
+        caution.add_css_class("timeline-evidence-caution");
+        caution.set_xalign(0.0);
+        caution.set_wrap(true);
+        insight.append(&caution);
+
+        let evidence = gtk::FlowBox::builder()
+            .selection_mode(gtk::SelectionMode::None)
+            .column_spacing(6)
+            .row_spacing(5)
+            .max_children_per_line(5)
+            .build();
+        for (evidence_index, item) in pattern.evidence.iter().enumerate() {
+            let button = gtk::Button::with_label(&format!(
+                "Evidence {} · {}",
+                evidence_index + 1,
+                format_timestamp(item.occurred_at_ms)
+            ));
+            button.add_css_class("flat");
+            button.set_tooltip_text(Some(&item.label));
+            let state = Rc::clone(state);
+            let remembrie_id = item.remembrie_id.clone();
+            let occurred_at_ms = item.occurred_at_ms;
+            button.connect_clicked(move |_| {
+                state
+                    .timeline_day_start_ms
+                    .set(local_day_start_ms(occurred_at_ms));
+                *state.timeline_target_id.borrow_mut() = Some(remembrie_id.clone());
+                *state.timeline_render_key.borrow_mut() = None;
+                refresh_timeline(&state);
+            });
+            evidence.insert(&button, -1);
+        }
+        insight.append(&evidence);
+        state.timeline_insight_content.append(&insight);
     }
 }
 
@@ -3600,6 +3695,7 @@ fn refresh_status(state: &Rc<UiState>) {
             state.activity_idle_combo.set_sensitive(false);
             state.semantic_capture_button.set_sensitive(false);
             state.semantic_interval_combo.set_sensitive(false);
+            state.mail_button.set_sensitive(false);
             state.screen_button.set_sensitive(false);
             state.screen_capture_now_button.set_sensitive(false);
             state.screen_interval_combo.set_sensitive(false);
@@ -3622,6 +3718,9 @@ fn refresh_status(state: &Rc<UiState>) {
             state
                 .semantic_status
                 .set_text("Semantic Context · Daemon offline");
+            state
+                .mail_status
+                .set_text("Thunderbird arrivals · Daemon offline");
             state
                 .screen_status
                 .set_text("Screen Memory · Daemon offline");
@@ -4104,6 +4203,9 @@ fn apply_status_ui(state: &UiState, status: &CaptureStatus) {
     state
         .semantic_interval_combo
         .set_sensitive(status.semantic_enabled);
+    state
+        .mail_button
+        .set_sensitive(state.clipboard_bridge_available.get() || status.mail_notifications_enabled);
     state.screen_button.set_sensitive(
         (state.clipboard_bridge_available.get() || status.screen_enabled)
             && status.activity_enabled,
@@ -4177,6 +4279,13 @@ fn apply_status_ui(state: &UiState, status: &CaptureStatus) {
             "Disable automatic semantic context"
         } else {
             "Enable automatic semantic context"
+        });
+    state
+        .mail_button
+        .set_label(if status.mail_notifications_enabled {
+            "Disable Thunderbird arrivals"
+        } else {
+            "Enable Thunderbird arrivals"
         });
     state.screen_button.set_label(if status.screen_enabled {
         "Disable screen memory"
@@ -4309,6 +4418,24 @@ fn apply_status_ui(state: &UiState, status: &CaptureStatus) {
     if !state.semantic_probe_busy.get() {
         state.semantic_status.set_text(&semantic_text);
     }
+    let mail_text = if !status.mail_notifications_enabled {
+        format!(
+            "Off · {} Thunderbird arrival notifications stored",
+            status.mail_notification_count
+        )
+    } else if !capture_agent_running {
+        "Enabled, but the desktop capture service is not responding".to_owned()
+    } else {
+        let last_received = status
+            .mail_last_received_at_ms
+            .map(|timestamp| format!("\nLast remembered: {}", format_timestamp(timestamp)))
+            .unwrap_or_default();
+        format!(
+            "On · local GNOME notification evidence only\n{} arrivals stored{last_received}",
+            status.mail_notification_count
+        )
+    };
+    state.mail_status.set_text(&mail_text);
     let screen_text = if !status.screen_enabled {
         format!(
             "Off · {} local screen observations stored · no screenshots retained",
@@ -4761,7 +4888,10 @@ fn timeline_entry_row(state: &Rc<UiState>, entry: &TimelineEntry) -> gtk::ListBo
         caution.set_xalign(0.0);
         caution.set_wrap(true);
         content.append(&caution);
-    } else if matches!(entry.kind.as_str(), "calendar" | "screen" | "semantic") {
+    } else if matches!(
+        entry.kind.as_str(),
+        "calendar" | "screen" | "semantic" | "mail_arrival"
+    ) {
         let caution = gtk::Label::new(Some(timeline_evidence_caution(&entry.kind)));
         caution.add_css_class("caption");
         caution.add_css_class("timeline-evidence-caution");
@@ -4787,6 +4917,7 @@ fn timeline_entry_row(state: &Rc<UiState>, entry: &TimelineEntry) -> gtk::ListBo
 fn timeline_evidence_type(kind: &str) -> &'static str {
     match kind {
         "activity" => "OBSERVED SESSION",
+        "mail_arrival" => "MAIL ARRIVAL",
         "calendar" => "SCHEDULED",
         "clipboard" => "CAPTURED CLIPBOARD",
         "screen" => "MACHINE-DESCRIBED SCREEN",
@@ -4805,6 +4936,9 @@ fn timeline_evidence_caution(kind: &str) -> &'static str {
         }
         "activity" => {
             "Observed window focus and duration—not proof of intent, productivity, or completion."
+        }
+        "mail_arrival" => {
+            "Thunderbird presented a new-mail notification—not proof the message was opened, read, answered, or acted upon."
         }
         "clipboard" => "Captured text shows what was copied, not how it was used.",
         "note" => "Written manually rather than observed automatically.",
@@ -5549,6 +5683,10 @@ mod tests {
             TimelineFilter::Observed,
             "clipboard"
         ));
+        assert!(timeline_filter_matches(
+            TimelineFilter::Observed,
+            "mail_arrival"
+        ));
         assert!(!timeline_filter_matches(
             TimelineFilter::Observed,
             "calendar"
@@ -5568,6 +5706,15 @@ mod tests {
             timeline_filter_summary(TimelineFilter::Scheduled, 2, 5)
                 .contains("not proof of attendance")
         );
+    }
+
+    #[test]
+    fn mail_arrival_evidence_never_claims_reading_or_response() {
+        assert_eq!(timeline_evidence_type("mail_arrival"), "MAIL ARRIVAL");
+        let caution = timeline_evidence_caution("mail_arrival");
+        assert!(caution.contains("not proof"));
+        assert!(caution.contains("read"));
+        assert!(caution.contains("answered"));
     }
 
     #[test]

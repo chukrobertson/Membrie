@@ -53,6 +53,12 @@ const DBUS_XML = `
     </signal>
     <signal name="TextReady"/>
     <signal name="ActivityChanged"/>
+    <signal name="MailNotification">
+      <arg type="s" name="app_id"/>
+      <arg type="s" name="app_name"/>
+      <arg type="s" name="title"/>
+      <arg type="s" name="body"/>
+    </signal>
   </interface>
 </node>
 `;
@@ -68,6 +74,10 @@ class ClipboardBridge {
         this._activitySignalId = 0;
         this._focusWindow = null;
         this._titleChangedId = 0;
+        this._notificationSourceIds = new Map();
+        this._notificationSignals = new Map();
+        this._notificationPending = new Map();
+        this._notificationSignatures = new Map();
         this._selection = global.display.get_selection();
         this._clipboard = St.Clipboard.get_default();
         this._windowTracker = Shell.WindowTracker.get_default();
@@ -96,6 +106,16 @@ class ClipboardBridge {
             'updated',
             () => this._queueActivityChanged()
         );
+        this._notificationSourceAddedId = Main.messageTray.connect(
+            'source-added',
+            (_tray, source) => this._trackNotificationSource(source)
+        );
+        this._notificationSourceRemovedId = Main.messageTray.connect(
+            'source-removed',
+            (_tray, source) => this._untrackNotificationSource(source)
+        );
+        for (const source of Main.messageTray.getSources())
+            this._trackNotificationSource(source);
         this._trackFocusedWindow();
     }
 
@@ -431,6 +451,116 @@ class ClipboardBridge {
         });
     }
 
+    _trackNotificationSource(source) {
+        if (this._notificationSourceIds.has(source))
+            return;
+        const signalId = source.connect('notification-added', (_source, notification) => {
+            this._trackNotification(source, notification, true);
+        });
+        this._notificationSourceIds.set(source, signalId);
+        for (const notification of source.notifications)
+            this._trackNotification(source, notification, false);
+    }
+
+    _untrackNotificationSource(source) {
+        const signalId = this._notificationSourceIds.get(source);
+        if (signalId) {
+            try {
+                source.disconnect(signalId);
+            } catch (_error) {
+                // The source may already have been disposed by GNOME Shell.
+            }
+        }
+        this._notificationSourceIds.delete(source);
+    }
+
+    _trackNotification(source, notification, newlyAdded) {
+        if (this._notificationSignals.has(notification)) {
+            if (newlyAdded)
+                this._queueMailNotification(source, notification);
+            return;
+        }
+        const titleId = notification.connect(
+            'notify::title',
+            () => this._queueMailNotification(source, notification)
+        );
+        const bodyId = notification.connect(
+            'notify::body',
+            () => this._queueMailNotification(source, notification)
+        );
+        const destroyId = notification.connect('destroy', () => {
+            const pendingId = this._notificationPending.get(notification);
+            if (pendingId)
+                GLib.source_remove(pendingId);
+            this._notificationPending.delete(notification);
+            this._notificationSignatures.delete(notification);
+            this._notificationSignals.delete(notification);
+        });
+        this._notificationSignals.set(notification, [titleId, bodyId, destroyId]);
+        this._notificationSignatures.set(
+            notification,
+            this._notificationSignature(source, notification)
+        );
+        if (newlyAdded)
+            this._queueMailNotification(source, notification, true);
+    }
+
+    _queueMailNotification(source, notification, force = false) {
+        if (this._notificationPending.has(notification))
+            return;
+        const pendingId = GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
+            this._notificationPending.delete(notification);
+            const signature = this._notificationSignature(source, notification);
+            const previous = this._notificationSignatures.get(notification);
+            this._notificationSignatures.set(notification, signature);
+            if ((force || signature !== previous) && signature)
+                this._emitMailNotification(source, notification);
+            return GLib.SOURCE_REMOVE;
+        });
+        this._notificationPending.set(notification, pendingId);
+    }
+
+    _notificationIdentity(source) {
+        const app = source.app ?? source._app ?? null;
+        const appId = app?.get_id?.() ?? source._appId ?? '';
+        const appName = app?.get_name?.() ?? source.title ?? '';
+        return [String(appId), String(appName)];
+    }
+
+    _notificationSignature(source, notification) {
+        const [appId, appName] = this._notificationIdentity(source);
+        const identity = `${appId}\n${appName}`.toLowerCase();
+        if (!identity.includes('thunderbird'))
+            return '';
+        const title = this._safeNotificationText(notification.title, 1000);
+        const body = this._safeNotificationText(notification.body, 4000);
+        if (!title && !body)
+            return '';
+        return `${appId}\n${appName}\n${title}\n${body}`;
+    }
+
+    _safeNotificationText(value, maximumCharacters) {
+        const normalized = String(value ?? '')
+            .replace(/<[^>]*>/g, ' ')
+            .replace(/\s+/g, ' ')
+            .trim();
+        return Array.from(normalized).slice(0, maximumCharacters).join('');
+    }
+
+    _emitMailNotification(source, notification) {
+        const [appId, appName] = this._notificationIdentity(source);
+        const title = this._safeNotificationText(notification.title, 1000);
+        const body = this._safeNotificationText(notification.body, 4000);
+        try {
+            this._dbusObject.emit_signal(
+                'MailNotification',
+                new GLib.Variant('(ssss)', [appId, appName, title, body])
+            );
+        } catch (error) {
+            logError(error, 'Membrie could not report a Thunderbird notification');
+        }
+    }
+
     destroy() {
         this._readGeneration++;
         if (this._selection && this._ownerChangedId > 0)
@@ -450,6 +580,34 @@ class ClipboardBridge {
         if (this._sessionUpdatedId > 0)
             Main.sessionMode.disconnect(this._sessionUpdatedId);
         this._sessionUpdatedId = 0;
+        if (this._notificationSourceAddedId > 0)
+            Main.messageTray.disconnect(this._notificationSourceAddedId);
+        this._notificationSourceAddedId = 0;
+        if (this._notificationSourceRemovedId > 0)
+            Main.messageTray.disconnect(this._notificationSourceRemovedId);
+        this._notificationSourceRemovedId = 0;
+        for (const [source, signalId] of this._notificationSourceIds) {
+            try {
+                source.disconnect(signalId);
+            } catch (_error) {
+                // The source may already have been disposed by GNOME Shell.
+            }
+        }
+        this._notificationSourceIds.clear();
+        for (const [notification, signalIds] of this._notificationSignals) {
+            for (const signalId of signalIds) {
+                try {
+                    notification.disconnect(signalId);
+                } catch (_error) {
+                    // The notification may already have been disposed.
+                }
+            }
+        }
+        this._notificationSignals.clear();
+        for (const pendingId of this._notificationPending.values())
+            GLib.source_remove(pendingId);
+        this._notificationPending.clear();
+        this._notificationSignatures.clear();
         if (this._activitySignalId > 0)
             GLib.source_remove(this._activitySignalId);
         this._activitySignalId = 0;

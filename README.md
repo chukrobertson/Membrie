@@ -27,14 +27,15 @@ The project is intentionally local-first and self-hosted:
 - Color-grouped application time ribbon with idle gaps, stable app colors, and exact evidence
 - Timeline filters for observed activity, scheduled events, and manual notes, including upcoming days
 - Evidence inspection that states each source's provenance and what it can—and cannot—prove
-- Evidence-backed repeated-context observations without productivity scoring
+- Evidence-backed repeated-context, resume-after-break, and clustered-mail patterns without productivity scoring
+- Clickable pattern evidence in the Timeline and deterministic pattern context for Brie when asked
 - Exact full-text search powered by SQLite FTS5/BM25
 - Persistent pause state
 - Safe, explicitly enabled clipboard capture through a local GNOME Shell bridge
 - Optional focused-application and window-title activity sessions with idle boundaries
 - Opt-in Semantic Context capture using bounded, read-only GNOME accessibility data
 - First-class LibreOffice Writer, Calc, Impress, Draw, Base, and Math context with focused-document identity and bounded text excerpts
-- First-class Thunderbird mailbox, message, and compose context with truthful Sent, Drafts, Outbox, and delivery boundaries
+- First-class Thunderbird mailbox, message, compose, and local new-mail notification evidence with truthful arrival, Sent, Drafts, Outbox, and delivery boundaries
 - Adaptive semantic-first capture: rich application context avoids redundant screenshots,
   while sparse or unavailable context falls back to Screen Memory when it is enabled
 - A consent-gated, store-nothing Semantic Context compatibility test
@@ -66,7 +67,7 @@ The project is intentionally local-first and self-hosted:
 - Local model selection and visible indexing health
 
 Broader file-format understanding, per-calendar controls, meeting transcripts,
-individual device revocation, and deeper pattern detection are the next implementation milestones.
+individual device revocation, and richer cross-source corroboration are the next implementation milestones.
 
 ## Install on Ubuntu
 
@@ -177,7 +178,11 @@ the caret. It never opens another document, reads files from disk, or calls Libr
 actions. Focused Thunderbird windows similarly expose only bounded accessibility context from the
 mailbox, message, or compose view; Membrie never receives Gmail credentials or reads Thunderbird's
 profile database. Compose, Drafts, Outbox, Inbox, and Sent are labeled with distinct evidence limits
-so Brie does not confuse drafting with sending or a Sent copy with delivery. Rich semantic observations replace a
+so Brie does not confuse drafting with sending or a Sent copy with delivery. A separate, off-by-default
+**Thunderbird arrivals** control can remember new-mail notifications that GNOME receives from
+Thunderbird. Those records prove only that the local notification appeared—not that the email was
+opened, read, answered, or acted upon. No mail account credentials or profile database access is
+involved. Rich semantic observations replace a
 redundant screenshot; partial or unavailable observations allow Screen Memory to fill the
 gap when that separate source is enabled. Screen Memory takes one-shot samples of the
 active window, filters unchanged frames locally, removes each PNG from disk before local

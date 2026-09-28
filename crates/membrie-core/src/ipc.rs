@@ -1,10 +1,10 @@
 use crate::model::{
     ActivityRecordResult, ActivitySnapshot, Attachment, AttachmentBatchImport, AttachmentImport,
     BackupInfo, BrieAnswer, CalendarSyncResult, CaptureCandidate, CaptureDecision, CaptureRule,
-    CaptureStatus, IntelligenceSettings, IntelligenceStatus, MobileUsageSummary, NewRemembrie,
-    PauseMode, RecallSnapshot, Remembrie, ScreenCaptureCandidate, ScreenCaptureResult, SearchHit,
-    SemanticCaptureCandidate, SemanticCaptureResult, TimelineEntry, TimelineHistorySpan,
-    TimelineMapSlice,
+    CaptureStatus, EvidencePattern, IntelligenceSettings, IntelligenceStatus, MobileUsageSummary,
+    NewRemembrie, PauseMode, RecallSnapshot, Remembrie, ScreenCaptureCandidate,
+    ScreenCaptureResult, SearchHit, SemanticCaptureCandidate, SemanticCaptureResult, TimelineEntry,
+    TimelineHistorySpan, TimelineMapSlice,
 };
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -69,6 +69,11 @@ pub enum Request {
         start_ms: i64,
         end_ms: i64,
     },
+    EvidencePatterns {
+        start_ms: i64,
+        end_ms: i64,
+        limit: u32,
+    },
     Search {
         query: String,
         limit: u32,
@@ -86,6 +91,9 @@ pub enum Request {
         idle_threshold_ms: u64,
     },
     SetSemanticEnabled {
+        enabled: bool,
+    },
+    SetMailNotificationsEnabled {
         enabled: bool,
     },
     SetSemanticSampleInterval {
@@ -201,6 +209,9 @@ pub enum Response {
     },
     TimelineMap {
         slices: Vec<TimelineMapSlice>,
+    },
+    EvidencePatterns {
+        patterns: Vec<EvidencePattern>,
     },
     SearchResults {
         hits: Vec<SearchHit>,
@@ -537,6 +548,24 @@ impl DaemonClient {
         }
     }
 
+    pub fn evidence_patterns(
+        &self,
+        start_ms: i64,
+        end_ms: i64,
+        limit: u32,
+    ) -> Result<Vec<EvidencePattern>, ClientError> {
+        match self.request(&Request::EvidencePatterns {
+            start_ms,
+            end_ms,
+            limit,
+        })? {
+            Response::EvidencePatterns { patterns } => Ok(patterns),
+            other => Err(ClientError::Rejected(format!(
+                "unexpected response: {other:?}"
+            ))),
+        }
+    }
+
     pub fn search(
         &self,
         query: impl Into<String>,
@@ -597,6 +626,18 @@ impl DaemonClient {
 
     pub fn set_semantic_enabled(&self, enabled: bool) -> Result<CaptureStatus, ClientError> {
         match self.request(&Request::SetSemanticEnabled { enabled })? {
+            Response::CaptureSourceUpdated { status } => Ok(status),
+            other => Err(ClientError::Rejected(format!(
+                "unexpected response: {other:?}"
+            ))),
+        }
+    }
+
+    pub fn set_mail_notifications_enabled(
+        &self,
+        enabled: bool,
+    ) -> Result<CaptureStatus, ClientError> {
+        match self.request(&Request::SetMailNotificationsEnabled { enabled })? {
             Response::CaptureSourceUpdated { status } => Ok(status),
             other => Err(ClientError::Rejected(format!(
                 "unexpected response: {other:?}"

@@ -14,11 +14,11 @@ pub use model::{
     ActivityRecordResult, ActivitySnapshot, Attachment, AttachmentBatchImport, AttachmentImport,
     AttachmentProcessingJob, AudioTranscription, BackupInfo, BrieAnswer, BrieCitation,
     CalendarSnapshot, CalendarSourceSnapshot, CalendarSyncResult, CaptureCandidate,
-    CaptureDecision, CaptureRule, CaptureStatus, EmbeddedChunk, IntelligenceSettings,
-    IntelligenceStatus, LocalModel, MobileUsageSummary, NewRemembrie, PauseMode, ProcessingJob,
-    Remembrie, ScreenAnalysis, ScreenCaptureCandidate, ScreenCaptureResult, SearchHit,
-    SemanticCaptureCandidate, SemanticCaptureResult, StagedAttachmentImport,
-    TimelineActivityObservation, TimelineActivitySummary, TimelineEntry, TimelineHistorySpan,
-    TimelineMapSlice,
+    CaptureDecision, CaptureRule, CaptureStatus, EmbeddedChunk, EvidencePattern,
+    IntelligenceSettings, IntelligenceStatus, LocalModel, MobileUsageSummary, NewRemembrie,
+    PatternEvidence, PauseMode, ProcessingJob, Remembrie, ScreenAnalysis, ScreenCaptureCandidate,
+    ScreenCaptureResult, SearchHit, SemanticCaptureCandidate, SemanticCaptureResult,
+    StagedAttachmentImport, TimelineActivityObservation, TimelineActivitySummary, TimelineEntry,
+    TimelineHistorySpan, TimelineMapSlice,
 };
 pub use repository::{Repository, RepositoryError};

@@ -71,6 +71,23 @@ pub struct TimelineEntry {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PatternEvidence {
+    pub remembrie_id: String,
+    pub occurred_at_ms: i64,
+    pub label: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct EvidencePattern {
+    pub id: String,
+    pub kind: String,
+    pub title: String,
+    pub detail: String,
+    pub caution: String,
+    pub evidence: Vec<PatternEvidence>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct NewRemembrie {
     pub kind: String,
     pub title: String,
@@ -279,6 +296,12 @@ pub struct CaptureStatus {
     pub semantic_last_observed_at_ms: Option<i64>,
     #[serde(default)]
     pub semantic_last_app: Option<String>,
+    #[serde(default)]
+    pub mail_notifications_enabled: bool,
+    #[serde(default)]
+    pub mail_notification_count: u64,
+    #[serde(default)]
+    pub mail_last_received_at_ms: Option<i64>,
     #[serde(default)]
     pub screen_enabled: bool,
     #[serde(default = "default_screen_sample_interval_ms")]

@@ -98,6 +98,7 @@ fn main() -> Result<()> {
                 &semantic_sampler_for_signals,
                 &semantic_busy_for_signals,
             ),
+            "MailNotification" => capture_mail_notification(&client_for_signals, parameters),
             _ => {}
         },
     );
@@ -621,6 +622,83 @@ fn current_time_ms() -> i64 {
         .unwrap_or(0)
 }
 
+fn capture_mail_notification(client: &DaemonClient, parameters: &glib::Variant) {
+    let Ok((app_id, app_name, title, notification_body)) =
+        parameters.try_get::<(String, String, String, String)>()
+    else {
+        eprintln!("Desktop bridge sent invalid mail-notification metadata");
+        return;
+    };
+    let identity = format!("{app_id}\n{app_name}").to_ascii_lowercase();
+    if !identity.contains("thunderbird") {
+        return;
+    }
+    match client.status() {
+        Ok(status) if status.mail_notifications_enabled && !status.paused => {}
+        Ok(_) => return,
+        Err(error) => {
+            eprintln!("Could not check whether mail capture is enabled: {error}");
+            return;
+        }
+    }
+    let title = bounded_notification_text(&title, 1_000);
+    let notification_body = bounded_notification_text(&notification_body, 4_000);
+    if title.is_empty() && notification_body.is_empty() {
+        return;
+    }
+    let display_subject = if !title.is_empty() {
+        title.as_str()
+    } else {
+        notification_body.as_str()
+    };
+    let mut body = "Thunderbird reported a local new-mail notification.".to_owned();
+    if !title.is_empty() {
+        body.push_str("\nNotification title: ");
+        body.push_str(&title);
+    }
+    if !notification_body.is_empty() {
+        body.push_str("\nNotification text: ");
+        body.push_str(&notification_body);
+    }
+    body.push_str(
+        "\nEvidence boundary: this supports that Thunderbird presented a new-mail notification. It does not prove the message was opened, read, answered, or acted upon.",
+    );
+    let candidate = CaptureCandidate {
+        kind: "mail_arrival".to_owned(),
+        title: format!(
+            "New email · {}",
+            bounded_notification_text(display_subject, 120)
+        ),
+        body,
+        source_app: Some("Thunderbird".to_owned()),
+        window_title: Some("New mail notification".to_owned()),
+        source_uri: None,
+        occurred_at_ms: Some(current_time_ms()),
+    };
+    let client = client.clone();
+    std::thread::spawn(move || match client.capture(candidate) {
+        Ok(CaptureDecision::Stored { remembrie }) => {
+            println!("Remembered Thunderbird mail arrival {}", remembrie.id);
+        }
+        Ok(CaptureDecision::Skipped {
+            category, reason, ..
+        }) => {
+            println!("Skipped Thunderbird mail arrival ({category}): {reason}");
+        }
+        Err(error) => eprintln!("Thunderbird mail arrival capture failed: {error}"),
+    });
+}
+
+fn bounded_notification_text(value: &str, maximum_characters: usize) -> String {
+    value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(maximum_characters)
+        .collect()
+}
+
 fn request_clipboard_text(
     proxy: &gio::DBusProxy,
     client: &DaemonClient,
@@ -752,5 +830,14 @@ mod tests {
             semantic_capability_for_quality("partial"),
             SemanticCapability::Partial
         );
+    }
+
+    #[test]
+    fn mail_notification_text_is_normalized_and_bounded() {
+        assert_eq!(
+            bounded_notification_text("  Duke\n  care   update  ", 100),
+            "Duke care update"
+        );
+        assert_eq!(bounded_notification_text("🧠🧠🧠", 2), "🧠🧠");
     }
 }

@@ -11,7 +11,8 @@ not an individual key press or low-level operating-system event.
 - `attachment_blobs`: unique SHA-256 identities, byte sizes, and detected media types for retained files
 - `remembrie_links`: explicit and inferred relationships between Remembries
 - `capture_rules`: exclusions and capture policy
-- `capture_state`: global pause state and opt-in source settings
+- `capture_state`: global pause state and opt-in source settings, including a distinct
+  off-by-default Thunderbird-arrivals consent
 - `capture_events`: content-free decisions for stored or skipped automatic events
 - `activity_sessions`: bounded active-use periods and their closing reason
 - `activity_observations`: deduplicated focused application and window-title changes
@@ -21,6 +22,8 @@ not an individual key press or low-level operating-system event.
   focused-document labels plus a bounded read-only excerpt in `text_content`
 - Thunderbird context also remains in `semantic_observations`; its mailbox/message labels encode
   Compose, Drafts, Outbox, Inbox, and Sent evidence boundaries without storing account credentials
+- Thunderbird `mail_arrival` items are ordinary canonical Remembries created from bounded local GNOME
+  notification metadata; they prove only that a new-mail notification was presented
 - `screen_observations`: explicitly labeled local vision descriptions tied to activity sessions;
   processing state survives session boundaries and temporary source images are not retained
 - `mobile_usage_events`: coarse opening counts and bounded visible-time pulses, stored locally without
@@ -31,9 +34,10 @@ Activity Remembrie when its session closes. They are supporting context rather t
 claims that an action occurred. Disabling Activity Context also disables both dependent sources.
 
 The visual Timeline does not create another canonical table. History cells, per-application
-duration ribbons, and repeated-context observations are derived on demand from Remembries,
-activity sessions, and their observations. This keeps colors and presentation replaceable while
-the original evidence remains authoritative.
+duration ribbons, and evidence-backed patterns are derived on demand from Remembries, activity
+sessions, and their observations. Repeated-context, resume-after-break, and clustered-mail results
+carry supporting Remembrie IDs and explicit cautions. This keeps pattern rules, colors, and
+presentation replaceable while the original evidence remains authoritative.
 
 ## Derived records
 

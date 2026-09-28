@@ -184,6 +184,15 @@ does not prove sending; Outbox may mean queued; a message visibly listed in Sent
 Thunderbird submitted it or stored a sent copy, but does not prove delivery or reading. Brie's local
 system prompt repeats these boundaries before answering from the resulting Remembries.
 
+The GNOME bridge also watches the Shell's already-local notification objects and filters them to a
+trusted Thunderbird application identity before emitting anything to the capture helper. A newly
+added notification, or a changed Thunderbird notification, is accepted only while the separate,
+off-by-default Thunderbird-arrivals source is enabled and capture is not paused. Title and body are bounded, normalized,
+and passed through the ordinary application/content exclusions, secret detection, and duplicate
+filter before becoming a `mail_arrival` Remembrie. This is notification evidence, not direct mailbox
+access: if Thunderbird notifications are disabled or GNOME never receives one, Membrie has no arrival
+event. It never opens the message or treats arrival as evidence of reading or response.
+
 Semantic and Screen Memory cooperate rather than blindly duplicating work. Rich semantic context
 suppresses Screen Memory until the next semantic interval. Partial context is stored but permits
 a visual fallback on the next desktop sample. Applications that do not expose usable AT-SPI data
@@ -305,10 +314,14 @@ deterministically onto a small accessible color palette, with names and duration
 so meaning never depends on color alone.
 
 Day entries remain grouped at the meaningful Remembrie level. Exact captured evidence is loaded
-on demand from the daemon, keeping the normal Timeline response compact. Lightweight repeated-
-context observations are deterministic and evidence-linked; they are phrased as patterns worth
-noticing rather than claims about intent or task completion. Relationship data remains available
-to Search and Brie without requiring a separate constellation interface.
+on demand from the daemon, keeping the normal Timeline response compact. Patterns are derived on
+demand rather than stored as canonical claims. The first deterministic detectors cover repeated
+focus visits, resuming the same first/last context after a meaningful break, and clusters of local
+Thunderbird arrival notifications. Every result carries its caution and exact supporting Remembrie
+IDs; Timeline evidence buttons navigate to those records. No detector scores productivity, importance,
+emotion, intent, or completion. When a question explicitly asks about patterns, Brie receives these
+derived pointers plus the canonical supporting sources and must cite those sources. Relationship data
+remains available without requiring a separate constellation interface.
 
 The chronology can separate observed records, scheduled calendar records, and manually authored
 notes, and it permits bounded navigation into the same one-year future window used by the calendar

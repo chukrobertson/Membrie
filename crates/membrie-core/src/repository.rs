@@ -2,11 +2,12 @@ use crate::model::{
     ActivityRecordResult, ActivitySnapshot, Attachment, AttachmentBatchImport, AttachmentImport,
     AttachmentProcessingJob, AudioTranscription, CalendarEventSnapshot, CalendarSnapshot,
     CalendarSyncResult, CaptureCandidate, CaptureDecision, CaptureRule, CaptureStatus,
-    EmbeddedChunk, IntelligenceSettings, IntelligenceStatus, LocalModel, MobileUsageSummary,
-    NewRemembrie, PauseMode, ProcessingJob, RecallSnapshot, Remembrie, ScreenAnalysis,
-    ScreenCaptureCandidate, ScreenCaptureResult, SearchHit, SemanticCaptureCandidate,
-    SemanticCaptureResult, StagedAttachmentImport, TimelineActivityObservation,
-    TimelineActivitySummary, TimelineEntry, TimelineHistorySpan, TimelineMapSlice,
+    EmbeddedChunk, EvidencePattern, IntelligenceSettings, IntelligenceStatus, LocalModel,
+    MobileUsageSummary, NewRemembrie, PatternEvidence, PauseMode, ProcessingJob, RecallSnapshot,
+    Remembrie, ScreenAnalysis, ScreenCaptureCandidate, ScreenCaptureResult, SearchHit,
+    SemanticCaptureCandidate, SemanticCaptureResult, StagedAttachmentImport,
+    TimelineActivityObservation, TimelineActivitySummary, TimelineEntry, TimelineHistorySpan,
+    TimelineMapSlice,
 };
 use crate::policy::{MAX_AUTOMATIC_CONTENT_BYTES, exclusion_reason, sensitive_reason};
 use rusqlite::{Connection, DatabaseName, OptionalExtension, Row, Transaction, params};
@@ -19,7 +20,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use uuid::Uuid;
 
-const SCHEMA_VERSION: i64 = 11;
+const SCHEMA_VERSION: i64 = 12;
 const DUPLICATE_WINDOW_MS: i64 = 24 * 60 * 60 * 1000;
 const MIN_SEMANTIC_SIMILARITY: f64 = 0.25;
 const SEMANTIC_SCORE_WINDOW: f64 = 0.20;
@@ -440,6 +441,11 @@ const MIGRATION_11: &str = r#"
 ALTER TABLE remembrie_contents ADD COLUMN user_correction TEXT;
 "#;
 
+const MIGRATION_12: &str = r#"
+ALTER TABLE capture_state ADD COLUMN mail_notifications_enabled INTEGER NOT NULL DEFAULT 0
+    CHECK(mail_notifications_enabled IN (0, 1));
+"#;
+
 #[derive(Debug, Error)]
 pub enum RepositoryError {
     #[error("database error: {0}")]
@@ -463,6 +469,25 @@ struct ActivityObservationRecord {
     app_id: String,
     app_name: String,
     window_title: String,
+}
+
+#[derive(Clone)]
+struct PatternObservationRecord {
+    remembrie_id: String,
+    session_started_at_ms: i64,
+    session_ended_at_ms: i64,
+    observed_at_ms: i64,
+    app_id: String,
+    app_name: String,
+    window_title: String,
+}
+
+struct PatternSessionRecord {
+    remembrie_id: String,
+    started_at_ms: i64,
+    ended_at_ms: i64,
+    first: PatternObservationRecord,
+    last: PatternObservationRecord,
 }
 
 struct StoredAttachmentInput {
@@ -570,6 +595,13 @@ impl Repository {
         if version < 11 {
             let transaction = connection.unchecked_transaction()?;
             transaction.execute_batch(MIGRATION_11)?;
+            transaction.pragma_update(None, "user_version", 11)?;
+            transaction.commit()?;
+            version = 11;
+        }
+        if version < 12 {
+            let transaction = connection.unchecked_transaction()?;
+            transaction.execute_batch(MIGRATION_12)?;
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             transaction.commit()?;
         }
@@ -1452,6 +1484,104 @@ impl Repository {
         Ok(entries)
     }
 
+    pub fn evidence_patterns(
+        &self,
+        start_ms: i64,
+        end_ms: i64,
+        limit: u32,
+    ) -> Result<Vec<EvidencePattern>, RepositoryError> {
+        validate_timeline_range(start_ms, end_ms, 40 * 24 * 60 * 60 * 1000)?;
+        let expanded_start = start_ms.saturating_sub(7 * 24 * 60 * 60 * 1000);
+        let observations = {
+            let mut statement = self.connection.prepare(
+                "SELECT r.id, s.started_at_ms, s.ended_at_ms, o.observed_at_ms,
+                        o.app_id, o.app_name, o.window_title
+                 FROM activity_observations o
+                 JOIN activity_sessions s ON s.id = o.session_id
+                 JOIN remembries r ON r.id = s.remembrie_id
+                 WHERE r.deleted_at_ms IS NULL
+                   AND s.ended_at_ms IS NOT NULL
+                   AND o.observed_at_ms >= ?1
+                   AND o.observed_at_ms < ?2
+                 ORDER BY s.started_at_ms, o.observed_at_ms, o.created_at_ms
+                 LIMIT 20000",
+            )?;
+            let rows = statement.query_map(params![expanded_start, end_ms], |row| {
+                Ok(PatternObservationRecord {
+                    remembrie_id: row.get(0)?,
+                    session_started_at_ms: row.get(1)?,
+                    session_ended_at_ms: row.get(2)?,
+                    observed_at_ms: row.get(3)?,
+                    app_id: row.get(4)?,
+                    app_name: row.get(5)?,
+                    window_title: row.get(6)?,
+                })
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+
+        let mut patterns = repeated_context_patterns(&observations, start_ms, end_ms);
+        patterns.extend(resumed_context_patterns(&observations, start_ms, end_ms));
+        if let Some(mail_pattern) = self.mail_arrival_pattern(start_ms, end_ms)? {
+            patterns.push(mail_pattern);
+        }
+        patterns.sort_by(|left, right| {
+            pattern_priority(&right.kind)
+                .cmp(&pattern_priority(&left.kind))
+                .then_with(|| {
+                    right
+                        .evidence
+                        .iter()
+                        .map(|item| item.occurred_at_ms)
+                        .max()
+                        .cmp(&left.evidence.iter().map(|item| item.occurred_at_ms).max())
+                })
+                .then_with(|| left.title.cmp(&right.title))
+        });
+        patterns.truncate(limit.clamp(1, 12) as usize);
+        Ok(patterns)
+    }
+
+    fn mail_arrival_pattern(
+        &self,
+        start_ms: i64,
+        end_ms: i64,
+    ) -> Result<Option<EvidencePattern>, RepositoryError> {
+        let records = {
+            let mut statement = self.connection.prepare(
+                "SELECT id, occurred_at_ms, title
+                 FROM remembries
+                 WHERE deleted_at_ms IS NULL AND kind = 'mail_arrival'
+                   AND occurred_at_ms >= ?1 AND occurred_at_ms < ?2
+                 ORDER BY occurred_at_ms
+                 LIMIT 100",
+            )?;
+            let rows = statement.query_map(params![start_ms, end_ms], |row| {
+                Ok(PatternEvidence {
+                    remembrie_id: row.get(0)?,
+                    occurred_at_ms: row.get(1)?,
+                    label: row.get(2)?,
+                })
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        if records.len() < 2 {
+            return Ok(None);
+        }
+        let count = records.len();
+        Ok(Some(EvidencePattern {
+            id: pattern_id("mail-arrivals", &format!("{start_ms}:{end_ms}")),
+            kind: "mail_arrivals".to_owned(),
+            title: "New mail arrived in a cluster".to_owned(),
+            detail: format!(
+                "Thunderbird reported {count} new-mail notifications during this period."
+            ),
+            caution: "Arrival notifications do not prove that any message was opened, read, answered, or acted upon."
+                .to_owned(),
+            evidence: records.into_iter().rev().take(5).collect(),
+        }))
+    }
+
     fn timeline_activity_summary(
         &self,
         remembrie_id: &str,
@@ -2310,12 +2440,13 @@ impl Repository {
             activity_idle_threshold_ms,
             semantic_enabled,
             semantic_sample_interval_ms,
+            mail_notifications_enabled,
             screen_enabled,
             screen_sample_interval_ms,
             screen_model,
         ) = self.connection.query_row(
             "SELECT clipboard_enabled, activity_enabled, activity_idle_threshold_ms,
-                        semantic_enabled, semantic_sample_interval_ms,
+                        semantic_enabled, semantic_sample_interval_ms, mail_notifications_enabled,
                         screen_enabled, screen_sample_interval_ms, screen_model
                  FROM capture_state WHERE singleton = 1",
             [],
@@ -2329,6 +2460,7 @@ impl Repository {
                     row.get(5)?,
                     row.get(6)?,
                     row.get(7)?,
+                    row.get(8)?,
                 ))
             },
         )?;
@@ -2417,6 +2549,13 @@ impl Repository {
                 |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
             )
             .optional()?;
+        let (mail_notification_count, mail_last_received_at_ms) = self.connection.query_row(
+            "SELECT COUNT(*), MAX(occurred_at_ms)
+             FROM remembries
+             WHERE deleted_at_ms IS NULL AND kind = 'mail_arrival'",
+            [],
+            |row| Ok((row.get::<_, u64>(0)?, row.get::<_, Option<i64>>(1)?)),
+        )?;
         let (
             calendar_enabled,
             calendar_source_count,
@@ -2466,6 +2605,9 @@ impl Repository {
                 .as_ref()
                 .map(|observation| observation.0),
             semantic_last_app: last_semantic_observation.map(|observation| observation.1),
+            mail_notifications_enabled,
+            mail_notification_count,
+            mail_last_received_at_ms,
             screen_enabled,
             screen_sample_interval_ms,
             screen_model,
@@ -2900,6 +3042,19 @@ impl Repository {
              SET semantic_enabled = ?1, updated_at_ms = ?2
              WHERE singleton = 1",
             params![semantic_enabled, now_ms()?],
+        )?;
+        self.status()
+    }
+
+    pub fn set_mail_notifications_enabled(
+        &self,
+        mail_notifications_enabled: bool,
+    ) -> Result<CaptureStatus, RepositoryError> {
+        self.connection.execute(
+            "UPDATE capture_state
+             SET mail_notifications_enabled = ?1, updated_at_ms = ?2
+             WHERE singleton = 1",
+            params![mail_notifications_enabled, now_ms()?],
         )?;
         self.status()
     }
@@ -4316,6 +4471,230 @@ impl Repository {
     }
 }
 
+fn repeated_context_patterns(
+    observations: &[PatternObservationRecord],
+    start_ms: i64,
+    end_ms: i64,
+) -> Vec<EvidencePattern> {
+    type ContextVisits = (String, String, u32, i64, Vec<PatternEvidence>);
+    let mut visits: HashMap<(String, String), ContextVisits> = HashMap::new();
+    for observation in observations
+        .iter()
+        .filter(|item| item.observed_at_ms >= start_ms && item.observed_at_ms < end_ms)
+    {
+        let Some((app_key, title_key)) = pattern_context_key(observation) else {
+            continue;
+        };
+        let app = pattern_app_label(observation);
+        let title = observation.window_title.trim().to_owned();
+        let value = visits
+            .entry((app_key, title_key))
+            .or_insert_with(|| (app.clone(), title.clone(), 0, 0, Vec::new()));
+        value.2 += 1;
+        value.3 = value.3.max(observation.observed_at_ms);
+        if !value
+            .4
+            .iter()
+            .any(|item| item.remembrie_id == observation.remembrie_id)
+            && value.4.len() < 5
+        {
+            value.4.push(PatternEvidence {
+                remembrie_id: observation.remembrie_id.clone(),
+                occurred_at_ms: observation.observed_at_ms,
+                label: format!("{app} · {title}"),
+            });
+        }
+    }
+
+    let mut patterns: Vec<(u32, i64, EvidencePattern)> = visits
+        .into_iter()
+        .filter(|(_, (_, _, count, _, _))| *count >= 3)
+        .map(|((app_key, title_key), (app, title, count, latest, evidence))| {
+            let pattern = EvidencePattern {
+                id: pattern_id(
+                    "repeated-context",
+                    &format!("{app_key}\n{title_key}"),
+                ),
+                kind: "repeated_context".to_owned(),
+                title: "A context kept drawing you back".to_owned(),
+                detail: format!(
+                    "Membrie observed {count} separate focus visits to “{}” in {app}.",
+                    truncate_pattern_text(&title, 140)
+                ),
+                caution: "Repeated focus is not proof that the task was unfinished, important, or productive."
+                    .to_owned(),
+                evidence,
+            };
+            (count, latest, pattern)
+        })
+        .collect();
+    patterns.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| right.1.cmp(&left.1)));
+    patterns
+        .into_iter()
+        .take(4)
+        .map(|(_, _, pattern)| pattern)
+        .collect()
+}
+
+fn resumed_context_patterns(
+    observations: &[PatternObservationRecord],
+    start_ms: i64,
+    end_ms: i64,
+) -> Vec<EvidencePattern> {
+    let mut grouped: HashMap<String, PatternSessionRecord> = HashMap::new();
+    for observation in observations {
+        grouped
+            .entry(observation.remembrie_id.clone())
+            .and_modify(|session| session.last = observation.clone())
+            .or_insert_with(|| PatternSessionRecord {
+                remembrie_id: observation.remembrie_id.clone(),
+                started_at_ms: observation.session_started_at_ms,
+                ended_at_ms: observation.session_ended_at_ms,
+                first: observation.clone(),
+                last: observation.clone(),
+            });
+    }
+    let mut sessions: Vec<_> = grouped.into_values().collect();
+    sessions.sort_by_key(|session| session.started_at_ms);
+
+    let mut latest_by_context: HashMap<(String, String), (i64, EvidencePattern)> = HashMap::new();
+    for pair in sessions.windows(2) {
+        let previous = &pair[0];
+        let current = &pair[1];
+        if current.started_at_ms < start_ms || current.started_at_ms >= end_ms {
+            continue;
+        }
+        let gap_ms = current.started_at_ms.saturating_sub(previous.ended_at_ms);
+        if !(20 * 60 * 1000..=7 * 24 * 60 * 60 * 1000).contains(&gap_ms) {
+            continue;
+        }
+        let Some(previous_key) = pattern_context_key(&previous.last) else {
+            continue;
+        };
+        let Some(current_key) = pattern_context_key(&current.first) else {
+            continue;
+        };
+        if previous_key != current_key {
+            continue;
+        }
+        let app = pattern_app_label(&current.first);
+        let title = current.first.window_title.trim();
+        let detail = format!(
+            "After {}, observed activity resumed at “{}” in {app}.",
+            format_pattern_gap(gap_ms),
+            truncate_pattern_text(title, 140)
+        );
+        let pattern = EvidencePattern {
+            id: pattern_id(
+                "resumed-context",
+                &format!("{}\n{}", previous_key.0, previous_key.1),
+            ),
+            kind: "resumed_context".to_owned(),
+            title: "You resumed the same context after a break".to_owned(),
+            detail,
+            caution: "Matching first and last focused windows supports continuity, but does not prove intent or task completion."
+                .to_owned(),
+            evidence: vec![
+                PatternEvidence {
+                    remembrie_id: previous.remembrie_id.clone(),
+                    occurred_at_ms: previous.last.observed_at_ms,
+                    label: "Context before the break".to_owned(),
+                },
+                PatternEvidence {
+                    remembrie_id: current.remembrie_id.clone(),
+                    occurred_at_ms: current.first.observed_at_ms,
+                    label: "Context after the break".to_owned(),
+                },
+            ],
+        };
+        latest_by_context.insert(previous_key, (current.started_at_ms, pattern));
+    }
+    let mut patterns: Vec<_> = latest_by_context.into_values().collect();
+    patterns.sort_by_key(|(at, _)| std::cmp::Reverse(*at));
+    patterns
+        .into_iter()
+        .take(3)
+        .map(|(_, pattern)| pattern)
+        .collect()
+}
+
+fn pattern_context_key(observation: &PatternObservationRecord) -> Option<(String, String)> {
+    let title = normalize_pattern_text(&observation.window_title);
+    if title.chars().count() < 4
+        || matches!(
+            title.as_str(),
+            "new tab" | "desktop" | "activities" | "mozilla thunderbird" | "thunderbird"
+        )
+    {
+        return None;
+    }
+    let app = if observation.app_id.trim().is_empty() {
+        normalize_pattern_text(&observation.app_name)
+    } else {
+        normalize_pattern_text(&observation.app_id)
+    };
+    (!app.is_empty()).then_some((app, title))
+}
+
+fn pattern_app_label(observation: &PatternObservationRecord) -> String {
+    if !observation.app_name.trim().is_empty() {
+        observation.app_name.trim().to_owned()
+    } else if !observation.app_id.trim().is_empty() {
+        observation.app_id.trim().to_owned()
+    } else {
+        "the desktop".to_owned()
+    }
+}
+
+fn normalize_pattern_text(value: &str) -> String {
+    value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+fn truncate_pattern_text(value: &str, maximum: usize) -> String {
+    let mut text: String = value.chars().take(maximum).collect();
+    if value.chars().count() > maximum {
+        text.push('…');
+    }
+    text
+}
+
+fn format_pattern_gap(gap_ms: i64) -> String {
+    let minutes = gap_ms / 60_000;
+    if minutes < 60 {
+        format!("{minutes} minutes away")
+    } else {
+        let hours = minutes / 60;
+        let remaining_minutes = minutes % 60;
+        if remaining_minutes == 0 {
+            format!("{hours} {} away", if hours == 1 { "hour" } else { "hours" })
+        } else {
+            format!("{hours}h {remaining_minutes}m away")
+        }
+    }
+}
+
+fn pattern_id(kind: &str, key: &str) -> String {
+    let digest = Sha256::digest(format!("{kind}\n{key}").as_bytes());
+    let suffix: String = digest[..8]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    format!("{kind}:{suffix}")
+}
+
+fn pattern_priority(kind: &str) -> u8 {
+    match kind {
+        "resumed_context" => 3,
+        "mail_arrivals" => 2,
+        "repeated_context" => 1,
+        _ => 0,
+    }
+}
+
 fn validate_activity_text(
     label: &str,
     value: &str,
@@ -5373,6 +5752,113 @@ mod tests {
         let _ = fs::remove_file(path);
     }
 
+    #[test]
+    fn evidence_patterns_link_repeated_and_resumed_context_to_sessions() {
+        let path = temporary_database("evidence-patterns");
+        let mut repository = Repository::open(&path).unwrap();
+        repository.set_activity_enabled(true).unwrap();
+        repository.set_activity_idle_threshold(5 * 60_000).unwrap();
+        let start = 1_800_000_000_000_i64;
+        let writer = (
+            "libreoffice-writer.desktop",
+            "LibreOffice Writer",
+            "Duke advocacy notes — LibreOffice Writer",
+        );
+        let browser = ("google-chrome.desktop", "Google Chrome", "Research sources");
+        for (offset, context) in [
+            (0, writer),
+            (60_000, browser),
+            (120_000, writer),
+            (180_000, browser),
+            (240_000, writer),
+        ] {
+            repository
+                .record_activity_snapshot(activity_snapshot(
+                    start + offset,
+                    context.0,
+                    context.1,
+                    context.2,
+                    0,
+                ))
+                .unwrap();
+        }
+        repository
+            .record_activity_snapshot(activity_snapshot(
+                start + 9 * 60_000,
+                writer.0,
+                writer.1,
+                writer.2,
+                5 * 60_000,
+            ))
+            .unwrap();
+
+        let resumed_at = start + 2 * 60 * 60_000;
+        repository
+            .record_activity_snapshot(activity_snapshot(
+                resumed_at, writer.0, writer.1, writer.2, 0,
+            ))
+            .unwrap();
+        repository
+            .record_activity_snapshot(activity_snapshot(
+                resumed_at + 5 * 60_000,
+                writer.0,
+                writer.1,
+                writer.2,
+                5 * 60_000,
+            ))
+            .unwrap();
+
+        let patterns = repository
+            .evidence_patterns(start, start + 24 * 60 * 60_000, 10)
+            .unwrap();
+        let repeated = patterns
+            .iter()
+            .find(|pattern| pattern.kind == "repeated_context")
+            .unwrap();
+        assert!(repeated.detail.contains("4 separate focus visits"));
+        assert!(!repeated.evidence.is_empty());
+        let resumed = patterns
+            .iter()
+            .find(|pattern| pattern.kind == "resumed_context")
+            .unwrap();
+        assert_eq!(resumed.evidence.len(), 2);
+        assert_ne!(
+            resumed.evidence[0].remembrie_id,
+            resumed.evidence[1].remembrie_id
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn evidence_patterns_keep_mail_arrivals_truthfully_bounded() {
+        let path = temporary_database("mail-arrival-pattern");
+        let mut repository = Repository::open(&path).unwrap();
+        let start = 1_800_000_000_000_i64;
+        for (offset, subject) in [(1_000, "Care update"), (2_000, "School follow-up")] {
+            repository
+                .create(NewRemembrie {
+                    kind: "mail_arrival".to_owned(),
+                    title: format!("New email · {subject}"),
+                    body: format!("Thunderbird reported {subject}"),
+                    source_app: Some("Thunderbird".to_owned()),
+                    window_title: Some("New mail notification".to_owned()),
+                    occurred_at_ms: Some(start + offset),
+                })
+                .unwrap();
+        }
+        let patterns = repository
+            .evidence_patterns(start, start + 60_000, 10)
+            .unwrap();
+        let mail = patterns
+            .iter()
+            .find(|pattern| pattern.kind == "mail_arrivals")
+            .unwrap();
+        assert!(mail.detail.contains("2 new-mail notifications"));
+        assert!(mail.caution.contains("do not prove"));
+        assert_eq!(mail.evidence.len(), 2);
+        let _ = fs::remove_file(path);
+    }
+
     fn activity_snapshot(
         occurred_at_ms: i64,
         app_id: &str,
@@ -5489,6 +5975,7 @@ mod tests {
         assert_eq!(status.semantic_observation_count, 0);
         assert!(!status.mobile_enabled);
         assert!(!status.mobile_allow_while_locked);
+        assert!(!status.mail_notifications_enabled);
         let version: i64 = repository
             .connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
@@ -5518,6 +6005,26 @@ mod tests {
         assert!(!disabled.mobile_enabled);
         assert!(!disabled.mobile_allow_while_locked);
 
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn thunderbird_arrival_capture_has_separate_consent() {
+        let path = temporary_database("mail-notification-setting");
+        let repository = Repository::open(&path).unwrap();
+        assert!(!repository.status().unwrap().mail_notifications_enabled);
+        assert!(
+            repository
+                .set_mail_notifications_enabled(true)
+                .unwrap()
+                .mail_notifications_enabled
+        );
+        assert!(
+            !repository
+                .set_mail_notifications_enabled(false)
+                .unwrap()
+                .mail_notifications_enabled
+        );
         let _ = fs::remove_file(path);
     }
 
