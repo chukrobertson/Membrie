@@ -947,10 +947,26 @@ fn build_timeline_page(state: &Rc<UiState>) -> gtk::Widget {
         *state_for_today.timeline_render_key.borrow_mut() = None;
         refresh_timeline(&state_for_today);
     });
+    let refresh_button = gtk::Button::with_label("Refresh");
+    refresh_button.set_tooltip_text(Some(
+        "Return to today and reload the latest Remembries while keeping the current filter",
+    ));
+    let state_for_refresh = Rc::clone(state);
+    refresh_button.connect_clicked(move |_| {
+        state_for_refresh.timeline_target_id.borrow_mut().take();
+        state_for_refresh
+            .timeline_day_start_ms
+            .set(local_today_start_ms());
+        state_for_refresh.timeline_follow_today.set(true);
+        *state_for_refresh.timeline_render_key.borrow_mut() = None;
+        refresh_timeline(&state_for_refresh);
+        toast(&state_for_refresh, "Timeline refreshed · showing today");
+    });
     day_navigation.append(&previous);
     day_navigation.append(&state.timeline_day_label);
     day_navigation.append(&state.timeline_today_button);
     day_navigation.append(&state.timeline_next_button);
+    day_navigation.append(&refresh_button);
     page.append(&day_navigation);
 
     let history_section = gtk::Box::new(Orientation::Vertical, 8);
