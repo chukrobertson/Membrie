@@ -55,6 +55,12 @@ a redundant screenshot. Partial or unavailable semantic context lets Screen Memo
 visual fallback. Both sources remain dependent on Activity Context, and all processing stays local.
 Some already-open applications may need to be restarted after accessibility is enabled.
 
+LibreOffice Writer, Calc, Impress, Draw, Base, and Math use this same opt-in Semantic Context path.
+When one of their windows is focused, Membrie records its active document identity and a bounded
+read-only excerpt supplied by LibreOffice, normally near the caret. It does not scan the filesystem,
+open inactive documents, or invoke editing actions. Use **Compatibility test** while a LibreOffice
+document is focused to preview exactly what that window provides without storing the result.
+
 Calendar access is also off by default. When enabled, Membrie reads the calendars already exposed by
 Ubuntu's Evolution Data Server every 15 minutes. It imports a bounded one-year history and one-year
 look-ahead, expands recurring events, and makes them locally searchable by Brie. The connector does

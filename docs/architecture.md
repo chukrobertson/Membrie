@@ -162,6 +162,18 @@ Action or EditableText interfaces. The daemon applies the same pause, source, ex
 window, password-manager, secret, timestamp, and duplicate checks before a semantic observation
 can enter SQLite. Rejected content produces only a content-free ledger decision.
 
+LibreOffice is a first-class specialization inside that same boundary rather than a separate file
+reader. The probe recognizes Writer, Calc, Impress, Draw, Base, and Math from the focused AT-SPI
+window, derives the active document identity from its title, and may call only read operations on
+the Text interface for visible document, paragraph, text, heading, comment, or cell nodes. For
+virtualized sheets and slides, the read-only side of Selection may identify at most 16 selected
+descendants rather than expanding a huge document tree. Text reads are capped at 24 nodes, 2,000
+characters per node, and 6,000 characters per observation. Long nodes use a bounded range around
+the reported caret; Membrie does not enumerate files, open inactive documents, request unsaved
+document contents through UNO, or invoke EditableText, Action, or any selection-changing operation.
+A useful document excerpt marks the semantic sample rich enough to avoid redundant local vision
+work. Downstream exclusions and secret detection remain unchanged.
+
 Semantic and Screen Memory cooperate rather than blindly duplicating work. Rich semantic context
 suppresses Screen Memory until the next semantic interval. Partial context is stored but permits
 a visual fallback on the next desktop sample. Applications that do not expose usable AT-SPI data

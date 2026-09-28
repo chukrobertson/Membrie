@@ -3,6 +3,7 @@
 use anyhow::{Context, Result};
 use atspi::connection::set_session_accessibility;
 use atspi::proxy::accessible::ObjectRefExt;
+use atspi::proxy::proxy_ext::ProxyExt;
 use atspi::{AccessibilityConnection, Interface, Role, State};
 use futures_lite::future;
 use std::collections::HashSet;
@@ -11,6 +12,12 @@ use std::time::Duration;
 const MAX_NODES: usize = 500;
 const MAX_DEPTH: usize = 14;
 const MAX_PREVIEW_LINES: usize = 80;
+const MAX_DOCUMENT_TEXT_NODES: usize = 24;
+const MAX_DOCUMENT_TEXT_CHARACTERS: usize = 6_000;
+const MAX_DOCUMENT_TEXT_PER_NODE: usize = 2_000;
+const MAX_DOCUMENT_PREVIEW_LINE_CHARACTERS: usize = 600;
+const MAX_SELECTED_DESCENDANTS: usize = 16;
+const LIBREOFFICE_DOCUMENT_RESERVED_LINES: usize = 16;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct WindowTarget {
@@ -23,16 +30,22 @@ pub struct WindowTarget {
 pub struct ProbeSummary {
     pub application: String,
     pub window: String,
+    pub integration: Option<String>,
+    pub document: Option<String>,
     pub nodes_seen: usize,
     pub visible_nodes: usize,
     pub text_nodes: usize,
     pub document_nodes: usize,
+    pub document_text_nodes: usize,
+    pub document_text_characters: usize,
     pub preview: Vec<String>,
 }
 
 impl ProbeSummary {
     pub fn quality(&self) -> &'static str {
-        if self.preview.len() >= 8 && (self.text_nodes >= 3 || self.document_nodes > 0) {
+        if self.document_text_characters >= 80
+            || (self.preview.len() >= 8 && (self.text_nodes >= 3 || self.document_nodes > 0))
+        {
             "rich"
         } else if self.preview.len() >= 3
             || (!self.preview.is_empty() && (self.text_nodes > 0 || self.document_nodes > 0))
@@ -150,7 +163,14 @@ async fn inspect_window_async(
                     }
                 }
             } else if active || focused {
-                return inspect_tree(connection, window_ref, application_name, show_text).await;
+                return inspect_tree(
+                    connection,
+                    window_ref,
+                    application_name,
+                    target.as_ref(),
+                    show_text,
+                )
+                .await;
             }
         }
     }
@@ -165,6 +185,7 @@ async fn inspect_window_async(
             connection,
             candidate.object_ref,
             candidate.application,
+            target.as_ref(),
             show_text,
         )
         .await;
@@ -265,6 +286,7 @@ async fn inspect_tree(
     connection: &atspi::zbus::Connection,
     root_ref: atspi::ObjectRefOwned,
     application: String,
+    target: Option<&WindowTarget>,
     show_text: bool,
 ) -> Result<ProbeSummary> {
     let mut summary = ProbeSummary {
@@ -305,15 +327,95 @@ async fn inspect_tree(
         let name = accessible.name().await.unwrap_or_default();
         if is_root {
             summary.window = name.clone();
+            let target_identity = target
+                .map(|target| {
+                    format!(
+                        "{} {} {}",
+                        target.app_id, target.app_name, target.window_title
+                    )
+                })
+                .unwrap_or_default();
+            if let Some(component) =
+                libreoffice_component(&summary.application, &summary.window, &target_identity)
+            {
+                summary.integration = Some(component.to_owned());
+                summary.document = libreoffice_document_title(&summary.window);
+                if show_text {
+                    for line in libreoffice_identity_lines(component, summary.document.as_deref()) {
+                        if summary.preview.len() >= MAX_PREVIEW_LINES {
+                            break;
+                        }
+                        if preview_seen.insert(line.clone()) {
+                            summary.preview.push(line);
+                        }
+                    }
+                }
+            }
         }
-        if show_text && summary.preview.len() < MAX_PREVIEW_LINES {
+        let semantic_label_limit = if summary.integration.is_some() {
+            MAX_PREVIEW_LINES - LIBREOFFICE_DOCUMENT_RESERVED_LINES
+        } else {
+            MAX_PREVIEW_LINES
+        };
+        if show_text && summary.preview.len() < semantic_label_limit {
             let description = accessible.description().await.unwrap_or_default();
             let line = semantic_label(role, &name, &description);
             if !line.is_empty() && preview_seen.insert(line.clone()) {
                 summary.preview.push(line);
             }
         }
-        if depth == MAX_DEPTH || states.contains(State::ManagesDescendants) {
+        if show_text
+            && summary.integration.is_some()
+            && summary.document_text_nodes < MAX_DOCUMENT_TEXT_NODES
+            && summary.document_text_characters < MAX_DOCUMENT_TEXT_CHARACTERS
+            && should_read_libreoffice_text(role)
+            && interfaces.contains(Interface::Text)
+            && let Ok(proxies) = accessible.proxies().await
+            && let Ok(text) = proxies.text().await
+            && let Ok(character_count) = text.character_count().await
+        {
+            let remaining = MAX_DOCUMENT_TEXT_CHARACTERS - summary.document_text_characters;
+            let caret = text.caret_offset().await.ok();
+            let (start, end) = document_text_range(character_count, caret, remaining);
+            if end > start
+                && let Ok(excerpt) = text.get_text(start, end).await
+            {
+                let excerpt = truncate_characters(&normalize(&excerpt), remaining);
+                if !excerpt.is_empty() {
+                    summary.document_text_nodes += 1;
+                    summary.document_text_characters += excerpt.chars().count();
+                    let label = libreoffice_content_label(
+                        summary.integration.as_deref().unwrap_or("LibreOffice"),
+                    );
+                    for line in chunk_document_text(label, &excerpt) {
+                        if summary.preview.len() >= MAX_PREVIEW_LINES {
+                            break;
+                        }
+                        if preview_seen.insert(line.clone()) {
+                            summary.preview.push(line);
+                        }
+                    }
+                }
+            }
+        }
+        if depth == MAX_DEPTH {
+            continue;
+        }
+        if states.contains(State::ManagesDescendants) {
+            if summary.integration.is_some()
+                && interfaces.contains(Interface::Selection)
+                && let Ok(proxies) = accessible.proxies().await
+                && let Ok(selection) = proxies.selection().await
+                && let Ok(selected_count) = selection.n_selected_children().await
+            {
+                for index in (0..selected_count.clamp(0, MAX_SELECTED_DESCENDANTS as i32)).rev() {
+                    if let Ok(child) = selection.get_selected_child(index).await
+                        && !child.is_null()
+                    {
+                        stack.push((child, depth + 1));
+                    }
+                }
+            }
             continue;
         }
         if let Ok(children) = accessible.get_children().await {
@@ -335,6 +437,129 @@ fn semantic_label(role: Role, name: &str, description: &str) -> String {
         (false, false) if name == description => format!("{role}: {name}"),
         (false, false) => format!("{role}: {name} — {description}"),
     }
+}
+
+fn libreoffice_component(
+    application: &str,
+    window: &str,
+    target_identity: &str,
+) -> Option<&'static str> {
+    let identity = format!("{application} {window} {target_identity}").to_ascii_lowercase();
+    if !identity.contains("libreoffice") && !identity.contains("soffice") {
+        return None;
+    }
+    for (needle, component) in [
+        ("writer", "LibreOffice Writer"),
+        ("calc", "LibreOffice Calc"),
+        ("impress", "LibreOffice Impress"),
+        ("draw", "LibreOffice Draw"),
+        ("base", "LibreOffice Base"),
+        ("math", "LibreOffice Math"),
+    ] {
+        if identity.contains(needle) {
+            return Some(component);
+        }
+    }
+    Some("LibreOffice")
+}
+
+fn libreoffice_document_title(window: &str) -> Option<String> {
+    let normalized = normalize(window);
+    let lower = normalized.to_ascii_lowercase();
+    let mut end = normalized.len();
+    for separator in [" - libreoffice", " — libreoffice", " – libreoffice"] {
+        if let Some(index) = lower.rfind(separator) {
+            end = end.min(index);
+        }
+    }
+    let title = normalized[..end]
+        .trim()
+        .trim_start_matches(['*', '•'])
+        .trim()
+        .trim_end_matches('*')
+        .trim();
+    if title.is_empty()
+        || title.eq_ignore_ascii_case("libreoffice")
+        || title.eq_ignore_ascii_case("start center")
+        || title.eq_ignore_ascii_case("libreoffice start center")
+    {
+        None
+    } else {
+        Some(title.to_owned())
+    }
+}
+
+fn libreoffice_identity_lines(component: &str, document: Option<&str>) -> Vec<String> {
+    let mut lines = vec![format!("office application: {component}")];
+    if let Some(document) = document {
+        lines.push(format!("focused document: {document}"));
+    }
+    lines
+}
+
+fn libreoffice_content_label(component: &str) -> &'static str {
+    if component.ends_with("Writer") {
+        "writer text"
+    } else if component.ends_with("Calc") {
+        "sheet content"
+    } else if component.ends_with("Impress") {
+        "slide content"
+    } else if component.ends_with("Draw") {
+        "drawing content"
+    } else if component.ends_with("Base") {
+        "database content"
+    } else if component.ends_with("Math") {
+        "formula content"
+    } else {
+        "office content"
+    }
+}
+
+fn should_read_libreoffice_text(role: Role) -> bool {
+    matches!(
+        role,
+        Role::DocumentText
+            | Role::DocumentSpreadsheet
+            | Role::DocumentPresentation
+            | Role::DocumentFrame
+            | Role::Paragraph
+            | Role::Text
+            | Role::TableCell
+            | Role::Heading
+            | Role::Comment
+    )
+}
+
+fn document_text_range(
+    character_count: i32,
+    caret_offset: Option<i32>,
+    remaining: usize,
+) -> (i32, i32) {
+    let character_count = character_count.max(0);
+    let maximum = remaining
+        .min(MAX_DOCUMENT_TEXT_PER_NODE)
+        .min(i32::MAX as usize) as i32;
+    if character_count == 0 || maximum == 0 {
+        return (0, 0);
+    }
+    if character_count <= maximum {
+        return (0, character_count);
+    }
+    let caret = caret_offset.unwrap_or(0).clamp(0, character_count);
+    let start = (caret - maximum / 2).clamp(0, character_count - maximum);
+    (start, start + maximum)
+}
+
+fn chunk_document_text(label: &str, text: &str) -> Vec<String> {
+    let characters: Vec<char> = text.chars().collect();
+    characters
+        .chunks(MAX_DOCUMENT_PREVIEW_LINE_CHARACTERS)
+        .map(|chunk| format!("{label}: {}", chunk.iter().collect::<String>()))
+        .collect()
+}
+
+fn truncate_characters(value: &str, maximum: usize) -> String {
+    value.chars().take(maximum).collect()
 }
 
 fn normalize(value: &str) -> String {
@@ -375,6 +600,64 @@ mod tests {
             .quality(),
             "rich"
         );
+        assert_eq!(
+            ProbeSummary {
+                document_text_characters: 80,
+                preview: vec!["writer text: bounded document context".to_owned()],
+                ..ProbeSummary::default()
+            }
+            .quality(),
+            "rich"
+        );
+    }
+
+    #[test]
+    fn libreoffice_components_and_document_titles_are_explicit() {
+        assert_eq!(
+            libreoffice_component("soffice", "Case Notes.odt — LibreOffice Writer", ""),
+            Some("LibreOffice Writer")
+        );
+        assert_eq!(
+            libreoffice_component("libreoffice-calc", "Budget.ods - LibreOffice Calc", ""),
+            Some("LibreOffice Calc")
+        );
+        assert_eq!(libreoffice_component("Firefox", "Case Notes", ""), None);
+        assert_eq!(
+            libreoffice_component("soffice", "Budget.ods", "libreoffice-calc.desktop"),
+            Some("LibreOffice Calc")
+        );
+        assert_eq!(
+            libreoffice_document_title("* Case Notes.odt — LibreOffice Writer").as_deref(),
+            Some("Case Notes.odt")
+        );
+        assert_eq!(libreoffice_document_title("LibreOffice Start Center"), None);
+    }
+
+    #[test]
+    fn document_text_ranges_are_bounded_around_the_caret() {
+        assert_eq!(document_text_range(120, Some(60), 6_000), (0, 120));
+        assert_eq!(
+            document_text_range(10_000, Some(5_000), 6_000),
+            (4_000, 6_000)
+        );
+        assert_eq!(document_text_range(10_000, Some(10), 400), (0, 400));
+        assert_eq!(document_text_range(0, None, 6_000), (0, 0));
+    }
+
+    #[test]
+    fn document_text_chunks_preserve_unicode_and_component_labels() {
+        let text = "é".repeat(MAX_DOCUMENT_PREVIEW_LINE_CHARACTERS + 1);
+        let chunks = chunk_document_text("writer text", &text);
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(
+            chunks[0]
+                .chars()
+                .filter(|character| *character == 'é')
+                .count(),
+            600
+        );
+        assert_eq!(chunks[1], "writer text: é");
+        assert_eq!(truncate_characters("éclair", 2), "éc");
     }
 
     #[test]

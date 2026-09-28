@@ -24,6 +24,12 @@ fn main() -> Result<()> {
     let summary = inspect_active_window(show_text)?;
     println!("Application: {}", display_or_unknown(&summary.application));
     println!("Active window: {}", display_or_unknown(&summary.window));
+    if let Some(integration) = &summary.integration {
+        println!("Integration: {integration}");
+    }
+    if let Some(document) = &summary.document {
+        println!("Focused document: {document}");
+    }
     println!(
         "Coverage: {} · {} visible nodes · {} text-capable · {} document-capable",
         summary.quality(),
@@ -31,6 +37,12 @@ fn main() -> Result<()> {
         summary.text_nodes,
         summary.document_nodes
     );
+    if summary.document_text_nodes > 0 {
+        println!(
+            "Document excerpt: {} characters from {} accessible items",
+            summary.document_text_characters, summary.document_text_nodes
+        );
+    }
     println!("Traversal bounded at {} nodes", summary.nodes_seen);
     if show_text {
         println!("Visible semantic labels:");

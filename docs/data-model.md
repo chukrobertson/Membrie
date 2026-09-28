@@ -17,6 +17,8 @@ not an individual key press or low-level operating-system event.
 - `activity_observations`: deduplicated focused application and window-title changes
 - `semantic_observations`: bounded, policy-approved visible labels and text supplied by
   application accessibility interfaces, tied to activity sessions and quality-labeled
+- LibreOffice context remains in `semantic_observations`, with explicit suite, component, and
+  focused-document labels plus a bounded read-only excerpt in `text_content`
 - `screen_observations`: explicitly labeled local vision descriptions tied to activity sessions;
   processing state survives session boundaries and temporary source images are not retained
 - `mobile_usage_events`: coarse opening counts and bounded visible-time pulses, stored locally without

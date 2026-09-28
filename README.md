@@ -33,6 +33,7 @@ The project is intentionally local-first and self-hosted:
 - Safe, explicitly enabled clipboard capture through a local GNOME Shell bridge
 - Optional focused-application and window-title activity sessions with idle boundaries
 - Opt-in Semantic Context capture using bounded, read-only GNOME accessibility data
+- First-class LibreOffice Writer, Calc, Impress, Draw, Base, and Math context with focused-document identity and bounded text excerpts
 - Adaptive semantic-first capture: rich application context avoids redundant screenshots,
   while sparse or unavailable context falls back to Screen Memory when it is enabled
 - A consent-gated, store-nothing Semantic Context compatibility test
@@ -63,7 +64,7 @@ The project is intentionally local-first and self-hosted:
 - Coarse, local-only Companion usage totals for the last day, week, and month
 - Local model selection and visible indexing health
 
-Broader document understanding, per-calendar controls, LibreOffice and Thunderbird evidence, meeting transcripts,
+Broader file-format understanding, per-calendar controls, deeper Thunderbird evidence, meeting transcripts,
 individual device revocation, and deeper pattern detection are the next implementation milestones.
 
 ## Install on Ubuntu
@@ -168,7 +169,11 @@ Membrie is in the background:
 The extension exports only a local session-bus interface and has no network code.
 Activity Context, Semantic Context, and Screen Memory stay off until enabled in Membrie's
 Privacy & Capture screen. Semantic Context reads bounded, visible application labels and
-text through GNOME's accessibility interface. Rich semantic observations replace a
+text through GNOME's accessibility interface. In a focused LibreOffice window it recognizes
+Writer, Calc, Impress, Draw, Base, and Math, records the document identity from the active window,
+and reads at most a small bounded excerpt exposed by read-only text interfaces, normally around
+the caret. It never opens another document, reads files from disk, or calls LibreOffice editing
+actions. Rich semantic observations replace a
 redundant screenshot; partial or unavailable observations allow Screen Memory to fill the
 gap when that separate source is enabled. Screen Memory takes one-shot samples of the
 active window, filters unchanged frames locally, removes each PNG from disk before local

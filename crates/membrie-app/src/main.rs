@@ -1644,11 +1644,11 @@ fn build_privacy_page(state: &Rc<UiState>) -> gtk::Widget {
     let semantic_card = gtk::Box::new(Orientation::Vertical, 8);
     semantic_card.add_css_class("card");
     semantic_card.add_css_class("capture-card");
-    let semantic_heading = gtk::Label::new(Some("Semantic Context · Early access"));
+    let semantic_heading = gtk::Label::new(Some("Semantic Context · Documents and apps"));
     semantic_heading.add_css_class("heading");
     semantic_heading.set_xalign(0.0);
     let semantic_detail = gtk::Label::new(Some(
-        "Off by default. When enabled, Membrie reads bounded names, labels, and visible text supplied by the active application to GNOME accessibility tools. Password fields are skipped, no application actions are performed, and exclusions, secret filtering, and duplicate filtering apply before anything is stored.",
+        "Off by default. When enabled, Membrie reads bounded names, labels, and visible text supplied by the active application to GNOME accessibility tools. Focused LibreOffice Writer, Calc, Impress, Draw, Base, and Math windows also provide a small read-only document excerpt, usually near the caret. Password fields are skipped, no application actions are performed, and exclusions, secret filtering, and duplicate filtering apply before anything is stored.",
     ));
     semantic_detail.add_css_class("dim-label");
     semantic_detail.set_xalign(0.0);
@@ -3216,8 +3216,32 @@ fn show_semantic_probe_result(parent: &gtk::Button, summary: &ProbeSummary) {
         "partial" => "Partial semantic context",
         _ => "Little semantic context",
     };
+    let integration = summary
+        .integration
+        .as_deref()
+        .map(|integration| format!("\nIntegration: {integration}"))
+        .unwrap_or_default();
+    let document = summary
+        .document
+        .as_deref()
+        .map(|document| format!("\nDocument: {document}"))
+        .unwrap_or_default();
+    let document_text = if summary.document_text_nodes > 0 {
+        format!(
+            "\nDocument excerpt: {} characters from {} accessible item{}",
+            summary.document_text_characters,
+            summary.document_text_nodes,
+            if summary.document_text_nodes == 1 {
+                ""
+            } else {
+                "s"
+            }
+        )
+    } else {
+        String::new()
+    };
     let body = format!(
-        "{quality}\n\nApplication: {application}\nWindow: {window}\nCoverage: {} visible items · {} text-capable · {} document-capable\n\nNothing from this preview was stored. Automatic Semantic Context remains off.",
+        "{quality}\n\nApplication: {application}\nWindow: {window}{integration}{document}{document_text}\nCoverage: {} visible items · {} text-capable · {} document-capable\n\nNothing from this preview was stored, and the test changed no capture settings.",
         summary.visible_nodes, summary.text_nodes, summary.document_nodes
     );
     let preview = if summary.preview.is_empty() {
