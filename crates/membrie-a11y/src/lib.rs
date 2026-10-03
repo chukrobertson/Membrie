@@ -7,6 +7,7 @@ use atspi::proxy::proxy_ext::ProxyExt;
 use atspi::{AccessibilityConnection, Interface, Role, State};
 use futures_lite::future;
 use std::collections::HashSet;
+use std::sync::Mutex;
 use std::time::Duration;
 
 const MAX_NODES: usize = 500;
@@ -18,6 +19,12 @@ const MAX_DOCUMENT_TEXT_PER_NODE: usize = 2_000;
 const MAX_DOCUMENT_PREVIEW_LINE_CHARACTERS: usize = 600;
 const MAX_SELECTED_DESCENDANTS: usize = 16;
 const INTEGRATION_CONTEXT_RESERVED_LINES: usize = 16;
+
+// AT-SPI uses background D-Bus workers. Opening a fresh connection for every
+// sample leaves those workers alive in a long-running capture process, even
+// after the short-lived inspection future has completed. Reuse one connection
+// and replace it only when the bus has actually closed.
+static ACCESSIBILITY_CONNECTION: Mutex<Option<AccessibilityConnection>> = Mutex::new(None);
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct WindowTarget {
@@ -86,7 +93,7 @@ pub fn inspect_target_window(target: WindowTarget, show_text: bool) -> Result<Pr
 
 fn run_bounded_probe(target: Option<WindowTarget>, show_text: bool) -> Result<ProbeSummary> {
     async_io::block_on(future::race(
-        inspect_window_async(target, show_text),
+        inspect_window_with_shared_connection(target, show_text),
         async {
             async_io::Timer::after(Duration::from_secs(20)).await;
             Err(anyhow::anyhow!(
@@ -94,6 +101,40 @@ fn run_bounded_probe(target: Option<WindowTarget>, show_text: bool) -> Result<Pr
             ))
         },
     ))
+}
+
+async fn inspect_window_with_shared_connection(
+    target: Option<WindowTarget>,
+    show_text: bool,
+) -> Result<ProbeSummary> {
+    let accessibility = shared_accessibility_connection().await?;
+    let result = inspect_window_async(&accessibility, target, show_text).await;
+    if accessibility.connection().is_closed()
+        && let Ok(mut cached) = ACCESSIBILITY_CONNECTION.lock()
+    {
+        *cached = None;
+    }
+    result
+}
+
+async fn shared_accessibility_connection() -> Result<AccessibilityConnection> {
+    if let Some(connection) = ACCESSIBILITY_CONNECTION
+        .lock()
+        .map_err(|_| anyhow::anyhow!("the accessibility connection state became unavailable"))?
+        .as_ref()
+        .filter(|connection| !connection.connection().is_closed())
+        .cloned()
+    {
+        return Ok(connection);
+    }
+
+    set_session_accessibility(true).await?;
+    let connection = AccessibilityConnection::new().await?;
+    let mut cached = ACCESSIBILITY_CONNECTION
+        .lock()
+        .map_err(|_| anyhow::anyhow!("the accessibility connection state became unavailable"))?;
+    *cached = Some(connection.clone());
+    Ok(connection)
 }
 
 #[derive(Debug)]
@@ -104,11 +145,10 @@ struct WindowCandidate {
 }
 
 async fn inspect_window_async(
+    accessibility: &AccessibilityConnection,
     target: Option<WindowTarget>,
     show_text: bool,
 ) -> Result<ProbeSummary> {
-    set_session_accessibility(true).await?;
-    let accessibility = AccessibilityConnection::new().await?;
     let root = accessibility.root_accessible_on_registry().await?;
     let connection = accessibility.connection();
     let applications = root.get_children().await?;
